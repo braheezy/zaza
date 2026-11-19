@@ -28,8 +28,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    runner.root_module.addImport("cpu", b.createModule(.{
+        .root_source_file = b.path("src/cpu.zig"),
+    }));
+    const styling = b.dependency("chameleon", .{ .target = b.graph.host, .optimize = optimize });
+    runner.root_module.addImport("chameleon", styling.module("chameleon"));
     const run_vectors = b.addRunArtifact(runner);
     run_vectors.addDirectoryArg2(vectors.path("v1"), .{});
     run_vectors.addPassthruArgs();
-    b.step("cputest", "Inspect ARM7TDMI SingleStepTests vectors").dependOn(&run_vectors.step);
+    b.step("cputest", "Run supported ARM7TDMI SingleStepTests vectors").dependOn(&run_vectors.step);
 }

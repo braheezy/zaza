@@ -14,6 +14,8 @@ const Cpu = @This();
 
 registers: [15]u32 = @splat(0),
 instruction_address: u32 = 0,
+// Current instruction first, then the next one. Null until the initial refill.
+pipeline: ?[2]u32 = null,
 cpsr: u32 = 0xD3, // Supervisor mode, ARM state, IRQ and FIQ masked.
 
 const stack_pointer: u4 = 13;
@@ -29,6 +31,44 @@ const Flags = packed struct(u4) {
     zero: bool = false,
     negative: bool = false,
 };
+
+pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
+    std.debug.assert(self.cpsr & thumb_bit == 0);
+    std.debug.assert(self.instruction_address & 3 == 0);
+    const current = bus.fetch32(self.instruction_address);
+    const next = bus.fetch32(self.instruction_address +% 4);
+    self.pipeline = .{ current, next };
+}
+
+pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
+    if (self.cpsr & thumb_bit != 0) return error.UnsupportedInstruction;
+    const queued = self.pipeline orelse return error.PipelineNotReady;
+    const instruction = queued[0];
+    const condition: u4 = @truncate(instruction >> 28);
+    const destination: u4 = @truncate(instruction >> 12);
+
+    // Only ARM MOV immediate without flag updates or a PC destination is implemented.
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    if (instruction & 0x0FFF_0000 != 0x03A0_0000) return error.UnsupportedInstruction;
+    if (destination == program_counter) return error.UnsupportedInstruction;
+
+    if (conditionPassed(condition, self.readFlags())) {
+        const immediate: u8 = @truncate(instruction);
+        const rotation: u4 = @truncate(instruction >> 8);
+        const value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
+        self.writeGeneralRegister(destination, value);
+    }
+    _ = self.advanceArmPipeline(bus);
+}
+
+fn advanceArmPipeline(self: *Cpu, bus: anytype) u32 {
+    std.debug.assert(self.cpsr & thumb_bit == 0);
+    const queued = self.pipeline.?;
+    const fetched = bus.fetch32(self.instruction_address +% 8);
+    self.pipeline = .{ queued[1], fetched };
+    self.instruction_address +%= 4;
+    return queued[0];
+}
 
 fn readFlags(self: *const Cpu) Flags {
     const bits: u4 = @truncate(self.cpsr >> flags_shift);
@@ -78,6 +118,52 @@ fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
 fn mode(self: *Cpu) Mode {
     const mode_bits: u5 = @truncate(self.cpsr);
     return @fromBackingInt(mode_bits);
+}
+
+test "ARM pipeline refill and advance fetch words in address order" {
+    const TestBus = struct {
+        addresses: [3]u32 = @splat(0),
+        fetch_count: usize = 0,
+
+        fn fetch32(self: *@This(), address: u32) u32 {
+            self.addresses[self.fetch_count] = address;
+            self.fetch_count += 1;
+            return address + 0x100;
+        }
+    };
+    var bus: TestBus = .{};
+    var cpu: Cpu = .{ .instruction_address = 0x0800_0000 };
+
+    cpu.refillArmPipeline(&bus);
+    try std.testing.expectEqual([2]u32{ 0x0800_0100, 0x0800_0104 }, cpu.pipeline.?);
+    try std.testing.expectEqual(@as(usize, 2), bus.fetch_count);
+    try std.testing.expectEqual(@as(u32, 0x0800_0100), cpu.advanceArmPipeline(&bus));
+    try std.testing.expectEqual([2]u32{ 0x0800_0104, 0x0800_0108 }, cpu.pipeline.?);
+    try std.testing.expectEqual(@as(u32, 0x0800_0004), cpu.instruction_address);
+    try std.testing.expectEqual([3]u32{ 0x0800_0000, 0x0800_0004, 0x0800_0008 }, bus.addresses);
+}
+
+test "ARM step executes the queued MOV and fetches the next word" {
+    const TestBus = struct {
+        fetched_address: ?u32 = null,
+
+        pub fn fetch32(self: *@This(), address: u32) u32 {
+            self.fetched_address = address;
+            return 0xE3A0_2000;
+        }
+    };
+    var bus: TestBus = .{};
+    var cpu: Cpu = .{
+        .instruction_address = 0x0800_0000,
+        .pipeline = .{ 0xE3A0_04FF, 0xE3A0_1000 },
+    };
+
+    try cpu.step(&bus);
+    try std.testing.expectEqual(@as(u32, 0xFF00_0000), cpu.registers[0]);
+    try std.testing.expectEqual(@as(u32, 0xD3), cpu.cpsr);
+    try std.testing.expectEqual(@as(?u32, 0x0800_0008), bus.fetched_address);
+    try std.testing.expectEqual(@as(u32, 0x0800_0004), cpu.instruction_address);
+    try std.testing.expectEqual([2]u32{ 0xE3A0_1000, 0xE3A0_2000 }, cpu.pipeline.?);
 }
 
 test "LR is stored, but reading PC derives a value" {

@@ -1,4 +1,6 @@
 const std = @import("std");
+const Cpu = @import("cpu");
+const chameleon = @import("chameleon");
 const suffix = ".json.bin";
 
 pub fn main(init: std.process.Init) !void {
@@ -11,6 +13,24 @@ pub fn main(init: std.process.Init) !void {
     var directory = try std.Io.Dir.cwd().openDir(init.io, args[1], .{ .iterate = true });
     defer directory.close(init.io);
 
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    var style = chameleon.initRuntimeFromEnviron(.{ .allocator = init.gpa }, init.environ_map);
+    defer style.deinit();
+    var report: Report = .{ .writer = &stdout.interface, .style = &style };
+
+    const result = runSelection(init, args, directory, case_index, &report);
+    try stdout.interface.flush();
+    try result;
+}
+
+fn runSelection(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    directory: std.Io.Dir,
+    case_index: ?usize,
+    report: *Report,
+) !void {
     if (args.len >= 3) {
         const family = args[2];
         if (family.len == 0) return usage();
@@ -18,18 +38,18 @@ pub fn main(init: std.process.Init) !void {
             if (!std.ascii.isAlphanumeric(byte) and byte != '_') return usage();
         }
         const filename = try init.arena.allocator().print("{s}{s}", .{ family, suffix });
-        _ = try inspectFile(directory, init.io, init.gpa, filename, case_index);
+        _ = try inspectFile(directory, init.io, init.gpa, filename, case_index, report);
     } else {
         var iterator = directory.iterate();
         var total: usize = 0;
         while (try iterator.next(init.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
-            total += try inspectFile(directory, init.io, init.gpa, entry.name, null);
+            total += try inspectFile(directory, init.io, init.gpa, entry.name, null, report);
         }
         if (total == 0) return error.NoVectorsFound;
-        std.debug.print("Decoded {d} cases total (no CPU execution).\n", .{total});
     }
+    if (case_index == null) try report.summary();
 }
 
 fn usage() error{InvalidArguments} {
@@ -134,14 +154,185 @@ const Reader = struct {
     }
 };
 
+const TestBus = struct {
+    transactions: Reader,
+    failure: ?error{ InvalidVector, UnexpectedFetch } = null,
+
+    pub fn fetch32(self: *TestBus, address: u32) u32 {
+        if (self.failure != null) return 0;
+        return self.expectFetch32(address) catch |err| {
+            // Keep the CPU bus API infallible; report mismatches after the step.
+            self.failure = err;
+            return 0;
+        };
+    }
+
+    fn expectFetch32(self: *TestBus, address: u32) !u32 {
+        if (self.transactions.remaining.len == 0) return error.UnexpectedFetch;
+        const entry = try self.transactions.words(6);
+        if (entry[0] != 0) return error.UnexpectedFetch;
+        if (entry[1] != 4) return error.UnexpectedFetch;
+        if (entry[2] != address) return error.UnexpectedFetch;
+        return entry[3];
+    }
+
+    fn finish(self: TestBus) !void {
+        if (self.failure) |err| return err;
+        if (self.transactions.remaining.len != 0) return error.MissingTransaction;
+    }
+};
+
+test "vector bus replays a fetch and detects missing or wrong fetches" {
+    const bytes = [_]u8{
+        0, 0, 0, 0, // Instruction read.
+        4, 0, 0, 0, // Width in bytes.
+        8, 0, 0, 8, // Address 0x08000008.
+        42, 0, 0, 0, // Returned word.
+        0, 0, 0, 0, // Cycle metadata.
+        0, 0, 0, 0, // Access metadata.
+    };
+    var bus: TestBus = .{ .transactions = .{ .remaining = &bytes } };
+    try std.testing.expectError(error.MissingTransaction, bus.finish());
+    try std.testing.expectEqual(@as(u32, 42), bus.fetch32(0x0800_0008));
+    try bus.finish();
+    _ = bus.fetch32(0x0800_000C);
+    try std.testing.expectError(error.UnexpectedFetch, bus.finish());
+
+    bus = .{ .transactions = .{ .remaining = &bytes } };
+    _ = bus.fetch32(0x0800_0004);
+    try std.testing.expectError(error.UnexpectedFetch, bus.finish());
+}
+
+fn runSelectedVector(vector: Vector) !void {
+    // Low-register MOV cannot touch banked state, which the CPU does not model yet.
+    const destination: u4 = @truncate(vector.opcode >> 12);
+    if (destination >= 8) return error.UnsupportedInstruction;
+    if (vector.initial.pipeline[0] != vector.opcode) return error.InvalidVector;
+    var cpu: Cpu = .{
+        .registers = vector.initial.registers[0..15].*,
+        .instruction_address = vector.initial.registers[15] -% 8,
+        .cpsr = vector.initial.cpsr,
+        .pipeline = vector.initial.pipeline,
+    };
+    var bus: TestBus = .{ .transactions = .{ .remaining = vector.transactions } };
+    try cpu.step(&bus);
+    try bus.finish();
+    if (!std.mem.eql(u32, vector.final.registers[0..15], &cpu.registers)) {
+        return error.RegisterMismatch;
+    }
+    if (vector.final.registers[15] != cpu.instruction_address +% 8) return error.PcMismatch;
+    if (vector.final.cpsr != cpu.cpsr) return error.CpsrMismatch;
+    if (!std.mem.eql(u32, &vector.final.pipeline, &cpu.pipeline.?)) return error.PipelineMismatch;
+}
+
+const Report = struct {
+    writer: *std.Io.Writer,
+    style: *chameleon.RuntimeChameleon,
+    passed: usize = 0,
+    failed: usize = 0,
+    skipped: usize = 0,
+    column: usize = 0,
+
+    fn single(self: *Report, family: []const u8, index: usize, vector: Vector) !void {
+        try self.style.bold().cyan().print(self.writer, "{s}", .{family});
+        try self.style.magenta().print(self.writer, " · case {d}\n", .{index});
+        const failure = outcome(family, vector);
+        const skipped_case = if (failure) |err| err == error.UnsupportedInstruction else false;
+        if (skipped_case) {
+            try self.style.yellow().print(self.writer, "  SKIP", .{});
+            try self.writer.print("  Unsupported opcode 0x{x:0>8}\n", .{vector.opcode});
+        } else if (failure) |err| {
+            try self.style.red().print(self.writer, "  FAIL", .{});
+            try self.writer.print("  {s} (opcode 0x{x:0>8})\n", .{ @errorName(err), vector.opcode });
+        } else {
+            try self.style.bold().green().print(self.writer, "  PASS", .{});
+            try self.explainMov(vector);
+        }
+
+        if (failure) |err| {
+            if (err != error.UnsupportedInstruction) return error.VectorMismatch;
+        }
+    }
+
+    fn explainMov(self: *Report, vector: Vector) !void {
+        const instruction = vector.opcode;
+        const destination: u4 = @truncate(instruction >> 12);
+        const condition: u4 = @truncate(instruction >> 28);
+        const rotation: u4 = @truncate(instruction >> 8);
+        const immediate: u8 = @truncate(instruction);
+        const value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
+        const conditions = [_][]const u8{
+            "EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC",
+            "HI", "LS", "GE", "LT", "GT", "LE", "AL", "reserved",
+        };
+        try self.style.cyan().print(self.writer, "  MOV{s} r{d}, #0x{x:0>8}\n", .{
+            if (condition == 14) "" else conditions[condition], destination, value,
+        });
+        try self.style.dim().print(self.writer, "        r{d}: 0x{x:0>8} → ", .{
+            destination, vector.initial.registers[destination],
+        });
+        try self.style.green().print(self.writer, "0x{x:0>8}\n", .{
+            vector.final.registers[destination],
+        });
+    }
+
+    fn outcome(family: []const u8, vector: Vector) ?anyerror {
+        if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
+            return error.UnsupportedInstruction;
+        }
+        runSelectedVector(vector) catch |err| return err;
+        return null;
+    }
+
+    fn record(self: *Report, family: []const u8, index: usize, vector: Vector) !void {
+        if (outcome(family, vector)) |err| {
+            if (err == error.UnsupportedInstruction) {
+                self.skipped += 1;
+                return;
+            }
+            self.failed += 1;
+            try self.style.red().print(self.writer, "F", .{});
+            try self.writer.print("  {s}[{d}]: {s}\n", .{ family, index, @errorName(err) });
+            self.column = 0;
+            try self.rerun(family, index);
+        } else {
+            self.passed += 1;
+            try self.style.green().print(self.writer, ".", .{});
+            self.column += 1;
+            if (self.column == 72) try self.endLine();
+        }
+    }
+
+    fn endLine(self: *Report) !void {
+        if (self.column != 0) try self.writer.writeByte('\n');
+        self.column = 0;
+    }
+
+    fn rerun(self: *Report, family: []const u8, index: usize) !void {
+        try self.writer.print("  Rerun: zig build cputest -- {s} --case {d}\n", .{ family, index });
+    }
+
+    fn summary(self: *Report) !void {
+        try self.endLine();
+        try self.style.green().print(self.writer, "{d} passed", .{self.passed});
+        try self.writer.writeAll(" · ");
+        try self.style.red().print(self.writer, "{d} failed", .{self.failed});
+        try self.writer.writeAll(" · ");
+        try self.style.yellow().print(self.writer, "{d} skipped", .{self.skipped});
+        try self.writer.writeByte('\n');
+        if (self.failed != 0) return error.VectorMismatch;
+    }
+};
+
 fn inspectFile(
     directory: std.Io.Dir,
     io: std.Io,
     allocator: std.mem.Allocator,
     filename: []const u8,
     case_index: ?usize,
+    report: *Report,
 ) !usize {
-    return inspectFileInner(directory, io, allocator, filename, case_index) catch |err| {
+    return inspectFileInner(directory, io, allocator, filename, case_index, report) catch |err| {
         std.debug.print("{s}: {s}\n", .{ filename, @errorName(err) });
         return err;
     };
@@ -153,6 +344,7 @@ fn inspectFileInner(
     allocator: std.mem.Allocator,
     filename: []const u8,
     case_index: ?usize,
+    report: *Report,
 ) !usize {
     const bytes = try directory.readFileAlloc(io, filename, allocator, .limited(32 * 1024 * 1024));
     defer allocator.free(bytes);
@@ -164,21 +356,23 @@ fn inspectFileInner(
         if (selected >= count) return error.CaseIndexOutOfRange;
         for (0..selected) |_| _ = try reader.section();
         const vector = try Vector.decode(&reader);
-        std.debug.print("{s}[{d}]: opcode=0x{x:0>8} base=0x{x:0>8}, {d} transactions\n", .{
-            family, selected, vector.opcode, vector.base_address, vector.transaction_count,
-        });
-        std.debug.print("  CPSR: 0x{x:0>8} -> 0x{x:0>8} (no CPU execution)\n", .{
-            vector.initial.cpsr, vector.final.cpsr,
-        });
+        try report.single(family, selected, vector);
         return 1;
     }
+    const skipped_before = report.skipped;
     for (0..count) |index| {
-        _ = Vector.decode(&reader) catch |err| {
+        const vector = Vector.decode(&reader) catch |err| {
             std.debug.print("{s}[{d}]: {s}\n", .{ family, index, @errorName(err) });
             return err;
         };
+        try report.record(family, index, vector);
     }
     try reader.finish();
-    std.debug.print("{s}: {d} cases decoded (no CPU execution)\n", .{ family, count });
+    const skipped = report.skipped - skipped_before;
+    if (skipped != 0) {
+        try report.endLine();
+        try report.style.yellow().print(report.writer, "S", .{});
+        try report.writer.print("  {s}: {d} unsupported cases\n", .{ family, skipped });
+    }
     return count;
 }
