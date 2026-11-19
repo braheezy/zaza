@@ -50,8 +50,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     if (condition == 0xF) return error.UnsupportedInstruction;
     const is_move = instruction & 0x0FFF_0000 == 0x03A0_0000;
     const is_add = instruction & 0x0FE0_0000 == 0x0280_0000;
+    const is_subtract = instruction & 0x0FE0_0000 == 0x0240_0000;
+    const is_compare = instruction & 0x0FFF_0000 == 0x0350_0000;
     const source: u4 = @truncate(instruction >> 16);
-    if (is_add) {
+    if (is_add or is_subtract or is_compare) {
         if (source >= 8) return error.UnsupportedInstruction;
         if (destination >= 8) return error.UnsupportedInstruction;
     } else {
@@ -73,6 +75,18 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
                     .zero = sum == 0,
                     .carry = carry != 0,
                     .overflow = ((left ^ sum) & (value ^ sum)) >> 31 != 0,
+                });
+            }
+        } else if (is_subtract or is_compare) {
+            const left = self.readRegister(source);
+            const difference, const borrow = @subWithOverflow(left, value);
+            if (!is_compare) self.writeGeneralRegister(destination, difference);
+            if (instruction & (1 << 20) != 0) {
+                self.writeFlags(.{
+                    .negative = difference >> 31 != 0,
+                    .zero = difference == 0,
+                    .carry = borrow == 0,
+                    .overflow = ((left ^ value) & (left ^ difference)) >> 31 != 0,
                 });
             }
         } else {

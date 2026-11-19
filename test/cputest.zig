@@ -266,11 +266,23 @@ const Report = struct {
             "HI", "LS", "GE", "LT", "GT", "LE", "AL", "reserved",
         };
         const condition_suffix = if (condition == 14) "" else conditions[condition];
-        if (instruction & 0x0FE0_0000 == 0x0280_0000) {
+        if (instruction & 0x0FFF_0000 == 0x0350_0000) {
+            const source: u4 = @truncate(instruction >> 16);
+            try self.style.cyan().print(self.writer, "  CMP{s} r{d}, #0x{x:0>8}\n", .{
+                condition_suffix, source, value,
+            });
+            try self.style.green().print(self.writer, "        NZCV: {b:0>4} → {b:0>4}\n", .{
+                vector.initial.cpsr >> 28, vector.final.cpsr >> 28,
+            });
+            return;
+        }
+        const operation = instruction & 0x0FE0_0000;
+        if (operation == 0x0280_0000 or operation == 0x0240_0000) {
             const source: u4 = @truncate(instruction >> 16);
             const flag_suffix = if (instruction & (1 << 20) != 0) "S" else "";
-            try self.style.cyan().print(self.writer, "  ADD{s}{s} r{d}, r{d}, #0x{x:0>8}\n", .{
-                condition_suffix, flag_suffix, destination, source, value,
+            const mnemonic = if (operation == 0x0280_0000) "ADD" else "SUB";
+            try self.style.cyan().print(self.writer, "  {s}{s}{s} r{d}, r{d}, #0x{x:0>8}\n", .{
+                mnemonic, condition_suffix, flag_suffix, destination, source, value,
             });
         } else {
             try self.style.cyan().print(self.writer, "  MOV{s} r{d}, #0x{x:0>8}\n", .{
