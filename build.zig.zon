@@ -1,0 +1,13 @@
+.{
+    .name = .zaza,
+    .version = "0.0.1",
+    .dependencies = .{
+        .arm7tdmi_vectors = .{
+            .url = "https://codeload.github.com/SingleStepTests/ARM7TDMI/tar.gz/e3097d88d428752736b949d94c094d5da50f0db6",
+            .hash = "N-V-__8AACU-qDfYGRUBWlFjNoNIf_l1cO0X6IbVgV0iWUNT",
+        },
+    },
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "src", "test/cputest.zig" },
+    .fingerprint = 0x83b6fe416857f87a,
+}
