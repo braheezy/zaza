@@ -204,7 +204,7 @@ test "vector bus replays a fetch and detects missing or wrong fetches" {
 }
 
 fn runSelectedVector(vector: Vector) !void {
-    // Low-register MOV cannot touch banked state, which the CPU does not model yet.
+    // Only test destinations that cannot touch banked state.
     const destination: u4 = @truncate(vector.opcode >> 12);
     if (destination >= 8) return error.UnsupportedInstruction;
     if (vector.initial.pipeline[0] != vector.opcode) return error.InvalidVector;
@@ -246,7 +246,7 @@ const Report = struct {
             try self.writer.print("  {s} (opcode 0x{x:0>8})\n", .{ @errorName(err), vector.opcode });
         } else {
             try self.style.bold().green().print(self.writer, "  PASS", .{});
-            try self.explainMov(vector);
+            try self.explainImmediate(vector);
         }
 
         if (failure) |err| {
@@ -254,7 +254,7 @@ const Report = struct {
         }
     }
 
-    fn explainMov(self: *Report, vector: Vector) !void {
+    fn explainImmediate(self: *Report, vector: Vector) !void {
         const instruction = vector.opcode;
         const destination: u4 = @truncate(instruction >> 12);
         const condition: u4 = @truncate(instruction >> 28);
@@ -265,9 +265,18 @@ const Report = struct {
             "EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC",
             "HI", "LS", "GE", "LT", "GT", "LE", "AL", "reserved",
         };
-        try self.style.cyan().print(self.writer, "  MOV{s} r{d}, #0x{x:0>8}\n", .{
-            if (condition == 14) "" else conditions[condition], destination, value,
-        });
+        const condition_suffix = if (condition == 14) "" else conditions[condition];
+        if (instruction & 0x0FE0_0000 == 0x0280_0000) {
+            const source: u4 = @truncate(instruction >> 16);
+            const flag_suffix = if (instruction & (1 << 20) != 0) "S" else "";
+            try self.style.cyan().print(self.writer, "  ADD{s}{s} r{d}, r{d}, #0x{x:0>8}\n", .{
+                condition_suffix, flag_suffix, destination, source, value,
+            });
+        } else {
+            try self.style.cyan().print(self.writer, "  MOV{s} r{d}, #0x{x:0>8}\n", .{
+                condition_suffix, destination, value,
+            });
+        }
         try self.style.dim().print(self.writer, "        r{d}: 0x{x:0>8} → ", .{
             destination, vector.initial.registers[destination],
         });

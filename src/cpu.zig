@@ -47,16 +47,37 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     const condition: u4 = @truncate(instruction >> 28);
     const destination: u4 = @truncate(instruction >> 12);
 
-    // Only ARM MOV immediate without flag updates or a PC destination is implemented.
     if (condition == 0xF) return error.UnsupportedInstruction;
-    if (instruction & 0x0FFF_0000 != 0x03A0_0000) return error.UnsupportedInstruction;
-    if (destination == program_counter) return error.UnsupportedInstruction;
+    const is_move = instruction & 0x0FFF_0000 == 0x03A0_0000;
+    const is_add = instruction & 0x0FE0_0000 == 0x0280_0000;
+    const source: u4 = @truncate(instruction >> 16);
+    if (is_add) {
+        if (source >= 8) return error.UnsupportedInstruction;
+        if (destination >= 8) return error.UnsupportedInstruction;
+    } else {
+        if (!is_move) return error.UnsupportedInstruction;
+        if (destination == program_counter) return error.UnsupportedInstruction;
+    }
 
     if (conditionPassed(condition, self.readFlags())) {
         const immediate: u8 = @truncate(instruction);
         const rotation: u4 = @truncate(instruction >> 8);
         const value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
-        self.writeGeneralRegister(destination, value);
+        if (is_add) {
+            const left = self.readRegister(source);
+            const sum, const carry = @addWithOverflow(left, value);
+            self.writeGeneralRegister(destination, sum);
+            if (instruction & (1 << 20) != 0) {
+                self.writeFlags(.{
+                    .negative = sum >> 31 != 0,
+                    .zero = sum == 0,
+                    .carry = carry != 0,
+                    .overflow = ((left ^ sum) & (value ^ sum)) >> 31 != 0,
+                });
+            }
+        } else {
+            self.writeGeneralRegister(destination, value);
+        }
     }
     _ = self.advanceArmPipeline(bus);
 }
