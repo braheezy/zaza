@@ -48,10 +48,18 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     const destination: u4 = @truncate(instruction >> 12);
 
     if (condition == 0xF) return error.UnsupportedInstruction;
-    const is_move = instruction & 0x0FFF_0000 == 0x03A0_0000;
-    const is_add = instruction & 0x0FE0_0000 == 0x0280_0000;
-    const is_subtract = instruction & 0x0FE0_0000 == 0x0240_0000;
-    const is_compare = instruction & 0x0FFF_0000 == 0x0350_0000;
+    const immediate_operand = instruction & (1 << 25) != 0;
+    const operand_register: u4 = @truncate(instruction);
+    if (!immediate_operand) {
+        if (instruction & (1 << 4) != 0) return error.UnsupportedInstruction;
+        if (operand_register >= 8) return error.UnsupportedInstruction;
+        if (destination >= 8) return error.UnsupportedInstruction;
+    }
+    const operation = instruction & ~(@as(u32, 1) << 25);
+    const is_move = operation & 0x0FFF_0000 == 0x01A0_0000;
+    const is_add = operation & 0x0FE0_0000 == 0x0080_0000;
+    const is_subtract = operation & 0x0FE0_0000 == 0x0040_0000;
+    const is_compare = operation & 0x0FFF_0000 == 0x0150_0000;
     const source: u4 = @truncate(instruction >> 16);
     if (is_add or is_subtract or is_compare) {
         if (source >= 8) return error.UnsupportedInstruction;
@@ -64,7 +72,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     if (conditionPassed(condition, self.readFlags())) {
         const immediate: u8 = @truncate(instruction);
         const rotation: u4 = @truncate(instruction >> 8);
-        const value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
+        const value = if (immediate_operand)
+            std.math.rotr(u32, immediate, @as(u5, rotation) * 2)
+        else
+            self.shiftedRegisterOperand(instruction, operand_register);
         if (is_add) {
             const left = self.readRegister(source);
             const sum, const carry = @addWithOverflow(left, value);
@@ -94,6 +105,22 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         }
     }
     _ = self.advanceArmPipeline(bus);
+}
+
+fn shiftedRegisterOperand(self: *const Cpu, instruction: u32, register: u4) u32 {
+    const value = self.readRegister(register);
+    const amount: u5 = @truncate(instruction >> 7);
+    const kind: u2 = @truncate(instruction >> 5);
+    // Zero encodes 32 for LSR/ASR and rotate-through-carry for ROR.
+    return switch (kind) {
+        0 => value << amount,
+        1 => if (amount == 0) 0 else value >> amount,
+        2 => @bitCast(@as(i32, @bitCast(value)) >> if (amount == 0) 31 else amount),
+        3 => if (amount == 0)
+            (value >> 1) | (@as(u32, @intFromBool(self.readFlags().carry)) << 31)
+        else
+            std.math.rotr(u32, value, amount),
+    };
 }
 
 fn advanceArmPipeline(self: *Cpu, bus: anytype) u32 {

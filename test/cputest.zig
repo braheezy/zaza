@@ -261,32 +261,49 @@ const Report = struct {
         const rotation: u4 = @truncate(instruction >> 8);
         const immediate: u8 = @truncate(instruction);
         const value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
+        var operand_buffer: [32]u8 = undefined;
+        const operand = if (instruction & (1 << 25) != 0)
+            try std.fmt.bufPrint(&operand_buffer, "#0x{x:0>8}", .{value})
+        else blk: {
+            const register: u4 = @truncate(instruction);
+            const amount: u5 = @truncate(instruction >> 7);
+            const kind: u2 = @truncate(instruction >> 5);
+            if (amount == 0) {
+                if (kind == 0) break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}", .{register});
+                if (kind == 3) break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}, RRX", .{register});
+            }
+            const names = [_][]const u8{ "LSL", "LSR", "ASR", "ROR" };
+            break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}, {s} #{d}", .{
+                register, names[kind], if (amount == 0) @as(u6, 32) else amount,
+            });
+        };
         const conditions = [_][]const u8{
             "EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC",
             "HI", "LS", "GE", "LT", "GT", "LE", "AL", "reserved",
         };
         const condition_suffix = if (condition == 14) "" else conditions[condition];
-        if (instruction & 0x0FFF_0000 == 0x0350_0000) {
+        const operation = instruction & ~(@as(u32, 1) << 25);
+        if (operation & 0x0FFF_0000 == 0x0150_0000) {
             const source: u4 = @truncate(instruction >> 16);
-            try self.style.cyan().print(self.writer, "  CMP{s} r{d}, #0x{x:0>8}\n", .{
-                condition_suffix, source, value,
+            try self.style.cyan().print(self.writer, "  CMP{s} r{d}, {s}\n", .{
+                condition_suffix, source, operand,
             });
             try self.style.green().print(self.writer, "        NZCV: {b:0>4} → {b:0>4}\n", .{
                 vector.initial.cpsr >> 28, vector.final.cpsr >> 28,
             });
             return;
         }
-        const operation = instruction & 0x0FE0_0000;
-        if (operation == 0x0280_0000 or operation == 0x0240_0000) {
+        const arithmetic = operation & 0x0FE0_0000;
+        if (arithmetic == 0x0080_0000 or arithmetic == 0x0040_0000) {
             const source: u4 = @truncate(instruction >> 16);
             const flag_suffix = if (instruction & (1 << 20) != 0) "S" else "";
-            const mnemonic = if (operation == 0x0280_0000) "ADD" else "SUB";
-            try self.style.cyan().print(self.writer, "  {s}{s}{s} r{d}, r{d}, #0x{x:0>8}\n", .{
-                mnemonic, condition_suffix, flag_suffix, destination, source, value,
+            const mnemonic = if (arithmetic == 0x0080_0000) "ADD" else "SUB";
+            try self.style.cyan().print(self.writer, "  {s}{s}{s} r{d}, r{d}, {s}\n", .{
+                mnemonic, condition_suffix, flag_suffix, destination, source, operand,
             });
         } else {
-            try self.style.cyan().print(self.writer, "  MOV{s} r{d}, #0x{x:0>8}\n", .{
-                condition_suffix, destination, value,
+            try self.style.cyan().print(self.writer, "  MOV{s} r{d}, {s}\n", .{
+                condition_suffix, destination, operand,
             });
         }
         try self.style.dim().print(self.writer, "        r{d}: 0x{x:0>8} → ", .{
@@ -299,7 +316,9 @@ const Report = struct {
 
     fn outcome(family: []const u8, vector: Vector) ?anyerror {
         if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
-            return error.UnsupportedInstruction;
+            if (!std.mem.eql(u8, family, "arm_data_proc_immediate_shift")) {
+                return error.UnsupportedInstruction;
+            }
         }
         runSelectedVector(vector) catch |err| return err;
         return null;
