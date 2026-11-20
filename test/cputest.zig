@@ -282,28 +282,31 @@ const Report = struct {
             "HI", "LS", "GE", "LT", "GT", "LE", "AL", "reserved",
         };
         const condition_suffix = if (condition == 14) "" else conditions[condition];
-        const operation = instruction & ~(@as(u32, 1) << 25);
-        if (operation & 0x0FFF_0000 == 0x0150_0000) {
+        const opcode: u4 = @truncate(instruction >> 21);
+        const mnemonics = [_][]const u8{
+            "AND", "EOR", "SUB", "RSB", "ADD", "ADC", "SBC", "RSC",
+            "TST", "TEQ", "CMP", "CMN", "ORR", "MOV", "BIC", "MVN",
+        };
+        const mnemonic = mnemonics[opcode];
+        if (opcode >= 8 and opcode <= 10) {
             const source: u4 = @truncate(instruction >> 16);
-            try self.style.cyan().print(self.writer, "  CMP{s} r{d}, {s}\n", .{
-                condition_suffix, source, operand,
+            try self.style.cyan().print(self.writer, "  {s}{s} r{d}, {s}\n", .{
+                mnemonic, condition_suffix, source, operand,
             });
             try self.style.green().print(self.writer, "        NZCV: {b:0>4} → {b:0>4}\n", .{
                 vector.initial.cpsr >> 28, vector.final.cpsr >> 28,
             });
             return;
         }
-        const arithmetic = operation & 0x0FE0_0000;
-        if (arithmetic == 0x0080_0000 or arithmetic == 0x0040_0000) {
+        const flag_suffix = if (instruction & (1 << 20) != 0) "S" else "";
+        if (opcode != 13 and opcode != 15) {
             const source: u4 = @truncate(instruction >> 16);
-            const flag_suffix = if (instruction & (1 << 20) != 0) "S" else "";
-            const mnemonic = if (arithmetic == 0x0080_0000) "ADD" else "SUB";
             try self.style.cyan().print(self.writer, "  {s}{s}{s} r{d}, r{d}, {s}\n", .{
                 mnemonic, condition_suffix, flag_suffix, destination, source, operand,
             });
         } else {
-            try self.style.cyan().print(self.writer, "  MOV{s} r{d}, {s}\n", .{
-                condition_suffix, destination, operand,
+            try self.style.cyan().print(self.writer, "  {s}{s}{s} r{d}, {s}\n", .{
+                mnemonic, condition_suffix, flag_suffix, destination, operand,
             });
         }
         try self.style.dim().print(self.writer, "        r{d}: 0x{x:0>8} → ", .{
@@ -354,15 +357,27 @@ const Report = struct {
 
     fn summary(self: *Report) !void {
         try self.endLine();
-        try self.style.green().print(self.writer, "{d} passed", .{self.passed});
+        const total = self.passed + self.failed + self.skipped;
+        try self.style.green().print(self.writer, "{d} passed ({d:.2}%)", .{
+            self.passed, percentage(self.passed, total),
+        });
         try self.writer.writeAll(" · ");
-        try self.style.red().print(self.writer, "{d} failed", .{self.failed});
+        try self.style.red().print(self.writer, "{d} failed ({d:.2}%)", .{
+            self.failed, percentage(self.failed, total),
+        });
         try self.writer.writeAll(" · ");
-        try self.style.yellow().print(self.writer, "{d} skipped", .{self.skipped});
+        try self.style.yellow().print(self.writer, "{d} skipped ({d:.2}%)", .{
+            self.skipped, percentage(self.skipped, total),
+        });
         try self.writer.writeByte('\n');
         if (self.failed != 0) return error.VectorMismatch;
     }
 };
+
+fn percentage(count: usize, total: usize) f64 {
+    if (total == 0) return 0;
+    return 100 * @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(total));
+}
 
 fn inspectFile(
     directory: std.Io.Dir,
