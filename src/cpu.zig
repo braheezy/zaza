@@ -49,7 +49,7 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
 }
 
 const ArmDataProcessing = struct {
-    operation: enum { mov, add, sub, cmp },
+    operation: enum { mov, mvn, and_, eor, orr, bic, tst, teq, add, sub, cmp },
     condition: u4,
     set_flags: bool,
     source: u4,
@@ -57,7 +57,7 @@ const ArmDataProcessing = struct {
     operand: Operand,
 
     const Operand = union(enum) {
-        immediate: u32,
+        immediate: struct { value: u32, rotated: bool },
         shifted_register: RegisterShift,
     };
     const RegisterShift = struct { register: u4, kind: u2, amount: u5 };
@@ -83,7 +83,14 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
     const source: u4 = @truncate(instruction >> 16);
     var decoded: ArmDataProcessing = .{
         .operation = switch (opcode) {
+            0b0000 => .and_,
+            0b0001 => .eor,
+            0b1000 => .tst,
+            0b1001 => .teq,
+            0b1100 => .orr,
             0b1101 => .mov,
+            0b1110 => .bic,
+            0b1111 => .mvn,
             0b0100 => .add,
             0b0010 => .sub,
             0b1010 => .cmp,
@@ -96,10 +103,20 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
         .operand = undefined,
     };
     switch (decoded.operation) {
-        .mov => {
+        .mov, .mvn => {
             if (source != 0) return error.UnsupportedInstruction;
-            if (set_flags) return error.UnsupportedInstruction;
-            if (destination == program_counter) return error.UnsupportedInstruction;
+            if (destination >= 8) {
+                if (decoded.operation != .mov or set_flags) return error.UnsupportedInstruction;
+                if (destination == program_counter) return error.UnsupportedInstruction;
+            }
+        },
+        .and_, .eor, .orr, .bic, .tst, .teq => {
+            if (source >= 8) return error.UnsupportedInstruction;
+            if (destination >= 8) return error.UnsupportedInstruction;
+            // With S clear, these test opcodes overlap other encoding families.
+            if (decoded.operation == .tst or decoded.operation == .teq) {
+                if (!set_flags) return error.UnsupportedInstruction;
+            }
         },
         .add, .sub, .cmp => {
             // Banking and special PC operands are outside the current implementation.
@@ -115,7 +132,10 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
     if (immediate_operand) {
         const immediate: u8 = @truncate(instruction);
         const rotation: u4 = @truncate(instruction >> 8);
-        decoded.operand = .{ .immediate = std.math.rotr(u32, immediate, @as(u5, rotation) * 2) };
+        decoded.operand = .{ .immediate = .{
+            .value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2),
+            .rotated = rotation != 0,
+        } };
     } else {
         decoded.operand = .{ .shifted_register = .{
             .register = operand_register,
@@ -128,14 +148,39 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
 
 fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
     if (!conditionPassed(decoded.condition, self.readFlags())) return;
-    const value = switch (decoded.operand) {
-        .immediate => |immediate| immediate,
+    const old_flags = self.readFlags();
+    const operand: ShifterResult = switch (decoded.operand) {
+        .immediate => |immediate| .{
+            .value = immediate.value,
+            .carry = if (immediate.rotated) immediate.value >> 31 != 0 else old_flags.carry,
+        },
         .shifted_register => |shift| self.shiftedRegisterOperand(shift),
     };
+    const value = operand.value;
     const source = decoded.source;
     const destination = decoded.destination;
     switch (decoded.operation) {
-        .mov => self.writeGeneralRegister(destination, value),
+        .mov, .mvn, .and_, .eor, .orr, .bic, .tst, .teq => {
+            const result = switch (decoded.operation) {
+                .mov => value,
+                .mvn => ~value,
+                .and_, .tst => self.readRegister(source) & value,
+                .eor, .teq => self.readRegister(source) ^ value,
+                .orr => self.readRegister(source) | value,
+                .bic => self.readRegister(source) & ~value,
+                else => unreachable,
+            };
+            switch (decoded.operation) {
+                .tst, .teq => {},
+                else => self.writeGeneralRegister(destination, result),
+            }
+            if (decoded.set_flags) self.writeFlags(.{
+                .negative = result >> 31 != 0,
+                .zero = result == 0,
+                .carry = operand.carry,
+                .overflow = old_flags.overflow,
+            });
+        },
         .add => {
             const left = self.readRegister(source);
             const sum, const carry = @addWithOverflow(left, value);
@@ -166,20 +211,30 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
     }
 }
 
-fn shiftedRegisterOperand(self: *const Cpu, shift: ArmDataProcessing.RegisterShift) u32 {
+const ShifterResult = struct { value: u32, carry: bool };
+
+fn shiftedRegisterOperand(self: *const Cpu, shift: ArmDataProcessing.RegisterShift) ShifterResult {
     const value = self.readRegister(shift.register);
     const amount = shift.amount;
     const kind = shift.kind;
     // Zero encodes 32 for LSR/ASR and rotate-through-carry for ROR.
-    return switch (kind) {
-        0 => value << amount,
-        1 => if (amount == 0) 0 else value >> amount,
-        2 => @bitCast(@as(i32, @bitCast(value)) >> if (amount == 0) 31 else amount),
-        3 => if (amount == 0)
-            (value >> 1) | (@as(u32, @intFromBool(self.readFlags().carry)) << 31)
-        else
-            std.math.rotr(u32, value, amount),
+    if (amount == 0) return switch (kind) {
+        0 => .{ .value = value, .carry = self.readFlags().carry },
+        1 => .{ .value = 0, .carry = value >> 31 != 0 },
+        2 => .{ .value = @bitCast(@as(i32, @bitCast(value)) >> 31), .carry = value >> 31 != 0 },
+        3 => .{
+            .value = (value >> 1) | (@as(u32, @intFromBool(self.readFlags().carry)) << 31),
+            .carry = value & 1 != 0,
+        },
     };
+    const result: u32 = switch (kind) {
+        0 => value << amount,
+        1 => value >> amount,
+        2 => @bitCast(@as(i32, @bitCast(value)) >> amount),
+        3 => std.math.rotr(u32, value, amount),
+    };
+    const carry_bit = if (kind == 0) 0 -% amount else amount - 1;
+    return .{ .value = result, .carry = (value >> carry_bit) & 1 != 0 };
 }
 
 fn advanceArmPipeline(self: *Cpu, bus: anytype) u32 {
