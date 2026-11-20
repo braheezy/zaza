@@ -43,7 +43,27 @@ pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
 pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
     if (self.cpsr & thumb_bit != 0) return error.UnsupportedInstruction;
     const queued = self.pipeline orelse return error.PipelineNotReady;
-    const instruction = queued[0];
+    const decoded = try decodeArmDataProcessing(queued[0]);
+    self.executeArmDataProcessing(decoded);
+    _ = self.advanceArmPipeline(bus);
+}
+
+const ArmDataProcessing = struct {
+    operation: enum { mov, add, sub, cmp },
+    condition: u4,
+    set_flags: bool,
+    source: u4,
+    destination: u4,
+    operand: Operand,
+
+    const Operand = union(enum) {
+        immediate: u32,
+        shifted_register: RegisterShift,
+    };
+    const RegisterShift = struct { register: u4, kind: u2, amount: u5 };
+};
+
+fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDataProcessing {
     const condition: u4 = @truncate(instruction >> 28);
     const destination: u4 = @truncate(instruction >> 12);
 
@@ -55,32 +75,72 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         if (operand_register >= 8) return error.UnsupportedInstruction;
         if (destination >= 8) return error.UnsupportedInstruction;
     }
-    const operation = instruction & ~(@as(u32, 1) << 25);
-    const is_move = operation & 0x0FFF_0000 == 0x01A0_0000;
-    const is_add = operation & 0x0FE0_0000 == 0x0080_0000;
-    const is_subtract = operation & 0x0FE0_0000 == 0x0040_0000;
-    const is_compare = operation & 0x0FFF_0000 == 0x0150_0000;
+    // Bits 27–26 select the encoding family; bits 24–21 name the ALU operation.
+    const family: u2 = @truncate(instruction >> 26);
+    if (family != 0) return error.UnsupportedInstruction;
+    const opcode: u4 = @truncate(instruction >> 21);
+    const set_flags = instruction & (1 << 20) != 0;
     const source: u4 = @truncate(instruction >> 16);
-    if (is_add or is_subtract or is_compare) {
-        if (source >= 8) return error.UnsupportedInstruction;
-        if (destination >= 8) return error.UnsupportedInstruction;
-    } else {
-        if (!is_move) return error.UnsupportedInstruction;
-        if (destination == program_counter) return error.UnsupportedInstruction;
+    var decoded: ArmDataProcessing = .{
+        .operation = switch (opcode) {
+            0b1101 => .mov,
+            0b0100 => .add,
+            0b0010 => .sub,
+            0b1010 => .cmp,
+            else => return error.UnsupportedInstruction,
+        },
+        .condition = condition,
+        .set_flags = set_flags,
+        .source = source,
+        .destination = destination,
+        .operand = undefined,
+    };
+    switch (decoded.operation) {
+        .mov => {
+            if (source != 0) return error.UnsupportedInstruction;
+            if (set_flags) return error.UnsupportedInstruction;
+            if (destination == program_counter) return error.UnsupportedInstruction;
+        },
+        .add, .sub, .cmp => {
+            // Banking and special PC operands are outside the current implementation.
+            if (source >= 8) return error.UnsupportedInstruction;
+            if (destination >= 8) return error.UnsupportedInstruction;
+            if (decoded.operation == .cmp) {
+                // Preserve the existing CMP coverage in this refactor.
+                if (!set_flags) return error.UnsupportedInstruction;
+                if (source != 0) return error.UnsupportedInstruction;
+            }
+        },
     }
-
-    if (conditionPassed(condition, self.readFlags())) {
+    if (immediate_operand) {
         const immediate: u8 = @truncate(instruction);
         const rotation: u4 = @truncate(instruction >> 8);
-        const value = if (immediate_operand)
-            std.math.rotr(u32, immediate, @as(u5, rotation) * 2)
-        else
-            self.shiftedRegisterOperand(instruction, operand_register);
-        if (is_add) {
+        decoded.operand = .{ .immediate = std.math.rotr(u32, immediate, @as(u5, rotation) * 2) };
+    } else {
+        decoded.operand = .{ .shifted_register = .{
+            .register = operand_register,
+            .kind = @truncate(instruction >> 5),
+            .amount = @truncate(instruction >> 7),
+        } };
+    }
+    return decoded;
+}
+
+fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
+    if (!conditionPassed(decoded.condition, self.readFlags())) return;
+    const value = switch (decoded.operand) {
+        .immediate => |immediate| immediate,
+        .shifted_register => |shift| self.shiftedRegisterOperand(shift),
+    };
+    const source = decoded.source;
+    const destination = decoded.destination;
+    switch (decoded.operation) {
+        .mov => self.writeGeneralRegister(destination, value),
+        .add => {
             const left = self.readRegister(source);
             const sum, const carry = @addWithOverflow(left, value);
             self.writeGeneralRegister(destination, sum);
-            if (instruction & (1 << 20) != 0) {
+            if (decoded.set_flags) {
                 self.writeFlags(.{
                     .negative = sum >> 31 != 0,
                     .zero = sum == 0,
@@ -88,11 +148,13 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
                     .overflow = ((left ^ sum) & (value ^ sum)) >> 31 != 0,
                 });
             }
-        } else if (is_subtract or is_compare) {
+        },
+        .sub, .cmp => {
             const left = self.readRegister(source);
             const difference, const borrow = @subWithOverflow(left, value);
-            if (!is_compare) self.writeGeneralRegister(destination, difference);
-            if (instruction & (1 << 20) != 0) {
+            // CMP uses the subtraction flags but discards the result.
+            if (decoded.operation == .sub) self.writeGeneralRegister(destination, difference);
+            if (decoded.set_flags) {
                 self.writeFlags(.{
                     .negative = difference >> 31 != 0,
                     .zero = difference == 0,
@@ -100,17 +162,14 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
                     .overflow = ((left ^ value) & (left ^ difference)) >> 31 != 0,
                 });
             }
-        } else {
-            self.writeGeneralRegister(destination, value);
-        }
+        },
     }
-    _ = self.advanceArmPipeline(bus);
 }
 
-fn shiftedRegisterOperand(self: *const Cpu, instruction: u32, register: u4) u32 {
-    const value = self.readRegister(register);
-    const amount: u5 = @truncate(instruction >> 7);
-    const kind: u2 = @truncate(instruction >> 5);
+fn shiftedRegisterOperand(self: *const Cpu, shift: ArmDataProcessing.RegisterShift) u32 {
+    const value = self.readRegister(shift.register);
+    const amount = shift.amount;
+    const kind = shift.kind;
     // Zero encodes 32 for LSR/ASR and rotate-through-carry for ROR.
     return switch (kind) {
         0 => value << amount,
