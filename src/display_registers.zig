@@ -1,19 +1,27 @@
 const std = @import("std");
 const Registers = @This();
+const base: u32 = 0x0400_0008;
 
 // Storage for display configuration beyond DISPCNT/DISPSTAT/VCOUNT.
 // Raster effects and register read open-bus behavior are not implemented.
-values: [0x28]u16 = @splat(0),
+values: [0x28]u16 = blk: {
+    var values: [0x28]u16 = @splat(0);
+    // BG2 and BG3 start with an identity transform (PA = PD = 1.0).
+    for ([_]u32{ 0x0400_0020, 0x0400_0026, 0x0400_0030, 0x0400_0036 }) |address| {
+        values[(address - base) / 2] = 0x0100;
+    }
+    break :blk values;
+},
 
 pub fn contains(address: u32) bool {
-    return address >= 0x0400_0008 and address < 0x0400_0058;
+    return address >= base and address < 0x0400_0058;
 }
 
 // Internal register access for the renderer and byte-write merging.
 pub fn stored(self: *const Registers, address: u32) u16 {
     std.debug.assert(contains(address));
     std.debug.assert(address & 1 == 0);
-    return self.values[(address - 0x0400_0008) / 2];
+    return self.values[(address - base) / 2];
 }
 
 pub fn affineReference(self: *const Registers, address: u32) i32 {
@@ -25,7 +33,7 @@ pub fn affineReference(self: *const Registers, address: u32) i32 {
 pub fn write(self: *Registers, address: u32, value: u16) void {
     std.debug.assert(contains(address));
     std.debug.assert(address & 1 == 0);
-    const offset = address - 0x0400_0008;
+    const offset = address - base;
     const mask: u16 = switch (address) {
         0x0400_0010...0x0400_001E => 0x01FF,
         0x0400_002A, 0x0400_002E, 0x0400_003A, 0x0400_003E => 0x0FFF,

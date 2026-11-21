@@ -418,8 +418,7 @@ test "Mode 4 selects the front and back pages and uses the live background palet
     var machine: Machine = undefined;
     machine.initCartridge(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
     const bus = &machine.bus;
-    bus.writeData(u16, 0x0400_0020, 0x0100); // BG2PA
-    bus.writeData(u16, 0x0400_0026, 0x0100); // BG2PD
+    // The default BG2 transform maps bitmap pixels directly to the screen.
     bus.writeData(u16, Bus.palette_base, 0x7C00);
     bus.writeData(u16, Bus.palette_base + 2, 0x001F);
     bus.writeData(u16, Bus.palette_base + 510, 0x03E0);

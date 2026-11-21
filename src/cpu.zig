@@ -689,15 +689,16 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
     const upper_register: u4 = @truncate(instruction >> 16);
     const long = instruction & (1 << 23) != 0;
     const accumulate = instruction & (1 << 21) != 0;
-    // ARMv4T excludes PC and restricts destination aliases with Rm.
+    // The multiplier reads its operands before writeback, so Rm can also be a destination.
+    // The ARM Architecture Reference Manual describes this behavior for ARMv4 implementations.
     if (left_register == program_counter or right_register == program_counter or
-        upper_register == program_counter or upper_register == left_register)
+        upper_register == program_counter)
     {
         return error.UnsupportedInstruction;
     }
     if (long) {
-        if (lower_register == program_counter or lower_register == left_register or
-            lower_register == upper_register) return error.UnsupportedInstruction;
+        if (lower_register == program_counter or lower_register == upper_register)
+            return error.UnsupportedInstruction;
     } else if (accumulate) {
         if (lower_register == program_counter) return error.UnsupportedInstruction;
     } else if (lower_register != 0) return error.UnsupportedInstruction;
@@ -742,6 +743,31 @@ fn multiplyCycles(multiplier: u32, allow_ones: bool) u8 {
     if (signed_fill >> 16 == 0) return 2;
     if (signed_fill >> 24 == 0) return 3;
     return 4;
+}
+
+test "ARM multiply reads aliased source registers before writeback" {
+    // MLA uses the output register as an input when the memory ROM computes a pixel offset.
+    var cpu: Cpu = .{};
+    cpu.registers[0] = 56;
+    cpu.registers[1] = 76;
+    cpu.registers[4] = 240;
+    try cpu.executeArmMultiply(0xE024_0194); // MLA r4, r4, r1, r0
+    try std.testing.expectEqual(@as(u32, 18_296), cpu.registers[4]);
+    try std.testing.expectEqual(@as(u64, 2), cpu.internal_cycles);
+
+    // Both words of the long accumulator and the aliased multiplicand use their old values.
+    cpu.registers[0] = 0xFFFF_FFFF;
+    cpu.registers[1] = 7;
+    cpu.registers[2] = 2;
+    try cpu.executeArmMultiply(0xE0A1_0290); // UMLAL r0, r1, r0, r2
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFD), cpu.registers[0]);
+    try std.testing.expectEqual(@as(u32, 9), cpu.registers[1]);
+
+    cpu.registers[0] = 0xFFFF_FFFF;
+    cpu.registers[1] = 7;
+    try cpu.executeArmMultiply(0xE0A1_0291); // UMLAL r0, r1, r1, r2
+    try std.testing.expectEqual(@as(u32, 13), cpu.registers[0]);
+    try std.testing.expectEqual(@as(u32, 8), cpu.registers[1]);
 }
 
 fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) void {
