@@ -203,20 +203,45 @@ test "vector bus replays a fetch and detects missing or wrong fetches" {
     try std.testing.expectError(error.UnexpectedFetch, bus.finish());
 }
 
+fn physicalBanks(state: State) Cpu.BankedRegisters {
+    return .{
+        .fiq = state.fiq,
+        .supervisor = state.supervisor,
+        .abort = state.abort,
+        .irq = state.irq,
+        .undefined_instruction = state.undefined_instruction,
+    };
+}
+
+fn visibleRegister(state: State, index: u4) u32 {
+    var cpu: Cpu = .{
+        .registers = state.registers[0..15].*,
+        .banked = physicalBanks(state),
+        .cpsr = state.cpsr,
+    };
+    return cpu.readRegister(index);
+}
+
 fn runSelectedVector(vector: Vector) !void {
-    // Only test destinations that cannot touch banked state.
-    const destination: u4 = @truncate(vector.opcode >> 12);
-    if (destination >= 8) return error.UnsupportedInstruction;
+    const mode_bits: u5 = @truncate(vector.initial.cpsr);
+    switch (mode_bits) {
+        0x10, 0x11, 0x12, 0x13, 0x17, 0x1B, 0x1F => {},
+        else => return error.UnsupportedInstruction,
+    }
     if (vector.initial.pipeline[0] != vector.opcode) return error.InvalidVector;
     var cpu: Cpu = .{
         .registers = vector.initial.registers[0..15].*,
+        .banked = physicalBanks(vector.initial),
         .instruction_address = vector.initial.registers[15] -% 8,
         .cpsr = vector.initial.cpsr,
         .pipeline = vector.initial.pipeline,
     };
+
     var bus: TestBus = .{ .transactions = .{ .remaining = vector.transactions } };
     try cpu.step(&bus);
     try bus.finish();
+
+    if (!std.meta.eql(physicalBanks(vector.final), cpu.banked)) return error.BankMismatch;
     if (!std.mem.eql(u32, vector.final.registers[0..15], &cpu.registers)) {
         return error.RegisterMismatch;
     }
@@ -316,10 +341,10 @@ const Report = struct {
             });
         }
         try self.style.dim().print(self.writer, "        r{d}: 0x{x:0>8} → ", .{
-            destination, vector.initial.registers[destination],
+            destination, visibleRegister(vector.initial, destination),
         });
         try self.style.green().print(self.writer, "0x{x:0>8}\n", .{
-            vector.final.registers[destination],
+            visibleRegister(vector.final, destination),
         });
     }
 

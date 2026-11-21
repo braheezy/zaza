@@ -13,10 +13,19 @@ const Mode = enum(u5) {
 const Cpu = @This();
 
 registers: [15]u32 = @splat(0),
+banked: BankedRegisters = .{},
 instruction_address: u32 = 0,
 // Current instruction first, then the next one. Null until the initial refill.
 pipeline: ?[2]u32 = null,
 cpsr: u32 = 0xD3, // Supervisor mode, ARM state, IRQ and FIQ masked.
+
+pub const BankedRegisters = struct {
+    fiq: [7]u32 = @splat(0),
+    supervisor: [2]u32 = @splat(0),
+    abort: [2]u32 = @splat(0),
+    irq: [2]u32 = @splat(0),
+    undefined_instruction: [2]u32 = @splat(0),
+};
 
 const stack_pointer: u4 = 13;
 const link_register: u4 = 14;
@@ -75,10 +84,9 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
             // Bit 7 must be clear; otherwise this can be a different encoding family.
             if (instruction & (1 << 7) != 0) return error.UnsupportedInstruction;
             const shift_register: u4 = @truncate(instruction >> 8);
-            if (shift_register >= 8) return error.UnsupportedInstruction;
+            if (shift_register == program_counter) return error.UnsupportedInstruction;
         }
-        if (operand_register >= 8) return error.UnsupportedInstruction;
-        if (destination >= 8) return error.UnsupportedInstruction;
+        if (operand_register == program_counter) return error.UnsupportedInstruction;
     }
     // Bits 27–26 select the encoding family; bits 24–21 name the ALU operation.
     const family: u2 = @truncate(instruction >> 26);
@@ -111,25 +119,20 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
         .destination = destination,
         .operand = undefined,
     };
+    if (destination == program_counter) return error.UnsupportedInstruction;
     switch (decoded.operation) {
         .mov, .mvn => {
             if (source != 0) return error.UnsupportedInstruction;
-            if (destination >= 8) {
-                if (decoded.operation != .mov or set_flags) return error.UnsupportedInstruction;
-                if (destination == program_counter) return error.UnsupportedInstruction;
-            }
         },
         .and_, .eor, .orr, .bic, .tst, .teq => {
-            if (source >= 8) return error.UnsupportedInstruction;
-            if (destination >= 8) return error.UnsupportedInstruction;
+            if (source == program_counter) return error.UnsupportedInstruction;
             // With S clear, these test opcodes overlap other encoding families.
             if (decoded.operation == .tst or decoded.operation == .teq) {
                 if (!set_flags) return error.UnsupportedInstruction;
             }
         },
         .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
-            if (source >= 8) return error.UnsupportedInstruction;
-            if (destination >= 8) return error.UnsupportedInstruction;
+            if (source == program_counter) return error.UnsupportedInstruction;
             if (decoded.operation == .cmp or decoded.operation == .cmn) {
                 if (!set_flags) return error.UnsupportedInstruction;
             }
@@ -226,7 +229,7 @@ fn addWithCarry(left: u32, right: u32, carry_in: bool) struct { value: u32, flag
 
 const ShifterResult = struct { value: u32, carry: bool };
 
-fn shiftedRegisterOperand(self: *const Cpu, shift: ArmDataProcessing.RegisterShift) ShifterResult {
+fn shiftedRegisterOperand(self: *Cpu, shift: ArmDataProcessing.RegisterShift) ShifterResult {
     const value = self.readRegister(shift.register);
     const kind = shift.kind;
     const amount = switch (shift.amount) {
@@ -308,10 +311,27 @@ fn conditionPassed(condition: u4, flags: Flags) bool {
     };
 }
 
-fn readRegister(self: *const Cpu, index: u4) u32 {
+// Return the physical bank currently visible at the top of the register file.
+fn activeBank(self: *Cpu) []u32 {
+    return switch (self.mode()) {
+        .user, .system => self.registers[15..15],
+        .fiq => &self.banked.fiq,
+        .supervisor => &self.banked.supervisor,
+        .abort => &self.banked.abort,
+        .irq => &self.banked.irq,
+        .undefined_instruction => &self.banked.undefined_instruction,
+    };
+}
+
+pub fn readRegister(self: *Cpu, index: u4) u32 {
     if (index == program_counter) {
         const offset: u32 = if (self.cpsr & thumb_bit != 0) 4 else 8;
         return self.instruction_address +% offset;
+    }
+    if (index >= 8) {
+        const bank = self.activeBank();
+        const first = 15 - bank.len;
+        if (index >= first) return bank[index - first];
     }
     return self.registers[index];
 }
@@ -319,12 +339,35 @@ fn readRegister(self: *const Cpu, index: u4) u32 {
 fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
     // PC writes must go through the control-flow path.
     std.debug.assert(index < program_counter);
+    if (index >= 8) {
+        const bank = self.activeBank();
+        const first = 15 - bank.len;
+        if (index >= first) {
+            bank[index - first] = value;
+            return;
+        }
+    }
     self.registers[index] = value;
 }
 
 fn mode(self: *Cpu) Mode {
     const mode_bits: u5 = @truncate(self.cpsr);
     return @fromBackingInt(mode_bits);
+}
+
+test "SP banks follow mode and User and System share storage" {
+    var cpu: Cpu = .{};
+    cpu.writeGeneralRegister(stack_pointer, 1);
+    cpu.cpsr = 0xD2; // IRQ.
+    cpu.writeGeneralRegister(stack_pointer, 2);
+    cpu.cpsr = 0xD0; // User.
+    cpu.writeGeneralRegister(stack_pointer, 3);
+    cpu.cpsr = 0xDF; // System.
+    try std.testing.expectEqual(@as(u32, 3), cpu.readRegister(stack_pointer));
+    cpu.cpsr = 0xD2;
+    try std.testing.expectEqual(@as(u32, 2), cpu.readRegister(stack_pointer));
+    cpu.cpsr = 0xD3;
+    try std.testing.expectEqual(@as(u32, 1), cpu.readRegister(stack_pointer));
 }
 
 test "ARM pipeline refill and advance fetch words in address order" {
