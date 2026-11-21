@@ -228,3 +228,24 @@ test "bundled emibios sound reset clears mixer routing and returns to the cartri
     // emibios leaves the Direct Sound gain bits set and clears stereo routing.
     try std.testing.expectEqual(@as(u32, 0x000E_0000), machine.bus.readData(u32, 0x0400_0080));
 }
+
+test "bundled emibios clears both palette banks and returns to the cartridge" {
+    const rom = [_]u8{
+        0x04, 0x00, 0xA0, 0xE3, // MOV r0, #4 (reset palette RAM).
+        0x00, 0x00, 0x01, 0xEF, // SWI 0x010000 (RegisterRamReset).
+        0x2A, 0x40, 0xA0, 0xE3, // MOV r4, #42.
+        0xFE, 0xFF, 0xFF, 0xEA, // B to self.
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(&rom, bundled_bios);
+    @memset(&machine.bus.palette, 0xFF);
+    for (0..10_000) |_| {
+        if (machine.cpu.instruction_address == Bus.rom_base + 12) break;
+        try machine.step();
+    } else return error.BiosDidNotReturn;
+    try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[4]);
+    const cleared: @TypeOf(machine.bus.palette) = @splat(0);
+    try std.testing.expectEqualSlices(u8, &cleared, &machine.bus.palette);
+}

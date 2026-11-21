@@ -27,6 +27,8 @@ const waitcnt_prefetch_enable: u16 = 1 << 14;
 pub const ime_address: u32 = 0x0400_0208;
 pub const bios_size_bytes = 16 * 1024;
 const irq_source_mask: u16 = 0x3FFF;
+pub const palette_base: u32 = 0x0500_0000;
+const palette_size_bytes = 1024;
 pub const vram_base: u32 = 0x0600_0000;
 const iwram_size_bytes = 32 * 1024;
 const vram_size_bytes = 96 * 1024;
@@ -43,6 +45,7 @@ display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
 iwram: [iwram_size_bytes]u8 = @splat(0),
+palette: [palette_size_bytes]u8 = @splat(0),
 vram: [vram_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
@@ -159,6 +162,9 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         self.chargeIwramDataAccess();
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
+    if (paletteOffset(aligned_address)) |offset| {
+        return std.mem.readInt(T, self.palette[offset..][0..@sizeOf(T)], .little);
+    }
     if (T == u16) {
         if (aligned_address == dispcnt_address) return self.dispcnt;
         if (aligned_address == dispcnt_address + 2) return self.greenswap;
@@ -219,6 +225,16 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     {
         self.writeData(u16, aligned_address, @truncate(value));
         self.writeData(u16, aligned_address + 2, @truncate(value >> 16));
+        return;
+    }
+    if (paletteOffset(aligned_address)) |offset| {
+        if (T == u8) {
+            // Palette RAM drives both byte lanes on a byte store.
+            const halfword_offset = offset & ~@as(u32, 1);
+            self.palette[halfword_offset..][0..2].* = @splat(value);
+        } else {
+            std.mem.writeInt(T, self.palette[offset..][0..@sizeOf(T)], value, .little);
+        }
         return;
     }
     if (T == u16) {
@@ -313,6 +329,11 @@ fn alignDataAddress(comptime T: type, address: u32) u32 {
 fn iwramOffset(address: u32) ?u32 {
     if (address < iwram_base or address >= iwram_base + iwram_size_bytes) return null;
     return address - iwram_base;
+}
+
+fn paletteOffset(address: u32) ?u32 {
+    if (address >> 24 != palette_base >> 24) return null;
+    return address % palette_size_bytes;
 }
 
 fn vramOffset(address: u32) ?u32 {
@@ -501,4 +522,15 @@ test "keypad any and all matches latch IF independently of CPU delivery" {
     bus.setPressedButtons(0);
     bus.setPressedButtons(3);
     try std.testing.expectEqual(keypad_irq, bus.irq_flags);
+}
+
+test "palette RAM mirrors share storage and byte writes update only the addressed color" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, palette_base + 0x1FC, 0x7C00_1234);
+    bus.writeData(u8, palette_base + 0x5FD, 0x5A);
+    try std.testing.expectEqual(@as(u32, 0x7C00_5A5A), bus.readData(u32, palette_base + 0x1FC));
+    try std.testing.expectEqual(@as(u8, 0x7C), bus.readData(u8, palette_base + 0x5FF));
+    bus.writeData(u16, 0x05FF_FFFE, 0xFEDC);
+    try std.testing.expectEqual(@as(u16, 0xFEDC), bus.readData(u16, palette_base + 0x3FE));
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, palette_base));
 }
