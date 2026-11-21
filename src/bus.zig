@@ -50,7 +50,8 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             return;
         }
     }
-    const offset = iwramOffset(aligned_address) orelse @panic("unmapped data write");
+    const offset = iwramOffset(aligned_address) orelse
+        std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
 }
 
@@ -72,7 +73,9 @@ fn vramOffset(address: u32) ?u32 {
 
 fn readRom(self: *const Bus, comptime T: type, address: u32) T {
     // Only the first cartridge window is mapped in this initial bus.
-    if (address < rom_base or address >= 0x0A00_0000) @panic("unmapped ROM address");
+    if (address < rom_base or address >= 0x0A00_0000) {
+        std.debug.panic("unmapped {d}-bit read at 0x{x:0>8}", .{ @bitSizeOf(T), address });
+    }
     const offset = address - rom_base;
     if (offset + @sizeOf(T) > self.rom.len) @panic("read past end of ROM");
     return std.mem.readInt(T, self.rom[offset..][0..@sizeOf(T)], .little);

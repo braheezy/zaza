@@ -1,17 +1,39 @@
 pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 2) {
-        std.debug.print("Usage: zaza <output.bmp>\n", .{});
-        return error.InvalidArguments;
-    }
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    const run: struct { rom: []const u8, steps: usize, output: []const u8 } = switch (args.len) {
+        2 => .{ .rom = &mode3_demo_rom, .steps = mode3_demo_steps, .output = args[1] },
+        4 => blk: {
+            const steps = try std.fmt.parseInt(usize, args[2], 10);
+            if (steps == 0) return error.InvalidStepCount;
+            const rom = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                args[1],
+                arena,
+                .limited(32 * 1024 * 1024 + 1),
+            );
+            if (rom.len < 8) return error.RomTooShort;
+            break :blk .{ .rom = rom, .steps = steps, .output = args[3] };
+        },
+        else => {
+            std.debug.print("Usage: zaza [<input.gba> <steps>] <output.bmp>\n", .{});
+            return error.InvalidArguments;
+        },
+    };
 
     var machine: Machine = undefined;
-    machine.initCartridge(&mode3_demo_rom);
-    for (0..mode3_demo_steps) |_| try machine.step();
+    machine.initCartridge(run.rom);
+    for (0..run.steps) |step| {
+        const address = machine.cpu.instruction_address;
+        machine.step() catch |err| {
+            std.debug.print("CPU stopped after {d} steps at 0x{x:0>8}\n", .{ step, address });
+            return err;
+        };
+    }
     var frame: video.Frame = undefined;
     try machine.snapshotMode3(&frame);
 
-    const file = try std.Io.Dir.cwd().createFile(init.io, args[1], .{ .exclusive = true });
+    const file = try std.Io.Dir.cwd().createFile(init.io, run.output, .{ .exclusive = true });
     defer file.close(init.io);
     var buffer: [4096]u8 = undefined;
     var file_writer = file.writer(init.io, &buffer);
