@@ -50,4 +50,23 @@ zig-out/bin/zaza --boot replay /path/to/bios.gba 400 /tmp/bios-test.bmp \
   --input '0 none'
 ```
 
-To select a different BIOS, place `--bios /path/to/bios.bin` before `--boot`.
+To select a different BIOS, add `--bios /path/to/bios.bin` before the command.
+
+## Cartridge saves
+
+Zaza detects save hardware from the ROM's save-type signature. Use
+`--save-type sram`, `flash64`, `flash128`, `eeprom`, `eeprom512`,
+`eeprom8k`, or `none` to override detection. The `eeprom` setting infers
+capacity from the game's DMA commands or the size of an existing save.
+
+Add `--save /path/to/game.sav` to load and persist the cartridge's raw save
+data. Supply the save options before the command or ROM. Without a save path,
+the cartridge's save data stays in memory for the session.
+
+```sh
+zig build window -Ddesktop=true -- --save /path/to/game.sav --live /path/to/game.gba
+```
+
+Zaza writes changed data after a successful capture or on normal window
+exit. It rejects a save whose size does not match the cartridge and uses
+an adjacent `.lock` file to prevent two Zaza sessions from writing the same save.

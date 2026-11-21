@@ -7,6 +7,7 @@ const video = @import("video.zig");
 const Machine = @import("machine.zig");
 const input = @import("input.zig");
 const timing = @import("timing.zig");
+const save_file = @import("save_file.zig");
 
 const frame_period_ns = timing.cycles_per_frame * std.time.ns_per_s / (1 << 24);
 const window_scale = 3;
@@ -23,26 +24,31 @@ var live_machine: ?*Machine = null;
 var live_error: ?anyerror = null;
 
 pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3) {
+    const arena = init.arena.allocator();
+    var args = (try init.minimal.args.toSlice(arena))[1..];
+    var save_options: save_file.Options = .{};
+    while (try save_options.take(&args)) {}
+    if (args.len != 2) {
         std.debug.print(
             "Usage: zaza-window <input.gba> <steps>\n" ++
-                "       zaza-window --live <input.gba>\n",
+                "       zaza-window --live <input.gba>\n" ++
+                "       Cartridge options: --save <path>, --save-type <type>\n",
             .{},
         );
         return error.InvalidArguments;
     }
-    const arena = init.arena.allocator();
-    if (std.mem.eql(u8, args[1], "--live")) {
-        const rom = try snapshot.loadRom(init.io, arena, args[2]);
-        const machine = try arena.create(Machine);
-        machine.initCartridgeWithBios(rom, snapshot.bundled_bios);
+    const live = std.mem.eql(u8, args[0], "--live");
+    const rom = try snapshot.loadRom(init.io, arena, if (live) args[1] else args[0]);
+    const machine = try arena.create(Machine);
+    machine.initCartridgeWithBios(rom, snapshot.bundled_bios);
+    var save = try save_options.open(init.io, arena, &machine.bus.save);
+    defer if (save) |session| session.close(init.io);
+    if (live) {
         live_machine = machine;
     } else {
-        const steps = try std.fmt.parseInt(usize, args[2], 10);
+        const steps = try std.fmt.parseInt(usize, args[1], 10);
         if (steps == 0) return error.InvalidStepCount;
-        const rom = try snapshot.loadRom(init.io, arena, args[1]);
-        try snapshot.captureBitmap(rom, snapshot.bundled_bios, steps, &frame);
+        try snapshot.captureMachineBitmap(machine, steps, &frame);
     }
 
     var modules: Modules = undefined;
@@ -50,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     defer modules.deinit(init.gpa);
     modules.get(.app).run(.main);
     if (live_error) |err| return err;
+    if (save) |*session| try session.flush(init.io, &machine.bus.save);
 }
 
 const App = struct {

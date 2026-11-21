@@ -38,6 +38,11 @@ pub fn ramAccessCycles(comptime T: type, region: u8) u8 {
     };
 }
 
+pub fn saveAccessCycles(waitcnt: u16) u8 {
+    const waits = [_]u8{ 4, 3, 2, 8 };
+    return 1 + waits[waitcnt & 3];
+}
+
 test "Game Pak window 0 charges each halfword of a word access" {
     try std.testing.expectEqual(@as(u8, 5), gamePakAccessCycles(u16, .nonsequential, 0, 0));
     try std.testing.expectEqual(@as(u8, 3), gamePakAccessCycles(u16, .sequential, 0, 0));

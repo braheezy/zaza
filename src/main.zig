@@ -1,13 +1,23 @@
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const args = (try init.minimal.args.toSlice(arena))[1..];
-    const with_bios = args.len >= 2 and std.mem.eql(u8, args[0], "--bios");
-    const remaining = if (with_bios) args[2..] else args;
-    const boot = remaining.len != 0 and std.mem.eql(u8, remaining[0], "--boot");
-    const run_args = if (boot) remaining[1..] else remaining;
-    const bios = if (with_bios) try loadBios(init.io, arena, args[1]) else bundled_bios;
+    var run_args = (try init.minimal.args.toSlice(arena))[1..];
+    var bios_path: ?[]const u8 = null;
+    var boot = false;
+    var save_options: save_file.Options = .{};
+    while (run_args.len != 0) {
+        if (try save_options.take(&run_args)) continue;
+        if (std.mem.eql(u8, run_args[0], "--bios")) {
+            if (run_args.len < 2 or bios_path != null) return error.InvalidArguments;
+            bios_path = run_args[1];
+            run_args = run_args[2..];
+        } else if (std.mem.eql(u8, run_args[0], "--boot")) {
+            boot = true;
+            run_args = run_args[1..];
+        } else break;
+    }
+    const bios = if (bios_path) |path| try loadBios(init.io, arena, path) else bundled_bios;
     if (run_args.len > 1 and std.mem.eql(u8, run_args[0], "replay")) {
-        return replayInput(init.io, arena, bios, boot, run_args[1..]);
+        return replayInput(init.io, arena, bios, boot, save_options, run_args[1..]);
     }
 
     const run: struct { rom: []const u8, steps: usize, output: []const u8 } = switch (run_args.len) {
@@ -27,7 +37,8 @@ pub fn main(init: std.process.Init) !void {
                     "       zaza [--bios <bios.bin>] [--boot] <input.gba> <steps> <output.bmp>\n" ++
                     "       zaza [--bios <bios.bin>] [--boot] replay <input.gba> " ++
                     "<frames> <output.bmp> " ++
-                    "(--input <script> | --input-file <path>)\n",
+                    "(--input <script> | --input-file <path>)\n" ++
+                    "       Cartridge options: --save <path>, --save-type <type>\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -37,9 +48,12 @@ pub fn main(init: std.process.Init) !void {
     var frame: video.Frame = undefined;
     var machine: Machine = undefined;
     if (boot) machine.initBios(run.rom, bios) else machine.initCartridgeWithBios(run.rom, bios);
+    var save = try save_options.open(init.io, arena, &machine.bus.save);
+    defer if (save) |session| session.close(init.io);
     try captureMachineBitmap(&machine, run.steps, &frame);
 
     try writeBitmap(init.io, run.output, &frame);
+    if (save) |*session| try session.flush(init.io, &machine.bus.save);
 }
 
 fn loadBios(io: std.Io, arena: std.mem.Allocator, path: []const u8) !*const [Bus.bios_size_bytes]u8 {
@@ -67,6 +81,7 @@ fn replayInput(
     arena: std.mem.Allocator,
     bios: *const [Bus.bios_size_bytes]u8,
     boot: bool,
+    save_options: save_file.Options,
     args: []const [:0]const u8,
 ) !void {
     if (args.len != 5) return error.InvalidReplayArguments;
@@ -86,6 +101,8 @@ fn replayInput(
     const rom = try loadRom(io, arena, args[0]);
     var machine: Machine = undefined;
     if (boot) machine.initBios(rom, bios) else machine.initCartridgeWithBios(rom, bios);
+    var save = try save_options.open(io, arena, &machine.bus.save);
+    defer if (save) |session| session.close(io);
     var replay: input.Replay = .{ .remaining = changes };
     for (0..frames) |index| {
         machine.runFrame(replay.buttonsForFrame(@intCast(index))) catch |err| {
@@ -98,6 +115,7 @@ fn replayInput(
     var frame: video.Frame = undefined;
     try machine.snapshotBitmap(&frame);
     try writeBitmap(io, args[2], &frame);
+    if (save) |*session| try session.flush(io, &machine.bus.save);
 }
 
 pub fn loadRom(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -107,18 +125,7 @@ pub fn loadRom(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const 
     return rom;
 }
 
-pub fn captureBitmap(
-    rom: []const u8,
-    bios: *const [Bus.bios_size_bytes]u8,
-    steps: usize,
-    frame: *video.Frame,
-) !void {
-    var machine: Machine = undefined;
-    machine.initCartridgeWithBios(rom, bios);
-    try captureMachineBitmap(&machine, steps, frame);
-}
-
-fn captureMachineBitmap(machine: *Machine, steps: usize, frame: *video.Frame) !void {
+pub fn captureMachineBitmap(machine: *Machine, steps: usize, frame: *video.Frame) !void {
     for (0..steps) |step| {
         const address = machine.cpu.instruction_address;
         machine.stepTimed() catch |err| {
@@ -136,6 +143,7 @@ const Machine = @import("machine.zig");
 const video = @import("video.zig");
 const bmp = @import("bmp.zig");
 const input = @import("input.zig");
+const save_file = @import("save_file.zig");
 
 const mode3_demo_rom = [_]u8{
     0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3

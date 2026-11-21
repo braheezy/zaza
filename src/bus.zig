@@ -6,6 +6,7 @@ const Audio = @import("audio.zig");
 const Timers = @import("timers.zig");
 const DMA = @import("dma.zig");
 const Serial = @import("serial.zig");
+const SaveMemory = @import("save_memory.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
 pub const ewram_base: u32 = 0x0200_0000;
@@ -46,6 +47,7 @@ const oam_size_bytes = 1024;
 
 // The caller owns both images and keeps them alive while the bus uses them.
 rom: []const u8,
+save: SaveMemory = .{},
 serial: Serial = .{},
 dma: DMA = .{},
 timers: Timers = .{},
@@ -110,6 +112,7 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
 }
 
 pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
+    self.save.advance(cycles);
     self.requestInterrupt(self.timers.advance(cycles));
     const phase = (old_phase + cycles) % timing.cycles_per_frame;
     self.vcount = @intCast(phase / timing.cycles_per_line);
@@ -191,15 +194,27 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
     };
     var source = alignDataAddress(T, channel.next_source);
     var destination = alignDataAddress(T, channel.next_destination);
+    const eeprom_input = T == u16 and index == 3 and self.hasEepromAt(destination);
+    const eeprom_output = T == u16 and index == 3 and self.hasEepromAt(source);
+    if (eeprom_input) self.save.beginEepromCommand();
     // Charge the transfers on the shared bus. Arbitration and startup delays are approximate.
     self.bus_cycles += 2;
     for (0..count) |_| {
         if (source < ewram_base) @panic("DMA reads below EWRAM are unsupported");
-        const value = self.readData(T, source);
-        self.writeData(T, destination, value);
+        const value: T = if (eeprom_output) blk: {
+            self.chargeDataAccess(T, source);
+            break :blk self.save.readEepromBit();
+        } else self.readData(T, source);
+        if (eeprom_input) {
+            self.chargeDataAccess(T, destination);
+            self.save.shiftEepromCommand(value);
+        } else {
+            self.writeData(T, destination, value);
+        }
         source = (source +% source_step) & DMA.sourceMask(index);
         destination = (destination +% destination_step) & DMA.destinationMask(index);
     }
+    if (eeprom_input) self.save.finishEepromCommand(count);
     self.dma.channels[index].next_source = source;
     self.dma.channels[index].next_destination =
         if ((channel.control >> 5) & 3 == 3) channel.destination else destination;
@@ -266,6 +281,11 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
+    if (SaveMemory.containsParallel(address)) {
+        const repeats = std.math.maxInt(T) / 0xFF;
+        return @as(T, self.save.readParallel(address)) * repeats;
+    }
+    if (T == u16 and self.hasEepromAt(address)) return self.save.eepromReady();
     if (aligned_address < bios_size_bytes) {
         if (self.executing_bios) return self.readBios(T, aligned_address);
         return wordLane(T, self.bios_fetch_word, aligned_address);
@@ -331,7 +351,17 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
+    if (SaveMemory.containsParallel(address)) {
+        const shift: std.math.Log2Int(T) = @intCast((address - aligned_address) * 8);
+        self.save.writeParallel(address, @truncate(value >> shift));
+        return;
+    }
+    if (self.hasEepromAt(address)) return; // Commands arrive as a DMA3 bitstream.
     self.writeAligned(T, aligned_address, value);
+}
+
+fn hasEepromAt(self: *const Bus, address: u32) bool {
+    return self.save.containsEeprom(self.rom.len, address);
 }
 
 fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) void {
@@ -498,6 +528,11 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
 
 fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
     self.next_fetch_nonsequential = true;
+    if (SaveMemory.containsParallel(address)) {
+        self.next_rom_data_address = null;
+        self.bus_cycles += timing.saveAccessCycles(self.waitcnt);
+        return;
+    }
     if (romWindow(address)) |window| {
         const sequential = self.next_rom_data_address == address and address & 0x1_FFFF != 0;
         const access: timing.Access = if (sequential) .sequential else .nonsequential;
@@ -779,6 +814,50 @@ test "HBlank DMA repeats with a running source and a reloaded destination" {
 
     bus.advanceDevices(timing.vblank_start, timing.hblank_start);
     try std.testing.expectEqual(@as(u16, 0x5678), bus.readData(u16, palette_base));
+}
+
+test "DMA3 writes and reads both EEPROM capacities over the Game Pak bus" {
+    const TestDma = struct {
+        fn transfer(bus: *Bus, source: u32, destination: u32, count: u32) void {
+            const channel = DMA.end - 12;
+            bus.writeData(u32, channel, source);
+            bus.writeData(u32, channel + 4, destination);
+            bus.writeData(u32, channel + 8, 0x8000_0000 | count);
+            bus.runDma(.immediate);
+        }
+
+        fn encode(bus: *Bus, value: u128, count: u32) void {
+            for (0..count) |index| {
+                const bit = value >> @intCast(count - 1 - index);
+                bus.writeData(u16, ewram_base + 2 * @as(u32, @intCast(index)), @truncate(bit & 1));
+            }
+        }
+    };
+    const port: u32 = 0x0DFF_FF00;
+    const payload: u64 = 0x0102_0304_0506_0708;
+    for ([_]u32{ 6, 14 }) |address_bits| {
+        var bus: Bus = .{ .rom = &.{}, .save = .{ .kind = .eeprom } };
+        const block: u128 = if (address_bits == 6) 63 else 1023;
+        const command = (@as(u128, 2) << @intCast(address_bits)) | block;
+        const write_count = 67 + address_bits;
+        TestDma.encode(&bus, (command << 65) | (@as(u128, payload) << 1), write_count);
+        TestDma.transfer(&bus, ewram_base, port, write_count);
+        try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, port));
+        bus.advanceDevices(0, 108_368);
+        try std.testing.expectEqual(@as(u16, 1), bus.readData(u16, port));
+        try std.testing.expectEqual(if (address_bits == 6) @as(usize, 512) else 8192, bus.save.bytes().len);
+
+        const read_count = 3 + address_bits;
+        TestDma.encode(&bus, ((@as(u128, 3) << @intCast(address_bits)) | block) << 1, read_count);
+        TestDma.transfer(&bus, ewram_base, port, read_count);
+        TestDma.transfer(&bus, port, iwram_base, 68);
+        var received: u64 = 0;
+        for (4..68) |index| {
+            const bit = bus.readData(u16, iwram_base + 2 * @as(u32, @intCast(index)));
+            received = (received << 1) | bit;
+        }
+        try std.testing.expectEqual(payload, received);
+    }
 }
 
 test "keypad word accesses pair active-low input with masked control" {

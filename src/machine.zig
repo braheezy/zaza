@@ -4,6 +4,7 @@ const Machine = @This();
 const video = @import("video.zig");
 const timing = @import("timing.zig");
 const input = @import("input.zig");
+const SaveMemory = @import("save_memory.zig");
 
 cpu: Cpu,
 bus: Bus,
@@ -16,7 +17,7 @@ const vblank_start = timing.vblank_start;
 pub fn initCartridge(self: *Machine, rom: []const u8) void {
     self.* = .{
         .cpu = .{ .instruction_address = Bus.rom_base },
-        .bus = .{ .rom = rom },
+        .bus = .{ .rom = rom, .save = .{ .kind = SaveMemory.Kind.detect(rom) } },
     };
     self.cpu.refillArmPipeline(&self.bus);
 }
@@ -39,7 +40,12 @@ pub fn initCartridgeWithBios(
 pub fn initBios(self: *Machine, rom: []const u8, bios: *const [Bus.bios_size_bytes]u8) void {
     self.* = .{
         .cpu = .{},
-        .bus = .{ .rom = rom, .bios = bios, .dispcnt = 0x0080 },
+        .bus = .{
+            .rom = rom,
+            .save = .{ .kind = SaveMemory.Kind.detect(rom) },
+            .bios = bios,
+            .dispcnt = 0x0080,
+        },
     };
     self.cpu.refillArmPipeline(&self.bus);
 }
