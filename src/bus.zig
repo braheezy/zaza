@@ -13,6 +13,12 @@ pub const dispcnt_address: u32 = 0x0400_0000;
 pub const dispstat_address: u32 = 0x0400_0004;
 const vblank_status: u16 = 1 << 0;
 const vblank_irq_enable: u16 = 1 << 3;
+pub const keyinput_address: u32 = 0x0400_0130;
+pub const keycnt_address: u32 = keyinput_address + 2;
+const keypad_irq: u14 = 1 << 12;
+const keypad_irq_enable: u16 = 1 << 14;
+const keypad_match_all: u16 = 1 << 15;
+const keypad_control_mask: u16 = 0xC3FF;
 pub const ie_address: u32 = 0x0400_0200;
 pub const if_address: u32 = 0x0400_0202;
 pub const waitcnt_address: u32 = 0x0400_0204;
@@ -31,6 +37,8 @@ serial: Serial = .{},
 dma: DMA = .{},
 timers: Timers = .{},
 audio: Audio = .{},
+pressed_buttons: u10 = 0,
+keypad_control: u16 = 0,
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
@@ -52,6 +60,30 @@ next_fetch_nonsequential: bool = false,
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
     // A device latches its request even while IRQ delivery is disabled.
     self.irq_flags |= sources;
+}
+
+/// Inject a complete button snapshot between instructions. A set bit means pressed.
+/// Bit order is A, B, Select, Start, Right, Left, Up, Down, R, L.
+pub fn setPressedButtons(self: *Bus, pressed: u10) void {
+    const previous_match = self.keypadIrqCondition();
+    self.pressed_buttons = pressed;
+    if (!previous_match and self.keypadIrqCondition()) self.requestInterrupt(keypad_irq);
+}
+
+fn keypadIrqCondition(self: *const Bus) bool {
+    if (self.keypad_control & keypad_irq_enable == 0) return false;
+    const selected: u10 = @truncate(self.keypad_control);
+    if (selected == 0) return false;
+    const matching = selected & self.pressed_buttons;
+    if (self.keypad_control & keypad_match_all != 0) return matching == selected;
+    return matching != 0;
+}
+
+fn writeKeypadControl(self: *Bus, value: u16) void {
+    const previous_match = self.keypadIrqCondition();
+    self.keypad_control = value & keypad_control_mask;
+    // Reevaluate on configuration writes as well as on input changes.
+    if (!previous_match and self.keypadIrqCondition()) self.requestInterrupt(keypad_irq);
 }
 
 pub fn updateVBlank(self: *Bus, active: bool, started: bool) void {
@@ -116,6 +148,12 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (Audio.contains(aligned_address)) return self.audio.read(T, aligned_address);
     if (Timers.contains(aligned_address)) return self.timers.read(T, aligned_address);
     if (DMA.contains(aligned_address)) return self.dma.read(T, aligned_address);
+    if (aligned_address >= keyinput_address and aligned_address < keyinput_address + 4) {
+        const input: u16 = @as(u10, ~self.pressed_buttons);
+        const registers = @as(u32, input) | (@as(u32, self.keypad_control) << 16);
+        const shift: u5 = @intCast((aligned_address - keyinput_address) * 8);
+        return @truncate(registers >> shift);
+    }
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
     if (iwramOffset(aligned_address)) |offset| {
         self.chargeIwramDataAccess();
@@ -200,6 +238,25 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     }
     if (DMA.contains(aligned_address)) {
         self.dma.write(T, aligned_address, value);
+        return;
+    }
+    // The BIOS clears the unused word between serial registers and KEYINPUT.
+    if (aligned_address >= 0x0400_012C and aligned_address < keyinput_address) return;
+    // The reset loop also clears the unused gap between RCNT and JOYCNT.
+    if (aligned_address >= 0x0400_0138 and aligned_address < 0x0400_0140) return;
+    if (aligned_address >= keyinput_address and aligned_address < keyinput_address + 4) {
+        // KEYINPUT is read-only, including the lower half of a word write.
+        if (T == u32) {
+            self.writeKeypadControl(@truncate(value >> 16));
+        } else if (aligned_address >= keycnt_address) {
+            if (T == u16) {
+                self.writeKeypadControl(value);
+            } else {
+                const shift: u4 = @intCast((aligned_address - keycnt_address) * 8);
+                const keep = self.keypad_control & ~(@as(u16, 0xFF) << shift);
+                self.writeKeypadControl(keep | (@as(u16, value) << shift));
+            }
+        }
         return;
     }
     if (Serial.contains(aligned_address)) {
@@ -411,4 +468,35 @@ test "BIOS DMA reset stores reach every channel and the unused trailing gap" {
     for (bus.dma.channels) |channel| {
         try std.testing.expectEqualDeep(DMA.Channel{}, channel);
     }
+}
+
+test "keypad word accesses pair active-low input with masked control" {
+    var bus: Bus = .{ .rom = &.{} };
+    try std.testing.expectEqual(@as(u32, 0x0000_03FF), bus.readData(u32, keyinput_address));
+    bus.setPressedButtons(0x201);
+    bus.writeData(u32, keyinput_address, 0xFFFF_0000);
+    try std.testing.expectEqual(@as(u32, 0xC3FF_01FE), bus.readData(u32, keyinput_address));
+    bus.writeData(u8, keycnt_address, 0x01);
+    bus.writeData(u8, keyinput_address + 1, 0xFF);
+    try std.testing.expectEqual(@as(u8, 1), bus.readData(u8, keyinput_address + 1));
+    try std.testing.expectEqual(@as(u16, 0xC301), bus.readData(u16, keycnt_address));
+}
+
+test "keypad any and all matches latch IF independently of CPU delivery" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.setPressedButtons(1);
+    bus.writeData(u16, keycnt_address, 0x4003);
+    try std.testing.expectEqual(keypad_irq, bus.irq_flags);
+    try std.testing.expect(!bus.irqLine());
+    bus.writeData(u16, if_address, keypad_irq);
+    bus.writeData(u16, keycnt_address, 0xC003);
+    try std.testing.expectEqual(@as(u16, 0), bus.irq_flags);
+    bus.setPressedButtons(7);
+    try std.testing.expectEqual(keypad_irq, bus.irq_flags);
+    bus.writeData(u16, if_address, keypad_irq);
+    bus.setPressedButtons(7);
+    try std.testing.expectEqual(@as(u16, 0), bus.irq_flags);
+    bus.setPressedButtons(0);
+    bus.setPressedButtons(3);
+    try std.testing.expectEqual(keypad_irq, bus.irq_flags);
 }
