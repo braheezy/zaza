@@ -54,6 +54,8 @@ keypad_control: u16 = 0,
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
+// Cartridge fast boot starts before any emulated BIOS instruction fetch.
+bios_fetch_word: u32 = 0,
 halted: bool = false,
 ewram: [ewram_size_bytes]u8 = @splat(0),
 iwram: [iwram_size_bytes]u8 = @splat(0),
@@ -163,7 +165,7 @@ pub fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
 pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
     const halfword = self.fetch(u16, address, access);
     if (address < bios_size_bytes) {
-        self.prefetch_word = self.readBios(u32, address & ~@as(u32, 3));
+        self.prefetch_word = self.bios_fetch_word;
     } else if (address >> 24 == iwram_base >> 24) {
         const shift: u5 = @intCast((address & 2) * 8);
         const mask = @as(u32, 0xFFFF) << shift;
@@ -181,7 +183,9 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     self.next_rom_data_address = null;
     if (address < bios_size_bytes) {
         self.bus_cycles += 1;
-        return self.readBios(T, address);
+        // The BIOS drives a 32-bit word for ARM and Thumb instruction fetches.
+        self.bios_fetch_word = self.readBios(u32, address & ~@as(u32, 3));
+        return wordLane(T, self.bios_fetch_word, address);
     }
     if (ewramOffset(address)) |offset| {
         self.next_fetch_nonsequential = true;
@@ -210,13 +214,11 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
     if (aligned_address < bios_size_bytes) {
-        // External BIOS reads need a protected-read latch, not access to ROM bytes.
-        if (!self.executing_bios) @panic("protected BIOS data read not modeled");
-        return self.readBios(T, aligned_address);
+        if (self.executing_bios) return self.readBios(T, aligned_address);
+        return wordLane(T, self.bios_fetch_word, aligned_address);
     }
     if (aligned_address < ewram_base or aligned_address >= 0x1000_0000) {
-        const shift: u5 = @intCast((aligned_address & 3) * 8);
-        return @truncate(self.prefetch_word >> shift);
+        return wordLane(T, self.prefetch_word, aligned_address);
     }
     if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
         var result: T = 0;
@@ -496,6 +498,11 @@ fn readBios(self: *const Bus, comptime T: type, address: u32) T {
     return std.mem.readInt(T, bios[address..][0..@sizeOf(T)], .little);
 }
 
+fn wordLane(comptime T: type, word: u32, address: u32) T {
+    const shift: u5 = @intCast((address & 3) * 8);
+    return @truncate(word >> shift);
+}
+
 fn readRom(self: *const Bus, comptime T: type, address: u32) T {
     if (romWindow(address) == null) {
         std.debug.panic("unmapped {d}-bit read at 0x{x:0>8}", .{ @bitSizeOf(T), address });
@@ -528,6 +535,25 @@ fn unbackedRomByte(address: u32) u8 {
     const halfword_address: u16 = @truncate(address >> 1);
     const shift: u4 = @intCast((address & 1) * 8);
     return @truncate(halfword_address >> shift);
+}
+
+test "Thumb BIOS fetches latch whole words for protected reads at every width" {
+    const bios = comptime blk: {
+        var bytes: [bios_size_bytes]u8 = @splat(0);
+        bytes[0..4].* = .{ 0x11, 0x22, 0x33, 0x44 };
+        bytes[4..8].* = .{ 0x55, 0x66, 0x77, 0x88 };
+        break :blk bytes;
+    };
+    var bus: Bus = .{ .rom = &.{ 1, 2, 3, 4 }, .bios = &bios };
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, 0));
+    try std.testing.expectEqual(@as(u16, 0x2211), bus.fetch16(0, .nonsequential));
+    try std.testing.expectEqual(@as(u8, 0x22), bus.readData(u8, 5));
+    try std.testing.expectEqual(@as(u16, 0x4433), bus.fetch16(2, .sequential));
+    try std.testing.expectEqual(@as(u16, 0x6655), bus.fetch16(4, .sequential));
+    try std.testing.expectEqual(@as(u32, 0x0403_0201), bus.fetch32(rom_base, .nonsequential));
+    try std.testing.expectEqual(@as(u32, 0x8877_6655), bus.readData(u32, 0));
+    try std.testing.expectEqual(@as(u16, 0x8877), bus.readData(u16, 2));
+    try std.testing.expectEqual(@as(u8, 0x66), bus.readData(u8, bios_size_bytes - 3));
 }
 
 test "unbacked Game Pak data follows the halfword address on each byte lane" {

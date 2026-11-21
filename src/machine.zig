@@ -275,27 +275,38 @@ test "timed Game Pak data load pays the nonsequential data access cost" {
     try std.testing.expectEqual(@as(u64, 6 + 8 + 1), machine.elapsed_cycles);
 }
 
-test "cartridge SWI executes a BIOS handler that reads a BIOS literal" {
+test "a BIOS SWI can read its literal and leaves a protected fetch word after return" {
     const std = @import("std");
     const rom = [_]u8{
+        0x00, 0x20, 0x91, 0xE5, // LDR r2, [r1], before any BIOS fetch.
         0x01, 0x00, 0x00, 0xEF, // SWI
-        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x30, 0x91, 0xE5, // LDR r3, [r1], after the SWI returns.
         0x00, 0x00, 0x00, 0x00,
     };
     const bios = comptime blk: {
         var bytes: [Bus.bios_size_bytes]u8 = @splat(0);
-        std.mem.writeInt(u32, bytes[8..12], 0xE59F_0000, .little); // LDR r0, [pc]
-        std.mem.writeInt(u32, bytes[16..20], 0x1234_5678, .little);
+        std.mem.writeInt(u32, bytes[0..4], 0x1122_3344, .little);
+        std.mem.writeInt(u32, bytes[8..12], 0xE59F_0010, .little); // LDR r0, [pc, #16]
+        std.mem.writeInt(u32, bytes[12..16], 0xE1B0_F00E, .little); // MOVS pc, lr
+        std.mem.writeInt(u32, bytes[20..24], 0xE1A0_0000, .little); // Return instruction's lookahead.
+        std.mem.writeInt(u32, bytes[32..36], 0x1234_5678, .little);
         break :blk bytes;
     };
     var machine: Machine = undefined;
     machine.initCartridgeWithBios(&rom, &bios);
     try std.testing.expectEqual(@as(u32, 0x0300_7F00), machine.cpu.readRegister(13));
     try machine.step();
+    try std.testing.expectEqual(@as(u32, 0), machine.cpu.readRegister(2));
+    try machine.step();
     try std.testing.expectEqual(@as(u32, 8), machine.cpu.instruction_address);
     try std.testing.expectEqual(@as(u32, 0x0300_7FE0), machine.cpu.readRegister(13));
     try machine.step();
     try std.testing.expectEqual(@as(u32, 0x1234_5678), machine.cpu.readRegister(0));
+    try std.testing.expectEqual(@as(u32, 0), machine.bus.readData(u32, 0));
+    try machine.step();
+    try std.testing.expectEqual(Bus.rom_base + 8, machine.cpu.instruction_address);
+    try machine.step();
+    try std.testing.expectEqual(@as(u32, 0xE1A0_0000), machine.cpu.readRegister(3));
 }
 
 test "BIOS HALT wakes on a cascaded timer interrupt with IME disabled" {
