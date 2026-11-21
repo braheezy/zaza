@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) !void {
             "-Dcputest-internal=true",
             b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         });
+        run_cputest.addArg("--");
         run_cputest.addPassthruArgs();
         b.step("cputest", "Run supported ARM7TDMI SingleStepTests vectors").dependOn(&run_cputest.step);
         return;

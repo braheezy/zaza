@@ -469,6 +469,8 @@ const Report = struct {
             "thumb_ldrh_strh_reg_offset",
             "thumb_ldrsb_strb_reg_offset",
             "thumb_ldrsh_ldrsb_reg_offset",
+            "thumb_push_pop",
+            "thumb_ldm_stm",
             "arm_mrs",
             "arm_msr_imm",
             "arm_msr_reg",

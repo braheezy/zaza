@@ -109,6 +109,12 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
         self.executeThumbTransfer(bus, transfer);
         return;
     }
+    const stack_transfer = instruction & 0xF600 == 0xB400;
+    if (stack_transfer or instruction >> 12 == 0xC) {
+        self.advanceThumbPipeline(bus, pc);
+        self.executeThumbBlockTransfer(bus, instruction, stack_transfer);
+        return;
+    }
     const immediate: u11 = @truncate(instruction);
     const signed_immediate: i32 = @as(i11, @bitCast(immediate));
     var target: ?u32 = null;
@@ -237,6 +243,54 @@ fn executeThumbTransfer(self: *Cpu, bus: anytype, transfer: ThumbTransfer) void 
         },
     };
     self.writeGeneralRegister(register, result);
+}
+
+fn executeThumbBlockTransfer(self: *Cpu, bus: anytype, instruction: u16, stack: bool) void {
+    const load = instruction & (1 << 11) != 0;
+    const base_register: u4 = if (stack) stack_pointer else @as(u3, @truncate(instruction >> 8));
+    const base = self.readRegister(base_register);
+    var registers: u16 = instruction & 0xFF;
+    if (stack and instruction & (1 << 8) != 0) {
+        registers |= @as(u16, 1) << if (load) program_counter else link_register;
+    }
+    // ARM7TDMI transfers PC for an empty list but adjusts the base by 16 words.
+    const count: u32 = if (registers == 0) 16 else @popCount(registers);
+    if (registers == 0) registers = 1 << program_counter;
+    const push = stack and !load;
+    const writeback = if (push) base -% (count * 4) else base +% (count * 4);
+    var address = if (push) writeback else base;
+    const first_register: u4 = @intCast(@ctz(registers));
+    var target: ?u32 = null;
+
+    // The lowest register always uses the lowest address, including on PUSH.
+    while (registers != 0) {
+        const register: u4 = @intCast(@ctz(registers));
+        registers &= registers - 1;
+        if (load) {
+            const value = bus.readData(u32, address);
+            if (register == program_counter) {
+                target = value;
+            } else {
+                self.writeGeneralRegister(register, value);
+            }
+        } else {
+            // STMIA stores the updated base unless it is the first register transferred.
+            const value = if (register == base_register and register != first_register)
+                writeback
+            else
+                self.readRegister(register);
+            bus.writeData(u32, address, value);
+        }
+        address +%= 4;
+    }
+
+    // LDMIA lets a loaded base register win over writeback.
+    const base_in_list = !stack and instruction & (@as(u16, 1) << base_register) != 0;
+    if (!load or !base_in_list) self.writeGeneralRegister(base_register, writeback);
+    if (target) |value| {
+        self.instruction_address = value & ~@as(u32, 1);
+        self.refillThumbPipeline(bus);
+    }
 }
 
 fn signExtendByte(value: u8) u32 {
