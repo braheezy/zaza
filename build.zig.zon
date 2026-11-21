@@ -3,10 +3,12 @@
     .version = "0.0.1",
     .dependencies = .{
         .arm7tdmi_vectors = .{
+            .lazy = true,
             .url = "https://codeload.github.com/SingleStepTests/ARM7TDMI/tar.gz/e3097d88d428752736b949d94c094d5da50f0db6",
             .hash = "N-V-__8AACU-qDfYGRUBWlFjNoNIf_l1cO0X6IbVgV0iWUNT",
         },
         .chameleon = .{
+            .lazy = true,
             .url = "git+https://github.com/evaneliasyoung/chameleon?ref=fix/zig-0.17.0#a28ac98b12ecc5a92466ffeab4f32f965d323991",
             .hash = "chameleon-3.0.0-ZOxajYp-AAD8z_GprV44kSKujggJNNrJVk30_c5_Aogt",
         },
