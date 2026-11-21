@@ -268,11 +268,17 @@ const Report = struct {
             const register: u4 = @truncate(instruction);
             const amount: u5 = @truncate(instruction >> 7);
             const kind: u2 = @truncate(instruction >> 5);
+            const names = [_][]const u8{ "LSL", "LSR", "ASR", "ROR" };
+            if (instruction & (1 << 4) != 0) {
+                const shift_register: u4 = @truncate(instruction >> 8);
+                break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}, {s} r{d}", .{
+                    register, names[kind], shift_register,
+                });
+            }
             if (amount == 0) {
                 if (kind == 0) break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}", .{register});
                 if (kind == 3) break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}, RRX", .{register});
             }
-            const names = [_][]const u8{ "LSL", "LSR", "ASR", "ROR" };
             break :blk try std.fmt.bufPrint(&operand_buffer, "r{d}, {s} #{d}", .{
                 register, names[kind], if (amount == 0) @as(u6, 32) else amount,
             });
@@ -320,7 +326,9 @@ const Report = struct {
     fn outcome(family: []const u8, vector: Vector) ?anyerror {
         if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
             if (!std.mem.eql(u8, family, "arm_data_proc_immediate_shift")) {
-                return error.UnsupportedInstruction;
+                if (!std.mem.eql(u8, family, "arm_data_proc_register_shift")) {
+                    return error.UnsupportedInstruction;
+                }
             }
         }
         runSelectedVector(vector) catch |err| return err;

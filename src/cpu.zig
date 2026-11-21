@@ -60,7 +60,7 @@ const ArmDataProcessing = struct {
         immediate: struct { value: u32, rotated: bool },
         shifted_register: RegisterShift,
     };
-    const RegisterShift = struct { register: u4, kind: u2, amount: u5 };
+    const RegisterShift = struct { register: u4, kind: u2, amount: union(enum) { immediate: u5, register: u4 } };
 };
 
 fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDataProcessing {
@@ -71,7 +71,12 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
     const immediate_operand = instruction & (1 << 25) != 0;
     const operand_register: u4 = @truncate(instruction);
     if (!immediate_operand) {
-        if (instruction & (1 << 4) != 0) return error.UnsupportedInstruction;
+        if (instruction & (1 << 4) != 0) {
+            // Bit 7 must be clear; otherwise this can be a different encoding family.
+            if (instruction & (1 << 7) != 0) return error.UnsupportedInstruction;
+            const shift_register: u4 = @truncate(instruction >> 8);
+            if (shift_register >= 8) return error.UnsupportedInstruction;
+        }
         if (operand_register >= 8) return error.UnsupportedInstruction;
         if (destination >= 8) return error.UnsupportedInstruction;
     }
@@ -141,7 +146,10 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
         decoded.operand = .{ .shifted_register = .{
             .register = operand_register,
             .kind = @truncate(instruction >> 5),
-            .amount = @truncate(instruction >> 7),
+            .amount = if (instruction & (1 << 4) != 0)
+                .{ .register = @truncate(instruction >> 8) }
+            else
+                .{ .immediate = @truncate(instruction >> 7) },
         } };
     }
     return decoded;
@@ -220,8 +228,26 @@ const ShifterResult = struct { value: u32, carry: bool };
 
 fn shiftedRegisterOperand(self: *const Cpu, shift: ArmDataProcessing.RegisterShift) ShifterResult {
     const value = self.readRegister(shift.register);
-    const amount = shift.amount;
     const kind = shift.kind;
+    const amount = switch (shift.amount) {
+        .immediate => |count| count,
+        .register => |register| blk: {
+            const count: u8 = @truncate(self.readRegister(register));
+            // Register shifts by zero preserve carry; they never encode RRX or #32.
+            if (count == 0) return .{ .value = value, .carry = self.readFlags().carry };
+            if (count < 32) break :blk @as(u5, @intCast(count));
+            const sign = value >> 31 != 0;
+            return switch (kind) {
+                0 => .{ .value = 0, .carry = count == 32 and value & 1 != 0 },
+                1 => .{ .value = 0, .carry = count == 32 and sign },
+                2 => .{ .value = if (sign) 0xFFFF_FFFF else 0, .carry = sign },
+                3 => rotate: {
+                    const result = std.math.rotr(u32, value, @as(u5, @truncate(count)));
+                    break :rotate .{ .value = result, .carry = result >> 31 != 0 };
+                },
+            };
+        },
+    };
     // Zero encodes 32 for LSR/ASR and rotate-through-carry for ROR.
     if (amount == 0) return switch (kind) {
         0 => .{ .value = value, .carry = self.readFlags().carry },
