@@ -9,6 +9,19 @@ pub fn contains(address: u32) bool {
     return address >= 0x0400_0008 and address < 0x0400_0058;
 }
 
+// Internal register access for the renderer and byte-write merging.
+pub fn stored(self: *const Registers, address: u32) u16 {
+    std.debug.assert(contains(address));
+    std.debug.assert(address & 1 == 0);
+    return self.values[(address - 0x0400_0008) / 2];
+}
+
+pub fn affineReference(self: *const Registers, address: u32) i32 {
+    const raw = @as(u32, self.stored(address)) | (@as(u32, self.stored(address + 2)) << 16);
+    const signed: i28 = @bitCast(@as(u28, @truncate(raw)));
+    return signed;
+}
+
 pub fn write(self: *Registers, address: u32, value: u16) void {
     std.debug.assert(contains(address));
     std.debug.assert(address & 1 == 0);

@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         .limited(32 * 1024 * 1024),
     );
     if (rom.len < 8) return error.RomTooShort;
-    try snapshot.captureMode3(rom, snapshot.bundled_bios, steps, &frame);
+    try snapshot.captureBitmap(rom, snapshot.bundled_bios, steps, &frame);
 
     var modules: Modules = undefined;
     try modules.init(init.gpa, init.io);

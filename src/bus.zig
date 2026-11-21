@@ -286,7 +286,7 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
             dispcnt_address + 2 => self.greenswap,
             dispstat_address => self.dispstat,
             vcount_address => 0,
-            else => self.display_registers.values[(halfword_address - 0x0400_0008) / 2],
+            else => self.display_registers.stored(halfword_address),
         };
         const shift: u4 = @intCast((aligned_address & 1) * 8);
         const merged = (previous & ~(@as(u16, 0xFF) << shift)) | (@as(u16, value) << shift);

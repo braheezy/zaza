@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk bytes[0..Bus.bios_size_bytes];
     } else bundled_bios;
     var frame: video.Frame = undefined;
-    try captureMode3(run.rom, bios, run.steps, &frame);
+    try captureBitmap(run.rom, bios, run.steps, &frame);
 
     const file = try std.Io.Dir.cwd().createFile(init.io, run.output, .{ .exclusive = true });
     defer file.close(init.io);
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     try file_writer.interface.flush();
 }
 
-pub fn captureMode3(
+pub fn captureBitmap(
     rom: []const u8,
     bios: *const [Bus.bios_size_bytes]u8,
     steps: usize,
@@ -58,12 +58,12 @@ pub fn captureMode3(
     machine.initCartridgeWithBios(rom, bios);
     for (0..steps) |step| {
         const address = machine.cpu.instruction_address;
-        machine.step() catch |err| {
+        machine.stepTimed() catch |err| {
             std.debug.print("CPU stopped after {d} steps at 0x{x:0>8}\n", .{ step, address });
             return err;
         };
     }
-    try machine.snapshotMode3(frame);
+    try machine.snapshotBitmap(frame);
 }
 
 const std = @import("std");

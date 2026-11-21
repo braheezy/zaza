@@ -257,6 +257,41 @@ pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!
     video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame);
 }
 
+/// Capture the selected bitmap using the current display registers and memory.
+pub fn snapshotBitmap(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
+    switch (self.bus.dispcnt & 7) {
+        3 => video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame),
+        4 => self.snapshotMode4(frame),
+        else => return error.UnsupportedDisplayMode,
+    }
+}
+
+fn snapshotMode4(self: *const Machine, frame: *video.Frame) void {
+    const registers = &self.bus.display_registers;
+    const page = self.bus.dispcnt & (1 << 4) != 0;
+    const offset: usize = if (page) video.mode4_page_stride_bytes else 0;
+    const mosaic_enabled = registers.stored(0x0400_000C) & (1 << 6) != 0;
+    const mosaic = registers.stored(0x0400_004C);
+    video.renderMode4(
+        self.bus.vram[offset..][0..video.mode4_bitmap_size_bytes],
+        self.bus.palette[0..video.background_palette_size_bytes],
+        .{
+            .enabled = self.bus.dispcnt & (1 << 10) != 0,
+            .forced_blank = self.bus.dispcnt & (1 << 7) != 0,
+            .green_swap = self.bus.greenswap != 0,
+            .dx = @bitCast(registers.stored(0x0400_0020)),
+            .dmx = @bitCast(registers.stored(0x0400_0022)),
+            .dy = @bitCast(registers.stored(0x0400_0024)),
+            .dmy = @bitCast(registers.stored(0x0400_0026)),
+            .origin_x = registers.affineReference(0x0400_0028),
+            .origin_y = registers.affineReference(0x0400_002C),
+            .mosaic_width = if (mosaic_enabled) 1 + @as(u5, @as(u4, @truncate(mosaic))) else 1,
+            .mosaic_height = if (mosaic_enabled) 1 + @as(u5, @as(u4, @truncate(mosaic >> 4))) else 1,
+        },
+        frame,
+    );
+}
+
 test "machine clock routes timer overflow IRQs while delivery is masked" {
     const std = @import("std");
     // Keep the CPU idle to isolate shared-clock device advancement and IRQ latching.
@@ -307,4 +342,86 @@ test "a Thumb VCOUNT polling loop writes palette RAM once on each VBlank" {
         const color = std.mem.readInt(u16, machine.bus.palette[0..2], .little);
         try std.testing.expectEqual(@as(u16, @intCast(frame + 1)), color);
     }
+}
+
+test "Mode 4 selects the front and back pages and uses the live background palette" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    const bus = &machine.bus;
+    bus.writeData(u16, 0x0400_0020, 0x0100); // BG2PA
+    bus.writeData(u16, 0x0400_0026, 0x0100); // BG2PD
+    bus.writeData(u16, Bus.palette_base, 0x7C00);
+    bus.writeData(u16, Bus.palette_base + 2, 0x001F);
+    bus.writeData(u16, Bus.palette_base + 510, 0x03E0);
+    bus.writeData(u16, Bus.palette_base + 512, 0x7FFF);
+    bus.writeData(u16, Bus.vram_base, 0x0001);
+    bus.writeData(u16, Bus.vram_base + 0xA000, 0xFF00);
+    bus.writeData(u16, Bus.vram_base + 0xA000 + 0x95FE, 0xFF00);
+
+    const red: video.Rgb = .{ .red = 255, .green = 0, .blue = 0 };
+    const green: video.Rgb = .{ .red = 0, .green = 255, .blue = 0 };
+    const blue: video.Rgb = .{ .red = 0, .green = 0, .blue = 255 };
+    const white: video.Rgb = .{ .red = 255, .green = 255, .blue = 255 };
+    var frame: video.Frame = undefined;
+    try std.testing.expectError(error.UnsupportedDisplayMode, machine.snapshotBitmap(&frame));
+    bus.writeData(u16, Bus.dispcnt_address, 0x0404);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(red, frame[0][0]);
+    try std.testing.expectEqual(blue, frame[0][1]);
+    bus.writeData(u8, Bus.dispcnt_address, 0x14);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(blue, frame[0][0]);
+    try std.testing.expectEqual(green, frame[0][1]);
+    try std.testing.expectEqual(green, frame[video.height - 1][video.width - 1]);
+    bus.writeData(u16, Bus.palette_base + 510, 0x801F);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(red, frame[0][1]);
+    bus.writeData(u16, Bus.palette_base + 510, 0x03E0);
+    bus.writeData(u16, Bus.dispcnt_address + 2, 1);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 255, .blue = 255 }, frame[0][0]);
+    try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 0, .blue = 0 }, frame[0][1]);
+    bus.writeData(u16, Bus.dispcnt_address + 2, 0);
+    bus.writeData(u16, Bus.dispcnt_address, 0x0014);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(blue, frame[0][1]);
+    bus.writeData(u16, Bus.dispcnt_address, 0x0494);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(white, frame[0][0]);
+    try std.testing.expectEqual(white, frame[video.height - 1][video.width - 1]);
+}
+
+test "Mode 4 samples signed BG2 coordinates with mosaic and backdrop clipping" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    const bus = &machine.bus;
+    bus.writeData(u16, Bus.dispcnt_address, 0x0404);
+    bus.writeData(u16, 0x0400_0020, 0x0100);
+    bus.writeData(u16, 0x0400_0026, 0x0100);
+    bus.writeData(u32, 0x0400_0028, 0x0FFF_FF00); // BG2X = -1.0.
+    bus.writeData(u16, Bus.palette_base + 2, 0x001F);
+    bus.writeData(u16, Bus.palette_base + 4, 0x03E0);
+    bus.writeData(u16, Bus.palette_base + 6, 0x7C00);
+    bus.writeData(u16, Bus.vram_base, 0x0201);
+    bus.writeData(u16, Bus.vram_base + video.width, 0x0303);
+
+    const red: video.Rgb = .{ .red = 255, .green = 0, .blue = 0 };
+    const green: video.Rgb = .{ .red = 0, .green = 255, .blue = 0 };
+    const blue: video.Rgb = .{ .red = 0, .green = 0, .blue = 255 };
+    const black: video.Rgb = .{ .red = 0, .green = 0, .blue = 0 };
+    var frame: video.Frame = undefined;
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(black, frame[0][0]);
+    try std.testing.expectEqual(red, frame[0][1]);
+    try std.testing.expectEqual(green, frame[0][2]);
+    try std.testing.expectEqual(blue, frame[1][1]);
+
+    bus.writeData(u16, 0x0400_000C, 1 << 6); // Enable BG2 mosaic.
+    bus.writeData(u16, 0x0400_004C, 0x0011); // 2 x 2 mosaic blocks.
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(black, frame[0][1]);
+    try std.testing.expectEqual(green, frame[0][2]);
+    try std.testing.expectEqual(green, frame[1][3]);
 }
