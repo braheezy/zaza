@@ -147,6 +147,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         self.ime_enabled = value & 1 != 0;
         return;
     }
+    // The gap between timers and serial registers has no write side effects.
+    // Keep real peripheral registers outside this range visible as unsupported.
+    if (aligned_address >= 0x0400_0110 and
+        aligned_address + @sizeOf(T) <= 0x0400_0120) return;
     const offset = iwramOffset(aligned_address) orelse
         std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
@@ -245,4 +249,18 @@ test "ROM data reads align to their transfer width without rotating" {
     try std.testing.expectEqual(@as(u8, 0x44), bus.readData(u8, address));
     try std.testing.expectEqual(@as(u16, 0x4433), bus.readData(u16, address));
     try std.testing.expectEqual(@as(u32, 0x4433_2211), bus.readData(u32, address));
+}
+
+test "writes to the unused timer to serial gap leave bus state unchanged" {
+    // Exercise every transfer width used by BIOS register clearing loops.
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u16, ie_address, 3);
+    for (0x0400_0110..0x0400_0120) |address| {
+        bus.writeData(u8, @intCast(address), 0xFF);
+        bus.writeData(u16, @intCast(address), 0xFFFF);
+        bus.writeData(u32, @intCast(address), 0xFFFF_FFFF);
+    }
+    try std.testing.expectEqual(@as(u16, 3), bus.irq_enable);
+    try std.testing.expectEqual(@as(u64, 0), bus.iwram_data_cycles);
+    try std.testing.expect(!bus.next_fetch_nonsequential);
 }
