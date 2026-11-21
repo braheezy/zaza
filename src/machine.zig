@@ -2,15 +2,13 @@ const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @This();
 const video = @import("video.zig");
+const timing = @import("timing.zig");
 
 cpu: Cpu,
 bus: Bus,
 elapsed_cycles: u64 = 0,
 
-const cycles_per_line = 1232;
-const cycles_per_frame = cycles_per_line * 228;
-const vblank_start = cycles_per_line * 160;
-const vblank_end = cycles_per_line * 227;
+const vblank_start = timing.vblank_start;
 
 // Start directly at the cartridge entry point without running the BIOS.
 pub fn initCartridge(self: *Machine, rom: []const u8) void {
@@ -48,65 +46,36 @@ pub fn step(self: *Machine) !void {
     try self.cpu.step(&self.bus);
 }
 
-// Use this from cartridge startup; ordinary step() does not advance the clock.
+/// Advance the clock for one supported CPU instruction or IRQ entry.
+/// Cartridge prefetch hits and contention are not included in the bus costs.
 pub fn stepTimed(self: *Machine) !void {
-    if (self.bus.prefetchEnabled()) return error.UntimedPrefetch;
-    if (self.bus.irqLine() and !self.cpu.irqMasked()) return error.UntimedIrq;
-    const instruction = (self.cpu.pipeline orelse return error.PipelineNotReady)[0];
-    const address = self.cpu.instruction_address;
-    if (self.cpu.cpsr & (1 << 5) != 0) return error.UntimedInstruction;
-    if (!self.romContainsWord(address) or !self.romContainsWord(address +% 8)) {
-        return error.UntimedInstruction;
-    }
-
-    // Only admit instructions whose complete cost is tracked below.
-    const mov_immediate = instruction & 0xFFF0_0000 == 0xE3A0_0000 and
-        instruction >> 12 & 0xF != 0xF;
-    if (instruction >> 24 == 0xEA) {
-        const words: i24 = @bitCast(@as(u24, @truncate(instruction)));
-        const target = address +% 8 +% @as(u32, @bitCast(@as(i32, words) * 4));
-        if (!self.romContainsWord(target) or !self.romContainsWord(target +% 4)) {
-            return error.UntimedInstruction;
-        }
-    } else if (!mov_immediate and !self.isTimedIwramTransfer(instruction)) {
-        return error.UntimedInstruction;
-    }
-
-    const fetch_cycles_before = self.bus.rom_fetch_cycles;
-    const data_cycles_before = self.bus.iwram_data_cycles;
+    const bus_cycles_before = self.bus.bus_cycles;
     const internal_cycles_before = self.cpu.internal_cycles;
     try self.step();
-    const fetch_cycles = self.bus.rom_fetch_cycles - fetch_cycles_before;
-    const data_cycles = self.bus.iwram_data_cycles - data_cycles_before;
+    const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
     const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
-    self.advanceClock(fetch_cycles + data_cycles + internal_cycles);
+    self.advanceClock(bus_cycles + internal_cycles);
 }
 
-fn isTimedIwramTransfer(self: *Machine, instruction: u32) bool {
-    // Match unconditional word LDR/STR Rd, [Rn], without offset or writeback.
-    if (instruction & 0xFFE0_0FFF != 0xE580_0000) return false;
-    const base_register: u4 = @truncate(instruction >> 16);
-    const data_register: u4 = @truncate(instruction >> 12);
-    if (base_register == 15 or data_register == 15) return false;
-    const address = self.cpu.readRegister(base_register);
-    return address & 3 == 0 and address >> 24 == Bus.iwram_base >> 24;
-}
-
-fn romContainsWord(self: *const Machine, address: u32) bool {
-    if (address < Bus.rom_base or address >= 0x0A00_0000) return false;
-    return address - Bus.rom_base + 4 <= self.bus.rom.len;
+/// Stop on the first instruction boundary at or after the next VBlank edge.
+pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
+    const phase = self.elapsed_cycles % timing.cycles_per_frame;
+    const target = self.elapsed_cycles + timing.cyclesUntil(
+        phase,
+        timing.vblank_start,
+        timing.cycles_per_frame,
+    );
+    for (0..instruction_budget) |_| {
+        try self.stepTimed();
+        if (self.elapsed_cycles >= target) return;
+    }
+    return error.InstructionBudgetExceeded;
 }
 
 fn advanceClock(self: *Machine, cycles: u64) void {
-    self.bus.requestInterrupt(self.bus.timers.advance(cycles));
-    const old_phase = self.elapsed_cycles % cycles_per_frame;
-    const until_vblank = if (old_phase < vblank_start)
-        vblank_start - old_phase
-    else
-        cycles_per_frame - old_phase + vblank_start;
+    const old_phase = self.elapsed_cycles % timing.cycles_per_frame;
     self.elapsed_cycles += cycles;
-    const phase = self.elapsed_cycles % cycles_per_frame;
-    self.bus.updateVBlank(phase >= vblank_start and phase < vblank_end, cycles >= until_vblank);
+    self.bus.advanceDevices(old_phase, cycles);
 }
 
 test "timed cartridge branch loop raises VBlank IF even with IRQ delivery masked" {
@@ -118,24 +87,23 @@ test "timed cartridge branch loop raises VBlank IF even with IRQ delivery masked
     };
     var machine: Machine = undefined;
     machine.initCartridge(&rom);
-    machine.bus.writeData(u16, Bus.dispstat_address, 0b1001);
-    try std.testing.expectEqual(@as(u16, 8), machine.bus.readData(u16, Bus.dispstat_address));
-
+    // Seed hardware state directly so inspection does not interrupt the Game Pak burst.
+    machine.bus.dispstat |= 1 << 3;
     for (0..vblank_start / 20 - 1) |_| try machine.stepTimed();
     try std.testing.expectEqual(@as(u64, vblank_start - 20), machine.elapsed_cycles);
-    try std.testing.expectEqual(@as(u16, 0), machine.bus.readData(u16, Bus.if_address));
+    try std.testing.expectEqual(@as(u16, 0), machine.bus.irq_flags);
     try machine.stepTimed();
     try std.testing.expectEqual(@as(u64, vblank_start), machine.elapsed_cycles);
-    try std.testing.expectEqual(@as(u16, 9), machine.bus.readData(u16, Bus.dispstat_address));
-    try std.testing.expectEqual(@as(u16, 1), machine.bus.readData(u16, Bus.if_address));
+    try std.testing.expectEqual(@as(u16, 9), machine.bus.dispstat);
+    try std.testing.expectEqual(@as(u16, 1), machine.bus.irq_flags);
     try std.testing.expect(!machine.bus.irqLine());
 
     machine.bus.writeData(u16, Bus.if_address, 1);
     try machine.stepTimed();
-    try std.testing.expectEqual(@as(u16, 0), machine.bus.readData(u16, Bus.if_address));
+    try std.testing.expectEqual(@as(u16, 0), machine.bus.irq_flags);
 }
 
-test "timed ROM fetches use WAITCNT and reject unmodeled prefetch" {
+test "timed ROM fetches use WAITCNT even with prefetch enabled" {
     const std = @import("std");
     const rom = [_]u8{
         0xFE, 0xFF, 0xFF, 0xEA, // B to self.
@@ -155,10 +123,8 @@ test "timed ROM fetches use WAITCNT and reject unmodeled prefetch" {
     try std.testing.expectEqual(@as(u64, 34 + 4 + 5 + 4), machine.elapsed_cycles);
 
     machine.bus.writeData(u16, Bus.waitcnt_address, 0x4018);
-    const fetch_cycles = machine.bus.rom_fetch_cycles;
-    try std.testing.expectError(error.UntimedPrefetch, machine.stepTimed());
-    try std.testing.expectEqual(fetch_cycles, machine.bus.rom_fetch_cycles);
-    try std.testing.expectEqual(@as(u64, 47), machine.elapsed_cycles);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 47 + 5 + 5 + 4), machine.elapsed_cycles);
 }
 
 test "timed IWRAM store charges one data cycle and breaks the next ROM fetch" {
@@ -213,15 +179,15 @@ test "timed IWRAM load charges a data cycle and an internal cycle" {
     try std.testing.expectEqual(@as(u64, 16 + 6), machine.elapsed_cycles);
 }
 
-test "timed stepping rejects a load outside IWRAM before advancing the CPU or clock" {
+test "timed Game Pak data load pays the nonsequential data access cost" {
     const std = @import("std");
     const rom = [_]u8{ 0x00, 0x00, 0x91, 0xE5, 0, 0, 0, 0, 0, 0, 0, 0 }; // LDR r0, [r1]
     var machine: Machine = undefined;
     machine.initCartridge(&rom);
     machine.cpu.registers[1] = Bus.rom_base;
-    try std.testing.expectError(error.UntimedInstruction, machine.stepTimed());
-    try std.testing.expectEqual(Bus.rom_base, machine.cpu.instruction_address);
-    try std.testing.expectEqual(@as(u64, 0), machine.elapsed_cycles);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0xE591_0000), machine.cpu.registers[0]);
+    try std.testing.expectEqual(@as(u64, 6 + 8 + 1), machine.elapsed_cycles);
 }
 
 test "cartridge SWI executes a BIOS handler that reads a BIOS literal" {
@@ -303,4 +269,42 @@ test "machine clock routes timer overflow IRQs while delivery is masked" {
     try std.testing.expectEqual(@as(u16, 8), machine.bus.irq_flags);
     try std.testing.expect(!machine.bus.irqLine());
     try std.testing.expectEqual(@as(u16, 0xFFFE), machine.bus.readData(u16, 0x0400_0100));
+}
+
+test "a Thumb VCOUNT polling loop writes palette RAM once on each VBlank" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x14, 0xFF, 0x2F, 0xE1, // BX r4
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0x08, 0x78, // wait_draw: LDRB r0, [r1]
+        0xA0, 0x28, // CMP r0, #160
+        0xFC, 0xD2, // BHS wait_draw
+        0x08, 0x78, // wait_blank: LDRB r0, [r1]
+        0xA0, 0x28, // CMP r0, #160
+        0xFC, 0xD3, // BLO wait_blank
+        0x01, 0x33, // ADDS r3, #1
+        0x13, 0x80, // STRH r3, [r2]
+        0xF6, 0xE7, // B wait_draw
+        0,    0,
+        0,    0,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    machine.cpu.registers[1] = Bus.vcount_address;
+    machine.cpu.registers[2] = Bus.palette_base;
+    machine.cpu.registers[4] = Bus.rom_base + 13;
+    machine.bus.writeData(u16, Bus.waitcnt_address, 0x4317);
+
+    for (0..3) |frame| {
+        try machine.runToVBlank(timing.cycles_per_frame);
+        try std.testing.expectEqual(@as(u8, 160), machine.bus.vcount);
+        const edge = timing.vblank_start + frame * timing.cycles_per_frame;
+        try std.testing.expect(machine.elapsed_cycles >= edge);
+        try std.testing.expect(machine.elapsed_cycles < edge + 32);
+        // Let the polling branch observe line 160 and execute its palette store.
+        for (0..16) |_| try machine.stepTimed();
+        const color = std.mem.readInt(u16, machine.bus.palette[0..2], .little);
+        try std.testing.expectEqual(@as(u16, @intCast(frame + 1)), color);
+    }
 }

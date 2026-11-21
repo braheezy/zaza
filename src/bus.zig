@@ -13,8 +13,12 @@ const ewram_size_bytes = 256 * 1024;
 pub const iwram_base: u32 = 0x0300_0000;
 pub const dispcnt_address: u32 = 0x0400_0000;
 pub const dispstat_address: u32 = 0x0400_0004;
+pub const vcount_address: u32 = dispstat_address + 2;
 const vblank_status: u16 = 1 << 0;
-const vblank_irq_enable: u16 = 1 << 3;
+const hblank_status: u16 = 1 << 1;
+const vcount_match_status: u16 = 1 << 2;
+const display_status_mask: u16 = 7;
+const display_write_mask: u16 = 0xFF38;
 pub const keyinput_address: u32 = 0x0400_0130;
 pub const keycnt_address: u32 = keyinput_address + 2;
 const keypad_irq: u14 = 1 << 12;
@@ -56,13 +60,15 @@ oam: [oam_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
 greenswap: u16 = 0,
-// Only the VBlank status and IRQ enable bits are modeled.
-dispstat: u16 = 0,
+dispstat: u16 = vcount_match_status,
+vcount: u8 = 0,
 irq_enable: u16 = 0,
 irq_flags: u16 = 0,
 ime_enabled: bool = false,
 waitcnt: u16 = 0,
+bus_cycles: u64 = 0,
 rom_fetch_cycles: u64 = 0,
+next_rom_data_address: ?u32 = null,
 iwram_data_cycles: u64 = 0,
 next_fetch_nonsequential: bool = false,
 
@@ -95,9 +101,41 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
     if (!previous_match and self.keypadIrqCondition()) self.requestInterrupt(keypad_irq);
 }
 
-pub fn updateVBlank(self: *Bus, active: bool, started: bool) void {
-    self.dispstat = (self.dispstat & ~vblank_status) | @intFromBool(active);
-    if (started and self.dispstat & vblank_irq_enable != 0) self.requestInterrupt(1);
+pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
+    self.requestInterrupt(self.timers.advance(cycles));
+    const phase = (old_phase + cycles) % timing.cycles_per_frame;
+    self.vcount = @intCast(phase / timing.cycles_per_line);
+    const compare = self.dispstat >> 8;
+    const line_phase = phase % timing.cycles_per_line;
+    self.dispstat &= ~display_status_mask;
+    if (phase >= timing.vblank_start and phase < timing.vblank_end) self.dispstat |= vblank_status;
+    if (line_phase >= timing.hblank_start) self.dispstat |= hblank_status;
+    if (self.vcount == compare) self.dispstat |= vcount_match_status;
+
+    // Detect crossed event boundaries even if the batch ends after the flag fell.
+    var events: u14 = 0;
+    if (cycles >= timing.cyclesUntil(old_phase, timing.vblank_start, timing.cycles_per_frame)) {
+        events |= 1;
+    }
+    const old_line_phase = old_phase % timing.cycles_per_line;
+    if (cycles >= timing.cyclesUntil(old_line_phase, timing.hblank_start, timing.cycles_per_line)) {
+        events |= 2;
+    }
+    if (compare < timing.lines_per_frame) {
+        const edge = @as(u64, compare) * timing.cycles_per_line;
+        if (cycles >= timing.cyclesUntil(old_phase, edge, timing.cycles_per_frame)) events |= 4;
+    }
+    self.requestInterrupt(events & @as(u14, @truncate(self.dispstat >> 3)));
+}
+
+fn writeDisplayStatus(self: *Bus, value: u16) void {
+    const previously_matching = self.dispstat & vcount_match_status != 0;
+    self.dispstat = (self.dispstat & (vblank_status | hblank_status)) |
+        (value & display_write_mask);
+    if (self.vcount == self.dispstat >> 8) {
+        self.dispstat |= vcount_match_status;
+        if (!previously_matching and self.dispstat & (1 << 5) != 0) self.requestInterrupt(4);
+    }
 }
 
 pub fn irqLine(self: *const Bus) bool {
@@ -119,13 +157,19 @@ pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
 fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     const interrupted = self.next_fetch_nonsequential;
     self.next_fetch_nonsequential = false;
-    if (address < bios_size_bytes) return self.readBios(T, address);
+    self.next_rom_data_address = null;
+    if (address < bios_size_bytes) {
+        self.bus_cycles += 1;
+        return self.readBios(T, address);
+    }
     if (ewramOffset(address)) |offset| {
         self.next_fetch_nonsequential = true;
+        self.bus_cycles += timing.ramAccessCycles(T, @truncate(address >> 24));
         return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
     }
     if (iwramOffset(address)) |offset| {
         self.next_fetch_nonsequential = true;
+        self.bus_cycles += timing.ramAccessCycles(T, @truncate(address >> 24));
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
     const value = self.readRom(T, address);
@@ -134,13 +178,16 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
         .nonsequential
     else
         access;
-    self.rom_fetch_cycles += timing.gamePak0AccessCycles(T, effective_access, self.waitcnt);
+    const cycles = timing.gamePakAccessCycles(T, effective_access, self.waitcnt, romWindow(address).?);
+    self.rom_fetch_cycles += cycles;
+    self.bus_cycles += cycles;
     return value;
 }
 
 pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
+    self.chargeDataAccess(T, aligned_address);
     if (aligned_address < bios_size_bytes) {
         // External BIOS reads need a protected-read latch, not access to ROM bytes.
         if (!self.executing_bios) @panic("protected BIOS data read not modeled");
@@ -177,7 +224,6 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
     }
     if (iwramOffset(aligned_address)) |offset| {
-        self.chargeIwramDataAccess();
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
     if (paletteOffset(aligned_address)) |offset| {
@@ -190,19 +236,24 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (oamOffset(aligned_address)) |offset| {
         return std.mem.readInt(T, self.oam[offset..][0..@sizeOf(T)], .little);
     }
-    if (T == u16) {
-        if (aligned_address == dispcnt_address) return self.dispcnt;
-        if (aligned_address == dispcnt_address + 2) return self.greenswap;
-        if (aligned_address == dispstat_address) return self.dispstat;
-    }
-    if (T == u32 and aligned_address == dispcnt_address) {
-        return @as(u32, self.dispcnt) | (@as(u32, self.greenswap) << 16);
+    if (aligned_address >= dispcnt_address and aligned_address < dispcnt_address + 8) {
+        const word = if (aligned_address < dispstat_address)
+            @as(u32, self.dispcnt) | (@as(u32, self.greenswap) << 16)
+        else
+            @as(u32, self.dispstat) | (@as(u32, self.vcount) << 16);
+        const shift: u5 = @intCast((aligned_address & 3) * 8);
+        return @truncate(word >> shift);
     }
     return self.readRom(T, aligned_address);
 }
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
+    self.chargeDataAccess(T, aligned_address);
+    self.writeAligned(T, aligned_address, value);
+}
+
+fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) void {
     if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
         for (0..@sizeOf(T)) |index| {
             const byte_address = aligned_address + @as(u32, @intCast(index));
@@ -234,19 +285,19 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             dispcnt_address => self.dispcnt,
             dispcnt_address + 2 => self.greenswap,
             dispstat_address => self.dispstat,
-            0x0400_0006 => 0,
+            vcount_address => 0,
             else => self.display_registers.values[(halfword_address - 0x0400_0008) / 2],
         };
         const shift: u4 = @intCast((aligned_address & 1) * 8);
         const merged = (previous & ~(@as(u16, 0xFF) << shift)) | (@as(u16, value) << shift);
-        self.writeData(u16, halfword_address, merged);
+        self.writeAligned(u16, halfword_address, merged);
         return;
     }
     if (T == u32 and aligned_address >= dispcnt_address and
         aligned_address < 0x0400_0058)
     {
-        self.writeData(u16, aligned_address, @truncate(value));
-        self.writeData(u16, aligned_address + 2, @truncate(value >> 16));
+        self.writeAligned(u16, aligned_address, @truncate(value));
+        self.writeAligned(u16, aligned_address + 2, @truncate(value >> 16));
         return;
     }
     if (paletteOffset(aligned_address)) |offset| {
@@ -260,7 +311,7 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         return;
     }
     if (T == u16) {
-        if (aligned_address == 0x0400_0006) return; // VCOUNT is read-only.
+        if (aligned_address == vcount_address) return; // VCOUNT is read-only.
         if (DisplayRegisters.contains(aligned_address)) {
             self.display_registers.write(aligned_address, value);
             return;
@@ -313,7 +364,7 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             return;
         }
         if (aligned_address == dispstat_address) {
-            self.dispstat = (self.dispstat & vblank_status) | (value & vblank_irq_enable);
+            self.writeDisplayStatus(value);
             return;
         }
     }
@@ -350,15 +401,24 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         return;
     }
     const offset = iwramOffset(aligned_address) orelse
-        std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
+        std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), aligned_address });
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
-    self.chargeIwramDataAccess();
 }
 
-fn chargeIwramDataAccess(self: *Bus) void {
-    // One IWRAM access fits in a single cycle and breaks the ROM fetch sequence.
-    self.iwram_data_cycles += 1;
+fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
     self.next_fetch_nonsequential = true;
+    if (romWindow(address)) |window| {
+        const sequential = self.next_rom_data_address == address and address & 0x1_FFFF != 0;
+        const access: timing.Access = if (sequential) .sequential else .nonsequential;
+        self.bus_cycles += timing.gamePakAccessCycles(T, access, self.waitcnt, window);
+        self.next_rom_data_address = (address & ~@as(u32, 1)) + @max(2, @sizeOf(T));
+    } else {
+        self.next_rom_data_address = null;
+        const region: u8 = @truncate(address >> 24);
+        const cycles = timing.ramAccessCycles(T, region);
+        self.bus_cycles += cycles;
+        if (region == iwram_base >> 24) self.iwram_data_cycles += cycles;
+    }
 }
 
 fn alignDataAddress(comptime T: type, address: u32) u32 {
@@ -406,11 +466,10 @@ fn readBios(self: *const Bus, comptime T: type, address: u32) T {
 }
 
 fn readRom(self: *const Bus, comptime T: type, address: u32) T {
-    // Only the first cartridge window is mapped in this initial bus.
-    if (address < rom_base or address >= 0x0A00_0000) {
+    if (romWindow(address) == null) {
         std.debug.panic("unmapped {d}-bit read at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     }
-    const offset = address - rom_base;
+    const offset = address & 0x01FF_FFFF;
     if (offset + @sizeOf(T) <= self.rom.len) {
         return std.mem.readInt(T, self.rom[offset..][0..@sizeOf(T)], .little);
     }
@@ -427,6 +486,11 @@ fn readRom(self: *const Bus, comptime T: type, address: u32) T {
         result |= @as(T, byte) << @intCast(index * 8);
     }
     return result;
+}
+
+fn romWindow(address: u32) ?u2 {
+    if (address < rom_base or address >= 0x0E00_0000) return null;
+    return @intCast((address - rom_base) >> 25);
 }
 
 fn unbackedRomByte(address: u32) u8 {
@@ -512,7 +576,7 @@ test "writes to the unused timer to serial gap leave bus state unchanged" {
     }
     try std.testing.expectEqual(@as(u16, 3), bus.irq_enable);
     try std.testing.expectEqual(@as(u64, 0), bus.iwram_data_cycles);
-    try std.testing.expect(!bus.next_fetch_nonsequential);
+    try std.testing.expect(bus.next_fetch_nonsequential);
 }
 
 test "bus routes serial registers across access widths" {
@@ -537,7 +601,7 @@ test "display control word writes include the green swap register" {
 test "BIOS display reset word stores and byte updates preserve status" {
     // Exercise the complete display reset span, including read-only and unused addresses.
     var bus: Bus = .{ .rom = &.{} };
-    bus.updateVBlank(true, true);
+    bus.advanceDevices(0, timing.vblank_start);
     for (0..0x60 / 4) |index| {
         bus.writeData(u32, dispcnt_address + @as(u32, @intCast(index * 4)), 0);
     }
@@ -688,4 +752,38 @@ test "IWRAM loaded as data can execute through its mirrors" {
     try std.testing.expectEqual(@as(u32, 0xE1A0_0000), bus.fetch32(0x03FF_8004, .nonsequential));
     try std.testing.expectEqual(@as(u16, 0xE1A0), bus.fetch16(iwram_base + 6, .sequential));
     try std.testing.expectEqual(@as(u64, 0), bus.rom_fetch_cycles);
+}
+
+test "display timing updates scanline status and latches each enabled IRQ" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u16, dispstat_address, 0xA0FF);
+    try std.testing.expectEqual(@as(u16, 0xA038), bus.readData(u16, dispstat_address));
+    bus.advanceDevices(0, timing.hblank_start - 1);
+    try std.testing.expectEqual(@as(u16, 0), bus.irq_flags);
+    bus.advanceDevices(timing.hblank_start - 1, 1);
+    try std.testing.expectEqual(@as(u16, 0xA03A), bus.readData(u16, dispstat_address));
+    try std.testing.expectEqual(@as(u16, 2), bus.irq_flags);
+    bus.writeData(u16, if_address, 2);
+    bus.advanceDevices(timing.vblank_start - 1, 1);
+    try std.testing.expectEqual(@as(u32, 0x00A0_A03D), bus.readData(u32, dispstat_address));
+    try std.testing.expectEqual(@as(u16, 5), bus.irq_flags);
+    bus.writeData(u32, dispstat_address, 0xFFFF_A038);
+    try std.testing.expectEqual(@as(u8, 160), bus.readData(u8, vcount_address));
+    bus.advanceDevices(timing.vblank_start, timing.vblank_end - timing.vblank_start);
+    try std.testing.expectEqual(@as(u32, 0x00E3_A038), bus.readData(u32, dispstat_address));
+    bus.advanceDevices(timing.vblank_end, timing.cycles_per_line);
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, vcount_address));
+}
+
+test "Game Pak mirrors use their own wait states and restart at a page boundary" {
+    var bus: Bus = .{ .rom = &.{ 0x11, 0x22, 0x33, 0x44 } };
+    try std.testing.expectEqual(@as(u32, 0x4433_2211), bus.readData(u32, 0x0A00_0000));
+    try std.testing.expectEqual(@as(u64, 10), bus.bus_cycles);
+    _ = bus.readData(u32, 0x0A00_0004);
+    try std.testing.expectEqual(@as(u64, 20), bus.bus_cycles);
+    _ = bus.readData(u16, 0x0C01_FFFE);
+    _ = bus.readData(u16, 0x0C02_0000);
+    try std.testing.expectEqual(@as(u64, 30), bus.bus_cycles);
+    try std.testing.expectEqual(@as(u16, 0x2211), bus.fetch16(0x0C00_0000, .sequential));
+    try std.testing.expectEqual(@as(u64, 35), bus.bus_cycles);
 }

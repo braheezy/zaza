@@ -204,6 +204,7 @@ fn executeArmBlockTransfer(
         }
         address +%= 4;
     }
+    if (load) self.internal_cycles += 1;
     if (writeback and (!load or !base_in_list)) {
         self.writeGeneralRegister(base_register, updated_base);
     }
@@ -443,6 +444,7 @@ fn executeThumbTransfer(self: *Cpu, bus: anytype, transfer: ThumbTransfer) void 
         .ldrsb => signExtendByte(bus.readData(u8, address)),
         .ldrsh => readSignedHalfword(bus, address),
     };
+    self.internal_cycles += 1;
     self.writeGeneralRegister(register, result);
 }
 
@@ -485,6 +487,7 @@ fn executeThumbBlockTransfer(self: *Cpu, bus: anytype, instruction: u16, stack: 
         address +%= 4;
     }
 
+    if (load) self.internal_cycles += 1;
     // LDMIA lets a loaded base register win over writeback.
     const base_in_list = !stack and instruction & (@as(u16, 1) << base_register) != 0;
     if (!load or !base_in_list) self.writeGeneralRegister(base_register, writeback);
@@ -617,6 +620,7 @@ fn executeThumbRegisterAlu(self: *Cpu, instruction: u16) void {
         0, 8 => left & right, // AND, TST.
         1 => left ^ right, // EOR.
         2, 3, 4, 7 => blk: {
+            self.internal_cycles += 1;
             const kind: u2 = if (operation == 7) 3 else @intCast(operation - 2);
             const shifted = self.shiftedRegisterOperand(.{
                 .register = destination,
@@ -639,7 +643,10 @@ fn executeThumbRegisterAlu(self: *Cpu, instruction: u16) void {
             break :blk arithmetic.value;
         },
         12 => left | right, // ORR.
-        13 => left *% right, // MUL.
+        13 => blk: {
+            self.internal_cycles += multiplyCycles(right, true);
+            break :blk left *% right;
+        },
         14 => left & ~right, // BIC.
         15 => ~right, // MVN.
     };
@@ -699,8 +706,11 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
     if (!conditionPassed(condition, flags)) return;
     const left = self.readRegister(left_register);
     const right = self.readRegister(right_register);
+    const signed = !long or instruction & (1 << 22) != 0;
+    self.internal_cycles += multiplyCycles(right, signed);
+    self.internal_cycles += @intFromBool(accumulate);
     if (long) {
-        const signed = instruction & (1 << 22) != 0;
+        self.internal_cycles += 1;
         var result: u64 = if (signed)
             @bitCast(@as(i64, @as(i32, @bitCast(left))) * @as(i64, @as(i32, @bitCast(right))))
         else
@@ -723,6 +733,15 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
     }
     // Preserve unspecified flags until hardware-specific multiply flags are modeled.
     if (instruction & (1 << 20) != 0) self.writeFlags(flags);
+}
+
+fn multiplyCycles(multiplier: u32, allow_ones: bool) u8 {
+    // ARM7 exits once the unprocessed high bytes are all zero or sign fill.
+    const signed_fill = if (allow_ones and multiplier >> 31 != 0) ~multiplier else multiplier;
+    if (signed_fill >> 8 == 0) return 1;
+    if (signed_fill >> 16 == 0) return 2;
+    if (signed_fill >> 24 == 0) return 3;
+    return 4;
 }
 
 fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) void {
@@ -958,6 +977,7 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
             .register => true,
         },
     };
+    if (register_shift) self.internal_cycles += 1;
     const source = decoded.source;
     const destination = decoded.destination;
     switch (decoded.operation) {
