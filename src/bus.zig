@@ -4,11 +4,14 @@ const Bus = @This();
 pub const rom_base: u32 = 0x0800_0000;
 pub const iwram_base: u32 = 0x0300_0000;
 pub const dispcnt_address: u32 = 0x0400_0000;
+pub const vram_base: u32 = 0x0600_0000;
 const iwram_size_bytes = 32 * 1024;
+const vram_size_bytes = 96 * 1024;
 
 // The caller owns the ROM bytes and keeps them alive while the bus uses them.
 rom: []const u8,
 iwram: [iwram_size_bytes]u8 = @splat(0),
+vram: [vram_size_bytes]u8 = @splat(0),
 // Only halfword storage is modeled; there is no display behavior yet.
 dispcnt: u16 = 0,
 
@@ -26,15 +29,26 @@ pub fn readData(self: *const Bus, comptime T: type, address: u32) T {
     if (iwramOffset(aligned_address)) |offset| {
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
-    if (T == u16 and aligned_address == dispcnt_address) return self.dispcnt;
+    if (T == u16) {
+        if (aligned_address == dispcnt_address) return self.dispcnt;
+        if (vramOffset(aligned_address)) |offset| {
+            return std.mem.readInt(u16, self.vram[offset..][0..2], .little);
+        }
+    }
     return self.readRom(T, aligned_address);
 }
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
-    if (T == u16 and aligned_address == dispcnt_address) {
-        self.dispcnt = value;
-        return;
+    if (T == u16) {
+        if (aligned_address == dispcnt_address) {
+            self.dispcnt = value;
+            return;
+        }
+        if (vramOffset(aligned_address)) |offset| {
+            std.mem.writeInt(u16, self.vram[offset..][0..2], value, .little);
+            return;
+        }
     }
     const offset = iwramOffset(aligned_address) orelse @panic("unmapped data write");
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
@@ -48,6 +62,12 @@ fn alignDataAddress(comptime T: type, address: u32) u32 {
 fn iwramOffset(address: u32) ?u32 {
     if (address < iwram_base or address >= iwram_base + iwram_size_bytes) return null;
     return address - iwram_base;
+}
+
+fn vramOffset(address: u32) ?u32 {
+    // Only the base VRAM range is mapped; mirrored addresses are not handled yet.
+    if (address < vram_base or address >= vram_base + vram_size_bytes) return null;
+    return address - vram_base;
 }
 
 fn readRom(self: *const Bus, comptime T: type, address: u32) T {

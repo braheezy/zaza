@@ -53,3 +53,20 @@ test "ARM program writes the memory-mapped display control register" {
     try std.testing.expectEqual(@as(u16, 3), machine.bus.dispcnt);
     try std.testing.expectEqual(@as(u16, 3), machine.bus.readData(u16, Bus.dispcnt_address));
 }
+
+test "ARM program stores a halfword in VRAM" {
+    const rom = [_]u8{
+        0x1F, 0x00, 0xA0, 0xE3, // MOV r0, #0x001F
+        0x06, 0x14, 0xA0, 0xE3, // MOV r1, #0x06000000
+        0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1]
+        // Pipeline lookahead only.
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    for (0..3) |_| try machine.step();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x1F, 0x00 }, machine.bus.vram[0..2]);
+    try std.testing.expectEqual(@as(u16, 0x001F), machine.bus.readData(u16, Bus.vram_base));
+}
