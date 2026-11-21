@@ -33,6 +33,7 @@ const stack_pointer: u4 = 13;
 const link_register: u4 = 14;
 const program_counter: u4 = 15;
 const thumb_bit: u32 = 1 << 5;
+const irq_disable_bit: u32 = 1 << 7;
 const flags_shift = 28;
 const flags_mask: u32 = 0xF << flags_shift;
 
@@ -728,15 +729,28 @@ fn executeArmSwi(self: *Cpu, bus: anytype, condition: u4) void {
 }
 
 fn enterSoftwareInterrupt(self: *Cpu, bus: anytype) void {
-    const supervisor_spsr = 1;
-    const irq_disable_bit: u32 = 1 << 7;
+    self.enterException(bus, .supervisor, 0x08, self.instruction_address);
+}
+
+pub fn irqMasked(self: *const Cpu) bool {
+    return self.cpsr & irq_disable_bit != 0;
+}
+
+pub fn enterIrq(self: *Cpu, bus: anytype) void {
+    std.debug.assert(!self.irqMasked());
+    // IRQ return subtracts four from LR to resume the first unexecuted instruction.
+    self.enterException(bus, .irq, 0x18, self.instruction_address +% 4);
+}
+
+fn enterException(self: *Cpu, bus: anytype, target_mode: Mode, vector: u32, return_link: u32) void {
+    const old_status = self.cpsr;
     const mode_mask: u32 = 0x1F;
-    self.spsr[supervisor_spsr] = self.cpsr;
-    self.cpsr = (self.cpsr & ~(mode_mask | thumb_bit)) |
-        irq_disable_bit | @as(u32, @backingInt(Mode.supervisor));
-    // Write LR after switching modes so the return address goes into the Supervisor bank.
-    self.writeGeneralRegister(link_register, self.instruction_address);
-    self.instruction_address = 0x08;
+    self.cpsr = (old_status & ~(mode_mask | thumb_bit)) |
+        irq_disable_bit | @as(u32, @backingInt(target_mode));
+    // SPSR and LR belong to the exception mode, not the interrupted mode.
+    self.spsr[self.savedStatusIndex().?] = old_status;
+    self.writeGeneralRegister(link_register, return_link);
+    self.instruction_address = vector;
     self.refillArmPipeline(bus);
 }
 
