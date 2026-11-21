@@ -165,13 +165,14 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (paletteOffset(aligned_address)) |offset| {
         return std.mem.readInt(T, self.palette[offset..][0..@sizeOf(T)], .little);
     }
+    if (aligned_address >> 24 == vram_base >> 24) {
+        const offset = self.vramOffset(aligned_address) orelse return 0;
+        return std.mem.readInt(T, self.vram[offset..][0..@sizeOf(T)], .little);
+    }
     if (T == u16) {
         if (aligned_address == dispcnt_address) return self.dispcnt;
         if (aligned_address == dispcnt_address + 2) return self.greenswap;
         if (aligned_address == dispstat_address) return self.dispstat;
-        if (vramOffset(aligned_address)) |offset| {
-            return std.mem.readInt(u16, self.vram[offset..][0..2], .little);
-        }
     }
     if (T == u32 and aligned_address == dispcnt_address) {
         return @as(u32, self.dispcnt) | (@as(u32, self.greenswap) << 16);
@@ -294,10 +295,18 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             self.dispstat = (self.dispstat & vblank_status) | (value & vblank_irq_enable);
             return;
         }
-        if (vramOffset(aligned_address)) |offset| {
-            std.mem.writeInt(u16, self.vram[offset..][0..2], value, .little);
-            return;
+    }
+    if (aligned_address >> 24 == vram_base >> 24) {
+        const offset = self.vramOffset(aligned_address) orelse return;
+        if (T == u8) {
+            // Byte writes duplicate in background VRAM and are ignored in sprite VRAM.
+            const sprite_start: u32 = if (self.bitmapMode()) 0x14000 else 0x10000;
+            if (offset >= sprite_start) return;
+            self.vram[offset & ~@as(u32, 1) ..][0..2].* = @splat(value);
+        } else {
+            std.mem.writeInt(T, self.vram[offset..][0..@sizeOf(T)], value, .little);
         }
+        return;
     }
     // The gap between DMA and timers is unused.
     if (aligned_address >= DMA.end and
@@ -336,10 +345,18 @@ fn paletteOffset(address: u32) ?u32 {
     return address % palette_size_bytes;
 }
 
-fn vramOffset(address: u32) ?u32 {
-    // Only the base VRAM range is mapped; mirrored addresses are not handled yet.
-    if (address < vram_base or address >= vram_base + vram_size_bytes) return null;
-    return address - vram_base;
+fn bitmapMode(self: *const Bus) bool {
+    return self.dispcnt & 7 >= 3;
+}
+
+fn vramOffset(self: *const Bus, address: u32) ?u32 {
+    std.debug.assert(address >> 24 == vram_base >> 24);
+    const offset = address & 0x1FFFF;
+    if (offset < vram_size_bytes) return offset;
+    // The final 32 KiB aliases the preceding bank, except in bitmap modes
+    // where the first 16 KiB of that alias reads zero and discards writes.
+    if (self.bitmapMode() and offset < 0x1C000) return null;
+    return offset - 0x8000;
 }
 
 fn readBios(self: *const Bus, comptime T: type, address: u32) T {
@@ -533,4 +550,30 @@ test "palette RAM mirrors share storage and byte writes update only the addresse
     bus.writeData(u16, 0x05FF_FFFE, 0xFEDC);
     try std.testing.expectEqual(@as(u16, 0xFEDC), bus.readData(u16, palette_base + 0x3FE));
     try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, palette_base));
+}
+
+test "VRAM widths and mirrors share storage with a hole in bitmap modes" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, vram_base + 0x30000, 0x4433_2211);
+    try std.testing.expectEqual(@as(u8, 0x33), bus.readData(u8, vram_base + 0x18002));
+    try std.testing.expectEqual(@as(u16, 0x2211), bus.readData(u16, vram_base + 0x10000));
+    bus.writeData(u16, dispcnt_address, 3);
+    bus.writeData(u32, vram_base + 0x18000, 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, vram_base + 0x18000));
+    try std.testing.expectEqual(@as(u32, 0x4433_2211), bus.readData(u32, vram_base + 0x10000));
+    bus.writeData(u32, vram_base + 0x1FFFC, 0xAABB_CCDD);
+    try std.testing.expectEqual(@as(u32, 0xAABB_CCDD), bus.readData(u32, vram_base + 0x17FFC));
+}
+
+test "VRAM byte stores honor the background and sprite boundary" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u8, vram_base + 0xFFFF, 0x12);
+    bus.writeData(u8, vram_base + 0x10000, 0x34);
+    try std.testing.expectEqual(@as(u16, 0x1212), bus.readData(u16, vram_base + 0xFFFE));
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, vram_base + 0x10000));
+    bus.writeData(u16, dispcnt_address, 3);
+    bus.writeData(u8, vram_base + 0x13FFF, 0x56);
+    bus.writeData(u8, vram_base + 0x1C000, 0x78);
+    try std.testing.expectEqual(@as(u16, 0x5656), bus.readData(u16, vram_base + 0x13FFE));
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, vram_base + 0x14000));
 }
