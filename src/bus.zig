@@ -28,8 +28,9 @@ bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
 iwram: [iwram_size_bytes]u8 = @splat(0),
 vram: [vram_size_bytes]u8 = @splat(0),
-// Only halfword storage is modeled; there is no display behavior yet.
+// Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
+greenswap: u16 = 0,
 // Only the VBlank status and IRQ enable bits are modeled.
 dispstat: u16 = 0,
 irq_enable: u16 = 0,
@@ -98,10 +99,14 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         if (aligned_address == if_address) return self.irq_flags;
         if (aligned_address == waitcnt_address) return self.waitcnt;
         if (aligned_address == dispcnt_address) return self.dispcnt;
+        if (aligned_address == dispcnt_address + 2) return self.greenswap;
         if (aligned_address == dispstat_address) return self.dispstat;
         if (vramOffset(aligned_address)) |offset| {
             return std.mem.readInt(u16, self.vram[offset..][0..2], .little);
         }
+    }
+    if (T == u32 and aligned_address == dispcnt_address) {
+        return @as(u32, self.dispcnt) | (@as(u32, self.greenswap) << 16);
     }
     if (T == u32 and aligned_address == ie_address) {
         return @as(u32, self.irq_enable) | (@as(u32, self.irq_flags) << 16);
@@ -135,6 +140,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             self.dispcnt = value;
             return;
         }
+        if (aligned_address == dispcnt_address + 2) {
+            self.greenswap = value & 1;
+            return;
+        }
         if (aligned_address == dispstat_address) {
             self.dispstat = (self.dispstat & vblank_status) | (value & vblank_irq_enable);
             return;
@@ -143,6 +152,12 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             std.mem.writeInt(u16, self.vram[offset..][0..2], value, .little);
             return;
         }
+    }
+    if (T == u32 and aligned_address == dispcnt_address) {
+        // A word store spans DISPCNT and the adjacent green-swap register.
+        self.dispcnt = @truncate(value);
+        self.greenswap = @truncate((value >> 16) & 1);
+        return;
     }
     if (T == u32 and aligned_address == ie_address) {
         // The low halfword writes IE; the high halfword acknowledges IF.
@@ -279,4 +294,14 @@ test "bus routes serial registers across access widths" {
     bus.writeData(u8, Serial.base + 1, 0xAB);
     try std.testing.expectEqual(@as(u16, 0xAB78), bus.readData(u16, Serial.base));
     try std.testing.expectEqual(@as(u32, 0x1234_AB78), bus.readData(u32, Serial.base));
+}
+
+test "display control word writes include the green swap register" {
+    // BIOS block stores use words across adjacent 16-bit display registers.
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, dispcnt_address, 0xFFFF_0403);
+    try std.testing.expectEqual(@as(u16, 0x0403), bus.readData(u16, dispcnt_address));
+    try std.testing.expectEqual(@as(u32, 0x0001_0403), bus.readData(u32, dispcnt_address));
+    bus.writeData(u16, dispcnt_address + 2, 2);
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, dispcnt_address + 2));
 }
