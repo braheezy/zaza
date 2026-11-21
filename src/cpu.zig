@@ -80,6 +80,12 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.executeArmSwi(bus, condition);
         return;
     }
+    // Multiply encodings overlap the data-processing space.
+    if (instruction & 0x0FC0_00F0 == 0x0000_0090 or instruction & 0x0F80_00F0 == 0x0080_0090) {
+        try self.executeArmMultiply(instruction);
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
     const decoded = try decodeArmDataProcessing(instruction);
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
@@ -87,6 +93,58 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
     }
+}
+
+fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    if (condition == 15) return error.UnsupportedInstruction;
+    const left_register: u4 = @truncate(instruction);
+    const right_register: u4 = @truncate(instruction >> 8);
+    const lower_register: u4 = @truncate(instruction >> 12);
+    const upper_register: u4 = @truncate(instruction >> 16);
+    const long = instruction & (1 << 23) != 0;
+    const accumulate = instruction & (1 << 21) != 0;
+    // ARMv4T excludes PC and restricts destination aliases with Rm.
+    if (left_register == program_counter or right_register == program_counter or
+        upper_register == program_counter or upper_register == left_register)
+    {
+        return error.UnsupportedInstruction;
+    }
+    if (long) {
+        if (lower_register == program_counter or lower_register == left_register or
+            lower_register == upper_register) return error.UnsupportedInstruction;
+    } else if (accumulate) {
+        if (lower_register == program_counter) return error.UnsupportedInstruction;
+    } else if (lower_register != 0) return error.UnsupportedInstruction;
+
+    var flags = self.readFlags();
+    if (!conditionPassed(condition, flags)) return;
+    const left = self.readRegister(left_register);
+    const right = self.readRegister(right_register);
+    if (long) {
+        const signed = instruction & (1 << 22) != 0;
+        var result: u64 = if (signed)
+            @bitCast(@as(i64, @as(i32, @bitCast(left))) * @as(i64, @as(i32, @bitCast(right))))
+        else
+            @as(u64, left) * right;
+        if (accumulate) {
+            const old = (@as(u64, self.readRegister(upper_register)) << 32) |
+                self.readRegister(lower_register);
+            result +%= old;
+        }
+        self.writeGeneralRegister(lower_register, @truncate(result));
+        self.writeGeneralRegister(upper_register, @truncate(result >> 32));
+        flags.negative = result >> 63 != 0;
+        flags.zero = result == 0;
+    } else {
+        var result = left *% right;
+        if (accumulate) result +%= self.readRegister(lower_register);
+        self.writeGeneralRegister(upper_register, result);
+        flags.negative = result >> 31 != 0;
+        flags.zero = result == 0;
+    }
+    // Preserve unspecified flags until hardware-specific multiply flags are modeled.
+    if (instruction & (1 << 20) != 0) self.writeFlags(flags);
 }
 
 fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) void {

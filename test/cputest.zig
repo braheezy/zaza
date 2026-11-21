@@ -249,7 +249,14 @@ fn runSelectedVector(vector: Vector) !void {
     // The fixture can retain low target bits in R15 even when its fetches are aligned.
     const expected_pc = vector.final.registers[15] & ~@as(u32, 3);
     if (expected_pc != cpu.instruction_address +% 8) return error.PcMismatch;
-    if (vector.final.cpsr != cpu.cpsr) return error.CpsrMismatch;
+    const opcode = vector.opcode;
+    const multiply = opcode & 0x0FC0_00F0 == 0x0000_0090 or opcode & 0x0F80_00F0 == 0x0080_0090;
+    // ARMv4T leaves C unspecified for flag-setting multiplies, and V for long forms.
+    const unspecified: u32 = if (multiply and opcode & (1 << 20) != 0)
+        (1 << 29) | (if (opcode & (1 << 23) != 0) @as(u32, 1 << 28) else 0)
+    else
+        0;
+    if ((vector.final.cpsr ^ cpu.cpsr) & ~unspecified != 0) return error.CpsrMismatch;
     if (!std.mem.eql(u32, &vector.final.spsr, &cpu.spsr)) return error.SpsrMismatch;
     if (!std.mem.eql(u32, &vector.final.pipeline, &cpu.pipeline.?)) return error.PipelineMismatch;
 }
@@ -304,7 +311,19 @@ const Report = struct {
                         status, vector.opcode,
                     });
                 } else {
-                    try self.explainImmediate(vector);
+                    if (std.mem.startsWith(u8, family, "arm_mul")) {
+                        const opcode = vector.opcode;
+                        const accumulate = opcode & (1 << 21) != 0;
+                        const mnemonic = if (opcode & (1 << 23) == 0)
+                            (if (accumulate) "MLA" else "MUL")
+                        else if (opcode & (1 << 22) != 0)
+                            (if (accumulate) "SMLAL" else "SMULL")
+                        else
+                            (if (accumulate) "UMLAL" else "UMULL");
+                        try self.style.cyan().print(self.writer, "  {s}{s} (opcode 0x{x:0>8})\n", .{
+                            mnemonic, if (opcode & (1 << 20) != 0) "S" else "", opcode,
+                        });
+                    } else try self.explainImmediate(vector);
                 }
             }
         }
@@ -401,6 +420,8 @@ const Report = struct {
             "arm_msr_imm",
             "arm_msr_reg",
             "arm_swi",
+            "arm_mul_mla",
+            "arm_mull_mlal",
         };
         for (supported_families) |supported| {
             if (std.mem.eql(u8, family, supported)) {
