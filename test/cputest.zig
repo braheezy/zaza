@@ -265,6 +265,8 @@ fn runSelectedVector(vector: Vector) !void {
     // ARMv4T leaves C unspecified for flag-setting multiplies, and V for long forms.
     const unspecified: u32 = if (!thumb and multiply and opcode & (1 << 20) != 0)
         (1 << 29) | (if (opcode & (1 << 23) != 0) @as(u32, 1 << 28) else 0)
+    else if (thumb and opcode & 0xFFC0 == 0x4340)
+        1 << 29
     else
         0;
     if ((vector.final.cpsr ^ cpu.cpsr) & ~unspecified != 0) return error.CpsrMismatch;
@@ -437,6 +439,9 @@ const Report = struct {
             "thumb_lsl_lsr_asr",
             "thumb_add_sub",
             "thumb_mov_cmp_add_sub",
+            "thumb_data_proc",
+            "thumb_add_sp_or_pc",
+            "thumb_add_sub_sp",
             "arm_mrs",
             "arm_msr_imm",
             "arm_msr_reg",

@@ -106,6 +106,28 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
 }
 
 fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!void {
+    if (instruction >> 10 == 0b010000) {
+        self.executeThumbRegisterAlu(instruction);
+        return;
+    }
+    if (instruction >> 12 == 0b1010) {
+        const destination: u3 = @truncate(instruction >> 8);
+        const offset = @as(u32, @as(u8, @truncate(instruction))) * 4;
+        // Thumb PC-relative address generation uses a word-aligned PC.
+        const base = if (instruction & (1 << 11) != 0)
+            self.readRegister(stack_pointer)
+        else
+            self.readRegister(program_counter) & ~@as(u32, 3);
+        self.writeGeneralRegister(destination, base +% offset);
+        return;
+    }
+    if (instruction >> 8 == 0xB0) {
+        const offset = @as(u32, @as(u7, @truncate(instruction))) * 4;
+        const base = self.readRegister(stack_pointer);
+        const result = if (instruction & (1 << 7) != 0) base -% offset else base +% offset;
+        self.writeGeneralRegister(stack_pointer, result);
+        return;
+    }
     switch (instruction >> 13) {
         0b000 => {
             const destination: u3 = @truncate(instruction);
@@ -156,6 +178,52 @@ fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction
         },
         else => return error.UnsupportedInstruction,
     }
+}
+
+fn executeThumbRegisterAlu(self: *Cpu, instruction: u16) void {
+    const operation: u4 = @truncate(instruction >> 6);
+    const source: u3 = @truncate(instruction >> 3);
+    const destination: u3 = @truncate(instruction);
+    const left = self.readRegister(destination);
+    const right = self.readRegister(source);
+    var flags = self.readFlags();
+    const result: u32 = switch (operation) {
+        0, 8 => left & right, // AND, TST.
+        1 => left ^ right, // EOR.
+        2, 3, 4, 7 => blk: {
+            const kind: u2 = if (operation == 7) 3 else @intCast(operation - 2);
+            const shifted = self.shiftedRegisterOperand(.{
+                .register = destination,
+                .kind = kind,
+                .amount = .{ .register = source },
+            });
+            flags.carry = shifted.carry;
+            break :blk shifted.value;
+        },
+        5, 6, 9, 10, 11 => blk: {
+            const arithmetic = switch (operation) {
+                5 => addWithCarry(left, right, flags.carry), // ADC.
+                6 => addWithCarry(left, ~right, flags.carry), // SBC.
+                9 => addWithCarry(0, ~right, true), // NEG.
+                10 => addWithCarry(left, ~right, true), // CMP.
+                11 => addWithCarry(left, right, false), // CMN.
+                else => unreachable,
+            };
+            flags = arithmetic.flags;
+            break :blk arithmetic.value;
+        },
+        12 => left | right, // ORR.
+        13 => left *% right, // MUL.
+        14 => left & ~right, // BIC.
+        15 => ~right, // MVN.
+    };
+    switch (operation) {
+        8, 10, 11 => {}, // Tests and comparisons only write flags.
+        else => self.writeGeneralRegister(destination, result),
+    }
+    flags.negative = result >> 31 != 0;
+    flags.zero = result == 0;
+    self.writeFlags(flags);
 }
 
 fn executeArmBx(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedInstruction}!void {
