@@ -54,10 +54,7 @@ pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
 pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
     const queued = self.pipeline orelse return error.PipelineNotReady;
     if (self.cpsr & thumb_bit != 0) {
-        try self.executeThumbLowAlu(@truncate(queued[0]));
-        const fetched = bus.fetch16(self.instruction_address +% 4);
-        self.pipeline = .{ queued[1], fetched };
-        self.instruction_address +%= 2;
+        try self.stepThumb(bus, @truncate(queued[0]));
         return;
     }
     const instruction = queued[0];
@@ -103,6 +100,52 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
     }
+}
+
+fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstruction}!void {
+    const pc = self.instruction_address +% 4;
+    const immediate: u11 = @truncate(instruction);
+    const signed_immediate: i32 = @as(i11, @bitCast(immediate));
+    var target: ?u32 = null;
+    if (instruction >> 12 == 0xD) {
+        const condition: u4 = @truncate(instruction >> 8);
+        if (condition >= 0xE) return error.UnsupportedInstruction;
+        if (conditionPassed(condition, self.readFlags())) {
+            const displacement: i8 = @bitCast(@as(u8, @truncate(instruction)));
+            target = pc +% @as(u32, @bitCast(@as(i32, displacement) * 2));
+        }
+    } else switch (instruction >> 11) {
+        0b11100 => target = pc +% @as(u32, @bitCast(signed_immediate * 2)),
+        0b11110 => {
+            // BL's prefix stores the signed high displacement in the active LR bank.
+            const base = pc +% @as(u32, @bitCast(signed_immediate * 4096));
+            self.writeGeneralRegister(link_register, base);
+        },
+        0b11111 => {
+            target = (self.readRegister(link_register) +% (@as(u32, immediate) * 2)) &
+                ~@as(u32, 1);
+            // Bit zero marks the return address as Thumb for BX.
+            self.writeGeneralRegister(link_register, (self.instruction_address +% 2) | 1);
+        },
+        else => try self.executeThumbLowAlu(instruction),
+    }
+
+    // A taken branch still performs the sequential fetch before refilling.
+    const queued = self.pipeline.?;
+    const fetched = bus.fetch16(pc);
+    self.pipeline = .{ queued[1], fetched };
+    self.instruction_address +%= 2;
+    if (target) |address| {
+        self.instruction_address = address;
+        self.refillThumbPipeline(bus);
+    }
+}
+
+fn refillThumbPipeline(self: *Cpu, bus: anytype) void {
+    std.debug.assert(self.instruction_address & 1 == 0);
+    const current = bus.fetch16(self.instruction_address);
+    const next = bus.fetch16(self.instruction_address +% 2);
+    self.pipeline = .{ current, next };
 }
 
 fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!void {
@@ -240,9 +283,7 @@ fn executeArmBx(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedIns
     if (target & 1 != 0) {
         self.cpsr |= thumb_bit;
         self.instruction_address = target & ~@as(u32, 1);
-        const current = bus.fetch16(self.instruction_address);
-        const next = bus.fetch16(self.instruction_address +% 2);
-        self.pipeline = .{ current, next };
+        self.refillThumbPipeline(bus);
     } else {
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
