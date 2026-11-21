@@ -1,6 +1,7 @@
 const std = @import("std");
 const Bus = @This();
 const timing = @import("timing.zig");
+const Serial = @import("serial.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
 pub const iwram_base: u32 = 0x0300_0000;
@@ -22,6 +23,7 @@ const vram_size_bytes = 96 * 1024;
 
 // The caller owns both images and keeps them alive while the bus uses them.
 rom: []const u8,
+serial: Serial = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
 iwram: [iwram_size_bytes]u8 = @splat(0),
@@ -86,6 +88,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         if (!self.executing_bios) @panic("protected BIOS data read not modeled");
         return self.readBios(T, aligned_address);
     }
+    if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
     if (iwramOffset(aligned_address)) |offset| {
         self.chargeIwramDataAccess();
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
@@ -109,6 +112,10 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
+    if (Serial.contains(aligned_address)) {
+        self.serial.write(T, aligned_address, value);
+        return;
+    }
     if (T == u16) {
         if (aligned_address == ie_address) {
             self.irq_enable = value & irq_source_mask;
@@ -263,4 +270,13 @@ test "writes to the unused timer to serial gap leave bus state unchanged" {
     try std.testing.expectEqual(@as(u16, 3), bus.irq_enable);
     try std.testing.expectEqual(@as(u64, 0), bus.iwram_data_cycles);
     try std.testing.expect(!bus.next_fetch_nonsequential);
+}
+
+test "bus routes serial registers across access widths" {
+    // Verify dispatch and CPU alignment without involving a ROM or BIOS.
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, Serial.base, 0x1234_5678);
+    bus.writeData(u8, Serial.base + 1, 0xAB);
+    try std.testing.expectEqual(@as(u16, 0xAB78), bus.readData(u16, Serial.base));
+    try std.testing.expectEqual(@as(u32, 0x1234_AB78), bus.readData(u32, Serial.base));
 }

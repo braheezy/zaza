@@ -1,0 +1,58 @@
+const std = @import("std");
+const Serial = @This();
+
+pub const base: u32 = 0x0400_0120;
+// Register storage only. Link transfers and pin behavior are not modeled yet.
+registers: [0x16]u8 = @splat(0),
+
+pub fn contains(address: u32) bool {
+    return switch (address) {
+        base...base + 0xB, base + 0x14...base + 0x15 => true,
+        else => false,
+    };
+}
+
+pub fn read(self: *const Serial, comptime T: type, address: u32) T {
+    comptime std.debug.assert(T == u8 or T == u16 or T == u32);
+    std.debug.assert(contains(address));
+    var value: T = 0;
+    for (0..@sizeOf(T)) |index| {
+        const byte_address = address + @as(u32, @intCast(index));
+        // A word access to RCNT includes an unused upper halfword.
+        if (contains(byte_address)) {
+            value |= @as(T, self.registers[byte_address - base]) << @intCast(index * 8);
+        }
+    }
+    return value;
+}
+
+pub fn write(self: *Serial, comptime T: type, address: u32, value: T) void {
+    comptime std.debug.assert(T == u8 or T == u16 or T == u32);
+    std.debug.assert(contains(address));
+    for (0..@sizeOf(T)) |index| {
+        const byte_address = address + @as(u32, @intCast(index));
+        if (contains(byte_address)) {
+            const byte: u8 = @truncate(value >> @intCast(index * 8));
+            if (byte_address == base + 8 and byte & 0x80 != 0) {
+                @panic("serial transfers are not modeled");
+            }
+            self.registers[byte_address - base] = byte;
+        }
+    }
+    // Reserved control bits do not retain writes (GBATEK SIO register map).
+    self.registers[9] &= 0x7F;
+    self.registers[0x15] &= 0xC1;
+}
+
+test "serial byte writes preserve adjacent data and word accesses are little endian" {
+    // BIOS uses byte stores even for registers also accessible as halfwords.
+    var serial: Serial = .{};
+    serial.write(u32, base, 0x4433_2211);
+    serial.write(u8, base + 1, 0xAA);
+    try std.testing.expectEqual(@as(u32, 0x4433_AA11), serial.read(u32, base));
+    serial.write(u16, base + 8, 0);
+    serial.write(u32, base + 0x14, 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u32, 0xC1FF), serial.read(u32, base + 0x14));
+    try std.testing.expect(!contains(0x0400_0130));
+    try std.testing.expect(!contains(base + 0xC));
+}
