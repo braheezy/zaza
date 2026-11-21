@@ -55,6 +55,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     if (self.cpsr & thumb_bit != 0) return error.UnsupportedInstruction;
     const queued = self.pipeline orelse return error.PipelineNotReady;
     const instruction = queued[0];
+    if (instruction & 0x0FFF_FFF0 == 0x012F_FF10) {
+        try self.executeArmBx(bus, instruction);
+        return;
+    }
     if (instruction >> 25 & 0b111 == 0b101) {
         const condition: u4 = @truncate(instruction >> 28);
         if (condition == 0xF) return error.UnsupportedInstruction;
@@ -90,6 +94,29 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
     if (redirect) |target| {
+        self.instruction_address = target & ~@as(u32, 3);
+        self.refillArmPipeline(bus);
+    }
+}
+
+fn executeArmBx(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    const source: u4 = @truncate(instruction);
+    if (source == program_counter) return error.UnsupportedInstruction;
+    const taken = conditionPassed(condition, self.readFlags());
+    const target = if (taken) self.readRegister(source) else 0;
+    // The old instruction stream still supplies the sequential ARM fetch.
+    _ = self.advanceArmPipeline(bus);
+    if (!taken) return;
+
+    if (target & 1 != 0) {
+        self.cpsr |= thumb_bit;
+        self.instruction_address = target & ~@as(u32, 1);
+        const current = bus.fetch16(self.instruction_address);
+        const next = bus.fetch16(self.instruction_address +% 2);
+        self.pipeline = .{ current, next };
+    } else {
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
     }
@@ -617,6 +644,10 @@ test "ARM pipeline refill and advance fetch words in address order" {
 test "ARM step executes the queued MOV and fetches the next word" {
     const TestBus = struct {
         fetched_address: ?u32 = null,
+
+        pub fn fetch16(_: *@This(), _: u32) u16 {
+            unreachable;
+        }
 
         pub fn fetch32(self: *@This(), address: u32) u32 {
             self.fetched_address = address;

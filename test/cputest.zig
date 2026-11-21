@@ -159,19 +159,27 @@ const TestBus = struct {
     failure: ?error{ InvalidVector, UnexpectedFetch } = null,
 
     pub fn fetch32(self: *TestBus, address: u32) u32 {
+        return self.fetch(address, 4);
+    }
+
+    pub fn fetch16(self: *TestBus, address: u32) u16 {
+        return @truncate(self.fetch(address, 2));
+    }
+
+    fn fetch(self: *TestBus, address: u32, width: u32) u32 {
         if (self.failure != null) return 0;
-        return self.expectFetch32(address) catch |err| {
+        return self.expectFetch(address, width) catch |err| {
             // Keep the CPU bus API infallible; report mismatches after the step.
             self.failure = err;
             return 0;
         };
     }
 
-    fn expectFetch32(self: *TestBus, address: u32) !u32 {
+    fn expectFetch(self: *TestBus, address: u32, width: u32) !u32 {
         if (self.transactions.remaining.len == 0) return error.UnexpectedFetch;
         const entry = try self.transactions.words(6);
         if (entry[0] != 0) return error.UnexpectedFetch;
-        if (entry[1] != 4) return error.UnexpectedFetch;
+        if (entry[1] != width) return error.UnexpectedFetch;
         if (entry[2] != address) return error.UnexpectedFetch;
         return entry[3];
     }
@@ -247,8 +255,9 @@ fn runSelectedVector(vector: Vector) !void {
         return error.RegisterMismatch;
     }
     // The fixture can retain low target bits in R15 even when its fetches are aligned.
-    const expected_pc = vector.final.registers[15] & ~@as(u32, 3);
-    if (expected_pc != cpu.instruction_address +% 8) return error.PcMismatch;
+    const width: u32 = if (cpu.cpsr & (1 << 5) != 0) 2 else 4;
+    const expected_pc = vector.final.registers[15] & ~(width - 1);
+    if (expected_pc != cpu.instruction_address +% (2 * width)) return error.PcMismatch;
     const opcode = vector.opcode;
     const multiply = opcode & 0x0FC0_00F0 == 0x0000_0090 or opcode & 0x0F80_00F0 == 0x0080_0090;
     // ARMv4T leaves C unspecified for flag-setting multiplies, and V for long forms.
@@ -289,6 +298,10 @@ const Report = struct {
                     vector.initial.registers[15] -% 8,
                     vector.final.registers[15] -% 8,
                 });
+            } else if (std.mem.eql(u8, family, "arm_bx")) {
+                const source: u4 = @truncate(vector.opcode);
+                const state = if (vector.final.cpsr & (1 << 5) != 0) "Thumb" else "ARM";
+                try self.style.cyan().print(self.writer, "  BX r{d} → {s} state\n", .{ source, state });
             } else if (std.mem.eql(u8, family, "arm_mrs")) {
                 const destination: u4 = @truncate(vector.opcode >> 12);
                 const status = if (vector.opcode & (1 << 22) != 0) "SPSR" else "CPSR";
@@ -416,6 +429,7 @@ const Report = struct {
             "arm_data_proc_immediate_shift",
             "arm_data_proc_register_shift",
             "arm_b_bl",
+            "arm_bx",
             "arm_mrs",
             "arm_msr_imm",
             "arm_msr_reg",
