@@ -1,51 +1,101 @@
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = (try init.minimal.args.toSlice(arena))[1..];
-    const with_bios = args.len == 5 and std.mem.eql(u8, args[0], "--bios");
+    const with_bios = args.len >= 2 and std.mem.eql(u8, args[0], "--bios");
     const run_args = if (with_bios) args[2..] else args;
+    const bios = if (with_bios) try loadBios(init.io, arena, args[1]) else bundled_bios;
+    if (run_args.len > 1 and std.mem.eql(u8, run_args[0], "replay")) {
+        return replayInput(init.io, arena, bios, run_args[1..]);
+    }
+
     const run: struct { rom: []const u8, steps: usize, output: []const u8 } = switch (run_args.len) {
         1 => .{ .rom = &mode3_demo_rom, .steps = mode3_demo_steps, .output = run_args[0] },
         3 => blk: {
             const steps = try std.fmt.parseInt(usize, run_args[1], 10);
             if (steps == 0) return error.InvalidStepCount;
-            const rom = try std.Io.Dir.cwd().readFileAlloc(
-                init.io,
-                run_args[0],
-                arena,
-                .limited(32 * 1024 * 1024 + 1),
-            );
-            if (rom.len < 8) return error.RomTooShort;
+            const rom = try loadRom(init.io, arena, run_args[0]);
             break :blk .{ .rom = rom, .steps = steps, .output = run_args[2] };
         },
         else => {
             std.debug.print(
                 "Usage: zaza <output.bmp>\n" ++
-                    "       zaza [--bios <bios.bin>] <input.gba> <steps> <output.bmp>\n",
+                    "       zaza [--bios <bios.bin>] <input.gba> <steps> <output.bmp>\n" ++
+                    "       zaza [--bios <bios.bin>] replay <input.gba> <frames> <output.bmp> " ++
+                    "(--input <script> | --input-file <path>)\n",
                 .{},
             );
             return error.InvalidArguments;
         },
     };
 
-    const bios = if (with_bios) blk: {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(
-            init.io,
-            args[1],
-            arena,
-            .limited(Bus.bios_size_bytes + 1),
-        );
-        if (bytes.len != Bus.bios_size_bytes) return error.InvalidBiosSize;
-        break :blk bytes[0..Bus.bios_size_bytes];
-    } else bundled_bios;
     var frame: video.Frame = undefined;
     try captureBitmap(run.rom, bios, run.steps, &frame);
 
-    const file = try std.Io.Dir.cwd().createFile(init.io, run.output, .{ .exclusive = true });
-    defer file.close(init.io);
+    try writeBitmap(init.io, run.output, &frame);
+}
+
+fn loadBios(io: std.Io, arena: std.mem.Allocator, path: []const u8) !*const [Bus.bios_size_bytes]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(Bus.bios_size_bytes + 1),
+    );
+    if (bytes.len != Bus.bios_size_bytes) return error.InvalidBiosSize;
+    return bytes[0..Bus.bios_size_bytes];
+}
+
+fn writeBitmap(io: std.Io, path: []const u8, frame: *const video.Frame) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer file.close(io);
     var buffer: [4096]u8 = undefined;
-    var file_writer = file.writer(init.io, &buffer);
-    try bmp.write(&file_writer.interface, &frame);
+    var file_writer = file.writer(io, &buffer);
+    try bmp.write(&file_writer.interface, frame);
     try file_writer.interface.flush();
+}
+
+fn replayInput(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    bios: *const [Bus.bios_size_bytes]u8,
+    args: []const [:0]const u8,
+) !void {
+    if (args.len != 5) return error.InvalidReplayArguments;
+    const frames = try std.fmt.parseInt(u32, args[1], 10);
+    if (frames == 0) return error.InvalidFrameCount;
+    const script = if (std.mem.eql(u8, args[3], "--input"))
+        args[4]
+    else if (std.mem.eql(u8, args[3], "--input-file"))
+        try std.Io.Dir.cwd().readFileAlloc(io, args[4], arena, .limited(1024 * 1024))
+    else
+        return error.InvalidReplayArguments;
+    const changes = try input.parseScript(arena, script);
+    if (changes.len != 0 and changes[changes.len - 1].frame >= frames) {
+        return error.InputFrameOutsideReplay;
+    }
+
+    const rom = try loadRom(io, arena, args[0]);
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(rom, bios);
+    var replay: input.Replay = .{ .remaining = changes };
+    for (0..frames) |index| {
+        machine.runFrame(replay.buttonsForFrame(@intCast(index))) catch |err| {
+            std.log.err("replay stopped in frame {d} at 0x{x:0>8}", .{
+                index, machine.cpu.instruction_address,
+            });
+            return err;
+        };
+    }
+    var frame: video.Frame = undefined;
+    try machine.snapshotBitmap(&frame);
+    try writeBitmap(io, args[2], &frame);
+}
+
+pub fn loadRom(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const rom = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(32 * 1024 * 1024 + 1));
+    if (rom.len < 8) return error.RomTooShort;
+    if (rom.len > 32 * 1024 * 1024) return error.RomTooLarge;
+    return rom;
 }
 
 pub fn captureBitmap(
@@ -72,6 +122,7 @@ const Bus = @import("bus.zig");
 const Machine = @import("machine.zig");
 const video = @import("video.zig");
 const bmp = @import("bmp.zig");
+const input = @import("input.zig");
 
 const mode3_demo_rom = [_]u8{
     0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3
@@ -90,6 +141,7 @@ const mode3_demo_steps = 6 + 3 * video.width;
 
 test {
     _ = bmp;
+    _ = input;
     _ = @import("timing.zig");
 }
 

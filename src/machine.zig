@@ -3,6 +3,7 @@ const Bus = @import("bus.zig");
 const Machine = @This();
 const video = @import("video.zig");
 const timing = @import("timing.zig");
+const input = @import("input.zig");
 
 cpu: Cpu,
 bus: Bus,
@@ -55,6 +56,13 @@ pub fn stepTimed(self: *Machine) !void {
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
     const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
     self.advanceClock(bus_cycles + internal_cycles);
+}
+
+/// Apply a full keypad snapshot and run to the next VBlank for frontends and replay.
+pub fn runFrame(self: *Machine, buttons: input.Buttons) !void {
+    self.bus.setPressedButtons(buttons);
+    // Every supported instruction advances at least one cycle.
+    try self.runToVBlank(timing.cycles_per_frame);
 }
 
 /// Stop on the first instruction boundary at or after the next VBlank edge.

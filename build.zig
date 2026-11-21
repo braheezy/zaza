@@ -45,7 +45,12 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                 }),
             });
-            desktop.root_module.addImport("mach", mach.module("mach"));
+            const mach_module = mach.module("mach");
+            desktop.root_module.addImport("mach", mach_module);
+            // Share Mach's AppKit bindings for native window options Core does not expose.
+            if (mach_module.import_table.get("objc")) |objc_module| {
+                desktop.root_module.addImport("objc", objc_module);
+            }
             desktop.root_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
             b.installArtifact(desktop);
             check.dependOn(&desktop.step);
