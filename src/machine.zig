@@ -101,6 +101,68 @@ fn advanceClock(self: *Machine, cycles: u64) void {
     self.bus.advanceDevices(old_phase, cycles);
 }
 
+test "ARM compare with Rd set to PC restores status and continues sequentially" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x00, 0xF0, 0x5F, 0x01, // CMPEQ with Rd = PC, skipped with Z clear.
+        0x00, 0xF0, 0x5F, 0xE1, // CMP with Rd = PC, restores the FIQ SPSR.
+        0x08, 0x00, 0xA0, 0xE1, // MOV r0, r8
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    machine.cpu.cpsr = 0x11;
+    machine.cpu.spsr[0] = 0x2000_001F;
+    machine.cpu.registers[8] = 32;
+    machine.cpu.banked.fiq[0] = 64;
+
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0x11), machine.cpu.cpsr);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0x2000_001F), machine.cpu.cpsr);
+    try std.testing.expectEqual(Bus.rom_base + 8, machine.cpu.instruction_address);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 32), machine.cpu.readRegister(0));
+}
+
+test "ARM word and byte swaps preserve aliased register inputs and charge one internal cycle each" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x90, 0x00, 0x01, 0xE1, // SWP r0, r0, [r1]
+        0x92, 0x10, 0x41, 0xE1, // SWPB r1, r2, [r1]
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    machine.cpu.registers[0] = 0x4433_2211;
+    machine.cpu.registers[1] = Bus.iwram_base + 1;
+    machine.cpu.registers[2] = 0xAABB_CC99;
+    machine.bus.writeData(u32, Bus.iwram_base, 0xDDCC_BBAA);
+
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0xAADD_CCBB), machine.cpu.readRegister(0));
+    try std.testing.expectEqual(@as(u32, 0x4433_2211), machine.bus.readData(u32, Bus.iwram_base));
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0x22), machine.cpu.readRegister(1));
+    try std.testing.expectEqual(@as(u32, 0x4433_9911), machine.bus.readData(u32, Bus.iwram_base));
+    try std.testing.expectEqual(@as(u64, 2), machine.cpu.internal_cycles);
+}
+
+test "ARM reads from unused memory take their lanes from the lookahead opcode" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x00, 0x00, 0x91, 0xE5, // LDR r0, [r1]
+        0x01, 0x20, 0xD1, 0xE5, // LDRB r2, [r1, #1]
+        0x00, 0xFF, 0x2F, 0xE1, // First read sees this word.
+        0x11, 0x22, 0x33, 0x44, // Second read sees byte lane 1 of this word.
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    machine.cpu.registers[1] = 0x8000_0000;
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0xE12F_FF00), machine.cpu.readRegister(0));
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0x22), machine.cpu.readRegister(2));
+}
+
 test "timed cartridge branch loop raises VBlank IF even with IRQ delivery masked" {
     const std = @import("std");
     const rom = [_]u8{

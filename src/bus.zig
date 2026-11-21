@@ -74,6 +74,7 @@ rom_fetch_cycles: u64 = 0,
 next_rom_data_address: ?u32 = null,
 iwram_data_cycles: u64 = 0,
 next_fetch_nonsequential: bool = false,
+prefetch_word: u32 = 0,
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
     // A device latches its request even while IRQ delivery is disabled.
@@ -154,11 +155,24 @@ pub fn prefetchEnabled(self: *const Bus) bool {
 }
 
 pub fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
-    return self.fetch(u32, address, access);
+    const word = self.fetch(u32, address, access);
+    self.prefetch_word = word;
+    return word;
 }
 
 pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
-    return self.fetch(u16, address, access);
+    const halfword = self.fetch(u16, address, access);
+    if (address < bios_size_bytes) {
+        self.prefetch_word = self.readBios(u32, address & ~@as(u32, 3));
+    } else if (address >> 24 == iwram_base >> 24) {
+        const shift: u5 = @intCast((address & 2) * 8);
+        const mask = @as(u32, 0xFFFF) << shift;
+        self.prefetch_word = (self.prefetch_word & ~mask) | (@as(u32, halfword) << shift);
+    } else {
+        // EWRAM and Game Pak instruction reads drive the same halfword on both lanes.
+        self.prefetch_word = @as(u32, halfword) * 0x0001_0001;
+    }
+    return halfword;
 }
 
 fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
@@ -199,6 +213,10 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         // External BIOS reads need a protected-read latch, not access to ROM bytes.
         if (!self.executing_bios) @panic("protected BIOS data read not modeled");
         return self.readBios(T, aligned_address);
+    }
+    if (aligned_address < ewram_base or aligned_address >= 0x1000_0000) {
+        const shift: u5 = @intCast((aligned_address & 3) * 8);
+        return @truncate(self.prefetch_word >> shift);
     }
     if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
         var result: T = 0;

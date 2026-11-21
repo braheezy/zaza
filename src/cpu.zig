@@ -91,6 +91,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.executeArmSwi(bus, condition);
         return;
     }
+    if (instruction & 0x0FB0_0FF0 == 0x0100_0090) {
+        try self.executeArmSwap(bus, instruction);
+        return;
+    }
     // Multiply encodings overlap the data-processing space.
     if (instruction & 0x0FC0_00F0 == 0x0000_0090 or instruction & 0x0F80_00F0 == 0x0080_0090) {
         try self.executeArmMultiply(instruction);
@@ -113,15 +117,17 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         .tst, .teq, .cmp, .cmn => false,
         else => true,
     };
-    const return_status: ?u32 = if (writes_result and decoded.destination == program_counter and
-        decoded.set_flags and conditionPassed(decoded.condition, self.readFlags()))
-        self.spsr[self.savedStatusIndex() orelse return error.UnsupportedInstruction]
-    else
-        null;
+    const return_status: ?u32 = blk: {
+        if (decoded.destination != program_counter or !decoded.set_flags) break :blk null;
+        if (!conditionPassed(decoded.condition, self.readFlags())) break :blk null;
+        if (self.savedStatus()) |status| break :blk status;
+        if (writes_result) return error.UnsupportedInstruction;
+        break :blk self.cpsr;
+    };
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
+    if (return_status) |status| self.cpsr = status;
     if (redirect) |target| {
-        if (return_status) |status| self.cpsr = status;
         if (self.cpsr & thumb_bit != 0) {
             self.instruction_address = target & ~@as(u32, 1);
             self.refillThumbPipeline(bus);
@@ -129,7 +135,42 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
             self.instruction_address = target & ~@as(u32, 3);
             self.refillArmPipeline(bus);
         }
+    } else if (self.cpsr & thumb_bit != 0) {
+        // Test and compare encodings with Rd = PC restore status without branching.
+        self.refillThumbPipeline(bus);
     }
+}
+
+fn executeArmSwap(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    if (!conditionPassed(condition, self.readFlags())) {
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
+
+    const base: u4 = @truncate(instruction >> 16);
+    const destination: u4 = @truncate(instruction >> 12);
+    const source: u4 = @truncate(instruction);
+    if (base == program_counter or destination == program_counter or source == program_counter) {
+        return error.UnsupportedInstruction;
+    }
+    const address = self.readRegister(base);
+    const outgoing = self.readRegister(source);
+    _ = self.advanceArmPipeline(bus);
+
+    // Read and write as one instruction, before replacing any aliased source register.
+    const incoming: u32 = if (instruction & (1 << 22) != 0) blk: {
+        const previous = bus.readData(u8, address);
+        bus.writeData(u8, address, @truncate(outgoing));
+        break :blk previous;
+    } else blk: {
+        const previous = std.math.rotr(u32, bus.readData(u32, address), (address & 3) * 8);
+        bus.writeData(u32, address, outgoing);
+        break :blk previous;
+    };
+    self.internal_cycles += 1;
+    self.writeGeneralRegister(destination, incoming);
 }
 
 fn executeArmBlockTransfer(
