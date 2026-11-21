@@ -65,6 +65,7 @@ const mode3_demo_steps = 6 + 3 * video.width;
 
 test {
     _ = bmp;
+    _ = @import("timing.zig");
 }
 
 test "ARM pipeline refills from cartridge ROM bytes" {
@@ -72,12 +73,34 @@ test "ARM pipeline refills from cartridge ROM bytes" {
         0x2A, 0x00, 0xA0, 0xE3, // MOV r0, #42
         0x00, 0x10, 0xA0, 0xE3, // MOV r1, #0
     };
-    const bus: Bus = .{ .rom = &rom };
+    var bus: Bus = .{ .rom = &rom };
     var cpu: Cpu = .{ .instruction_address = Bus.rom_base };
 
     cpu.refillArmPipeline(&bus);
 
     try std.testing.expectEqual([2]u32{ 0xE3A0_002A, 0xE3A0_1000 }, cpu.pipeline.?);
+}
+
+test "ARM branch starts a fresh cartridge fetch sequence" {
+    const rom = [_]u8{
+        0x2A, 0x00, 0xA0, 0xE3, // MOV r0, #42
+        0x01, 0x00, 0x00, 0xEA, // B to ROM offset 16
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xA0, 0xE1, // Branch target.
+        0x00, 0x00, 0x00, 0x00,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    try std.testing.expectEqual(@as(u64, 8 + 6), machine.bus.rom_fetch_cycles);
+
+    try machine.step();
+    try std.testing.expectEqual(@as(u64, 14 + 6), machine.bus.rom_fetch_cycles);
+
+    try machine.step();
+    try std.testing.expectEqual(Bus.rom_base + 16, machine.cpu.instruction_address);
+    // Lookahead reaches offset 12, but the redirect still starts a new sequence at 16.
+    try std.testing.expectEqual(@as(u64, 20 + 6 + 8 + 6), machine.bus.rom_fetch_cycles);
 }
 
 test "ARM program executes from ROM and stores a word in internal RAM" {

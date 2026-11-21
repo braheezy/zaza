@@ -160,11 +160,11 @@ const TestBus = struct {
 
     const Kind = enum(u32) { fetch, read, write };
 
-    pub fn fetch32(self: *TestBus, address: u32) u32 {
+    pub fn fetch32(self: *TestBus, address: u32, _: Cpu.FetchAccess) u32 {
         return self.consume(.fetch, address, 4);
     }
 
-    pub fn fetch16(self: *TestBus, address: u32) u16 {
+    pub fn fetch16(self: *TestBus, address: u32, _: Cpu.FetchAccess) u16 {
         return @truncate(self.consume(.fetch, address, 2));
     }
 
@@ -212,13 +212,13 @@ test "vector bus replays a fetch and detects missing or wrong fetches" {
     };
     var bus: TestBus = .{ .transactions = .{ .remaining = &bytes } };
     try std.testing.expectError(error.MissingTransaction, bus.finish());
-    try std.testing.expectEqual(@as(u32, 42), bus.fetch32(0x0800_0008));
+    try std.testing.expectEqual(@as(u32, 42), bus.fetch32(0x0800_0008, .sequential));
     try bus.finish();
-    _ = bus.fetch32(0x0800_000C);
+    _ = bus.fetch32(0x0800_000C, .sequential);
     try std.testing.expectError(error.UnexpectedTransaction, bus.finish());
 
     bus = .{ .transactions = .{ .remaining = &bytes } };
-    _ = bus.fetch32(0x0800_0004);
+    _ = bus.fetch32(0x0800_0004, .sequential);
     try std.testing.expectError(error.UnexpectedTransaction, bus.finish());
 }
 

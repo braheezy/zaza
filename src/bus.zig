@@ -1,9 +1,13 @@
 const std = @import("std");
 const Bus = @This();
+const timing = @import("timing.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
 pub const iwram_base: u32 = 0x0300_0000;
 pub const dispcnt_address: u32 = 0x0400_0000;
+pub const dispstat_address: u32 = 0x0400_0004;
+const vblank_status: u16 = 1 << 0;
+const vblank_irq_enable: u16 = 1 << 3;
 pub const ie_address: u32 = 0x0400_0200;
 pub const if_address: u32 = 0x0400_0202;
 pub const ime_address: u32 = 0x0400_0208;
@@ -20,33 +24,45 @@ iwram: [iwram_size_bytes]u8 = @splat(0),
 vram: [vram_size_bytes]u8 = @splat(0),
 // Only halfword storage is modeled; there is no display behavior yet.
 dispcnt: u16 = 0,
+// Only the VBlank status and IRQ enable bits are modeled.
+dispstat: u16 = 0,
 irq_enable: u16 = 0,
 irq_flags: u16 = 0,
 ime_enabled: bool = false,
+rom_fetch_cycles: u64 = 0,
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
     // A device latches its request even while IRQ delivery is disabled.
     self.irq_flags |= sources;
 }
 
+pub fn updateVBlank(self: *Bus, active: bool, started: bool) void {
+    self.dispstat = (self.dispstat & ~vblank_status) | @intFromBool(active);
+    if (started and self.dispstat & vblank_irq_enable != 0) self.requestInterrupt(1);
+}
+
 pub fn irqLine(self: *const Bus) bool {
     return self.ime_enabled and (self.irq_enable & self.irq_flags) != 0;
 }
 
-pub fn fetch32(self: *const Bus, address: u32) u32 {
-    return self.fetch(u32, address);
+pub fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
+    return self.fetch(u32, address, access);
 }
 
-pub fn fetch16(self: *const Bus, address: u32) u16 {
-    return self.fetch(u16, address);
+pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
+    return self.fetch(u16, address, access);
 }
 
-fn fetch(self: *const Bus, comptime T: type, address: u32) T {
+fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     if (address < bios_size_bytes) {
         const bios = self.bios orelse @panic("BIOS fetch without a BIOS image");
         return std.mem.readInt(T, bios[address..][0..@sizeOf(T)], .little);
     }
-    return self.readRom(T, address);
+    const value = self.readRom(T, address);
+    // The cartridge starts a fresh sequence at each 128 KiB boundary.
+    const effective_access = if (address & 0x1_FFFF == 0) .nonsequential else access;
+    self.rom_fetch_cycles += timing.gamePak0AccessCycles(T, effective_access);
+    return value;
 }
 
 pub fn readData(self: *const Bus, comptime T: type, address: u32) T {
@@ -59,6 +75,7 @@ pub fn readData(self: *const Bus, comptime T: type, address: u32) T {
         if (aligned_address == ie_address) return self.irq_enable;
         if (aligned_address == if_address) return self.irq_flags;
         if (aligned_address == dispcnt_address) return self.dispcnt;
+        if (aligned_address == dispstat_address) return self.dispstat;
         if (vramOffset(aligned_address)) |offset| {
             return std.mem.readInt(u16, self.vram[offset..][0..2], .little);
         }
@@ -84,6 +101,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         }
         if (aligned_address == dispcnt_address) {
             self.dispcnt = value;
+            return;
+        }
+        if (aligned_address == dispstat_address) {
+            self.dispstat = (self.dispstat & vblank_status) | (value & vblank_irq_enable);
             return;
         }
         if (vramOffset(aligned_address)) |offset| {
@@ -165,8 +186,11 @@ test "IME shares bit zero across access widths and ignores other bits" {
 }
 
 test "Thumb fetch reads two bytes at a halfword offset" {
-    const bus: Bus = .{ .rom = &.{ 0x00, 0x20, 0x2A, 0x21 } };
-    try std.testing.expectEqual(@as(u16, 0x212A), bus.fetch16(rom_base + 2));
+    var bus: Bus = .{ .rom = &.{ 0x00, 0x20, 0x2A, 0x21 } };
+    try std.testing.expectEqual(@as(u16, 0x212A), bus.fetch16(rom_base + 2, .sequential));
+    try std.testing.expectEqual(@as(u64, 3), bus.rom_fetch_cycles);
+    _ = bus.fetch16(rom_base, .sequential);
+    try std.testing.expectEqual(@as(u64, 8), bus.rom_fetch_cycles);
 }
 
 test "ROM data reads align to their transfer width without rotating" {

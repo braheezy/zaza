@@ -11,6 +11,7 @@ const Mode = enum(u5) {
 };
 
 const Cpu = @This();
+pub const FetchAccess = @import("timing.zig").Access;
 
 registers: [15]u32 = @splat(0),
 banked: BankedRegisters = .{},
@@ -47,8 +48,8 @@ const Flags = packed struct(u4) {
 pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
     std.debug.assert(self.cpsr & thumb_bit == 0);
     std.debug.assert(self.instruction_address & 3 == 0);
-    const current = bus.fetch32(self.instruction_address);
-    const next = bus.fetch32(self.instruction_address +% 4);
+    const current = bus.fetch32(self.instruction_address, .nonsequential);
+    const next = bus.fetch32(self.instruction_address +% 4, .sequential);
     self.pipeline = .{ current, next };
 }
 
@@ -354,7 +355,7 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
 
 fn advanceThumbPipeline(self: *Cpu, bus: anytype, fetch_address: u32) void {
     const queued = self.pipeline.?;
-    self.pipeline = .{ queued[1], bus.fetch16(fetch_address) };
+    self.pipeline = .{ queued[1], bus.fetch16(fetch_address, .sequential) };
     self.instruction_address +%= 2;
 }
 
@@ -506,8 +507,8 @@ fn executeThumbHighAlu(self: *Cpu, instruction: u16) error{UnsupportedInstructio
 
 fn refillThumbPipeline(self: *Cpu, bus: anytype) void {
     std.debug.assert(self.instruction_address & 1 == 0);
-    const current = bus.fetch16(self.instruction_address);
-    const next = bus.fetch16(self.instruction_address +% 2);
+    const current = bus.fetch16(self.instruction_address, .nonsequential);
+    const next = bus.fetch16(self.instruction_address +% 2, .sequential);
     self.pipeline = .{ current, next };
 }
 
@@ -1055,7 +1056,7 @@ fn shiftedRegisterOperand(self: *Cpu, shift: ArmDataProcessing.RegisterShift) Sh
 fn advanceArmPipeline(self: *Cpu, bus: anytype) u32 {
     std.debug.assert(self.cpsr & thumb_bit == 0);
     const queued = self.pipeline.?;
-    const fetched = bus.fetch32(self.instruction_address +% 8);
+    const fetched = bus.fetch32(self.instruction_address +% 8, .sequential);
     self.pipeline = .{ queued[1], fetched };
     self.instruction_address +%= 4;
     return queued[0];
@@ -1171,7 +1172,7 @@ test "ARM pipeline refill and advance fetch words in address order" {
         addresses: [3]u32 = @splat(0),
         fetch_count: usize = 0,
 
-        fn fetch32(self: *@This(), address: u32) u32 {
+        fn fetch32(self: *@This(), address: u32, _: FetchAccess) u32 {
             self.addresses[self.fetch_count] = address;
             self.fetch_count += 1;
             return address + 0x100;
@@ -1201,11 +1202,11 @@ test "ARM step executes the queued MOV and fetches the next word" {
             unreachable;
         }
 
-        pub fn fetch16(_: *@This(), _: u32) u16 {
+        pub fn fetch16(_: *@This(), _: u32, _: FetchAccess) u16 {
             unreachable;
         }
 
-        pub fn fetch32(self: *@This(), address: u32) u32 {
+        pub fn fetch32(self: *@This(), address: u32, _: FetchAccess) u32 {
             self.fetched_address = address;
             return 0xE3A0_2000;
         }
