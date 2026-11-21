@@ -6,6 +6,7 @@ const std = @import("std");
 const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @import("machine.zig");
+const video = @import("video.zig");
 
 test "ARM pipeline refills from cartridge ROM bytes" {
     const rom = [_]u8{
@@ -54,8 +55,11 @@ test "ARM program writes the memory-mapped display control register" {
     try std.testing.expectEqual(@as(u16, 3), machine.bus.readData(u16, Bus.dispcnt_address));
 }
 
-test "ARM program stores a halfword in VRAM" {
+test "ARM program selects Mode 3 and writes a red pixel" {
     const rom = [_]u8{
+        0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3
+        0x01, 0x13, 0xA0, 0xE3, // MOV r1, #0x04000000
+        0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1] (DISPCNT)
         0x1F, 0x00, 0xA0, 0xE3, // MOV r0, #0x001F
         0x06, 0x14, 0xA0, 0xE3, // MOV r1, #0x06000000
         0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1]
@@ -65,8 +69,13 @@ test "ARM program stores a halfword in VRAM" {
     };
     var machine: Machine = undefined;
     machine.initCartridge(&rom);
-    for (0..3) |_| try machine.step();
+    var frame: video.Frame = undefined;
+    try std.testing.expectError(error.NotMode3, machine.snapshotMode3(&frame));
+    for (0..6) |_| try machine.step();
 
     try std.testing.expectEqualSlices(u8, &.{ 0x1F, 0x00 }, machine.bus.vram[0..2]);
     try std.testing.expectEqual(@as(u16, 0x001F), machine.bus.readData(u16, Bus.vram_base));
+    try machine.snapshotMode3(&frame);
+    try std.testing.expectEqual(video.Rgb{ .red = 255, .green = 0, .blue = 0 }, frame[0][0]);
+    try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 0, .blue = 0 }, frame[0][1]);
 }

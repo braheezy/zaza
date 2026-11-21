@@ -1,6 +1,7 @@
 const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @This();
+const video = @import("video.zig");
 
 cpu: Cpu,
 bus: Bus,
@@ -16,4 +17,9 @@ pub fn initCartridge(self: *Machine, rom: []const u8) void {
 
 pub fn step(self: *Machine) !void {
     try self.cpu.step(&self.bus);
+}
+
+pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!void {
+    if (self.bus.dispcnt & 0b111 != 3) return error.NotMode3;
+    video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame);
 }
