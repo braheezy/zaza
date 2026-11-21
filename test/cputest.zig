@@ -391,20 +391,24 @@ const Report = struct {
     }
 
     fn outcome(family: []const u8, vector: Vector) ?anyerror {
-        if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
-            if (!std.mem.eql(u8, family, "arm_data_proc_immediate_shift")) {
-                if (!std.mem.eql(u8, family, "arm_data_proc_register_shift") and
-                    !std.mem.eql(u8, family, "arm_b_bl") and !std.mem.eql(u8, family, "arm_mrs") and
-                    !std.mem.eql(u8, family, "arm_swi") and
-                    !std.mem.eql(u8, family, "arm_msr_imm") and
-                    !std.mem.eql(u8, family, "arm_msr_reg"))
-                {
-                    return error.UnsupportedInstruction;
-                }
+        // Only run families whose state and bus accesses the adapter can check.
+        const supported_families = [_][]const u8{
+            "arm_data_proc_immediate",
+            "arm_data_proc_immediate_shift",
+            "arm_data_proc_register_shift",
+            "arm_b_bl",
+            "arm_mrs",
+            "arm_msr_imm",
+            "arm_msr_reg",
+            "arm_swi",
+        };
+        for (supported_families) |supported| {
+            if (std.mem.eql(u8, family, supported)) {
+                runSelectedVector(vector) catch |err| return err;
+                return null;
             }
         }
-        runSelectedVector(vector) catch |err| return err;
-        return null;
+        return error.UnsupportedInstruction;
     }
 
     fn record(self: *Report, family: []const u8, index: usize, vector: Vector) !void {

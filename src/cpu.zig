@@ -61,6 +61,7 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.executeArmBranch(bus, instruction, condition);
         return;
     }
+    // Decode status transfers before the ALU because their encodings overlap.
     if (instruction & 0x0FBF_0FFF == 0x010F_0000) {
         try self.executeArmMrs(instruction);
         _ = self.advanceArmPipeline(bus);
@@ -76,14 +77,7 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     if (instruction >> 24 & 0xF == 0xF) {
         const condition: u4 = @truncate(instruction >> 28);
         if (condition == 0xF) return error.UnsupportedInstruction;
-        _ = self.advanceArmPipeline(bus);
-        if (conditionPassed(condition, self.readFlags())) {
-            self.spsr[1] = self.cpsr;
-            self.cpsr = (self.cpsr & ~@as(u32, 0x3F)) | 0x93;
-            self.writeGeneralRegister(link_register, self.instruction_address);
-            self.instruction_address = 0x08;
-            self.refillArmPipeline(bus);
-        }
+        self.executeArmSwi(bus, condition);
         return;
     }
     const decoded = try decodeArmDataProcessing(instruction);
@@ -107,6 +101,23 @@ fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) v
     const words: i24 = @bitCast(@as(u24, @truncate(instruction)));
     const offset: u32 = @bitCast(@as(i32, words) * 4);
     self.instruction_address = address +% 8 +% offset;
+    self.refillArmPipeline(bus);
+}
+
+fn executeArmSwi(self: *Cpu, bus: anytype, condition: u4) void {
+    // Advance first so the current address becomes the return address.
+    _ = self.advanceArmPipeline(bus);
+    if (!conditionPassed(condition, self.readFlags())) return;
+
+    const supervisor_spsr = 1;
+    const irq_disable_bit: u32 = 1 << 7;
+    const mode_mask: u32 = 0x1F;
+    self.spsr[supervisor_spsr] = self.cpsr;
+    self.cpsr = (self.cpsr & ~(mode_mask | thumb_bit)) |
+        irq_disable_bit | @as(u32, @backingInt(Mode.supervisor));
+    // Write LR after switching modes so the return address goes into the Supervisor bank.
+    self.writeGeneralRegister(link_register, self.instruction_address);
+    self.instruction_address = 0x08;
     self.refillArmPipeline(bus);
 }
 
