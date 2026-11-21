@@ -3,11 +3,14 @@ const Bus = @This();
 
 pub const rom_base: u32 = 0x0800_0000;
 pub const iwram_base: u32 = 0x0300_0000;
+pub const dispcnt_address: u32 = 0x0400_0000;
 const iwram_size_bytes = 32 * 1024;
 
 // The caller owns the ROM bytes and keeps them alive while the bus uses them.
 rom: []const u8,
 iwram: [iwram_size_bytes]u8 = @splat(0),
+// Only halfword storage is modeled; there is no display behavior yet.
+dispcnt: u16 = 0,
 
 pub fn fetch32(self: *const Bus, address: u32) u32 {
     return self.readRom(u32, address);
@@ -23,11 +26,16 @@ pub fn readData(self: *const Bus, comptime T: type, address: u32) T {
     if (iwramOffset(aligned_address)) |offset| {
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
+    if (T == u16 and aligned_address == dispcnt_address) return self.dispcnt;
     return self.readRom(T, aligned_address);
 }
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
+    if (T == u16 and aligned_address == dispcnt_address) {
+        self.dispcnt = value;
+        return;
+    }
     const offset = iwramOffset(aligned_address) orelse @panic("unmapped data write");
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
 }

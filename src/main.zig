@@ -36,3 +36,20 @@ test "ARM program executes from ROM and stores a word in internal RAM" {
     try std.testing.expectEqualSlices(u8, &.{ 42, 0, 0, 0 }, machine.bus.iwram[0..4]);
     try std.testing.expectEqual(@as(u32, 42), machine.bus.readData(u32, Bus.iwram_base));
 }
+
+test "ARM program writes the memory-mapped display control register" {
+    const rom = [_]u8{
+        0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3
+        0x01, 0x13, 0xA0, 0xE3, // MOV r1, #0x04000000
+        0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1]
+        // Pipeline lookahead only.
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    for (0..3) |_| try machine.step();
+
+    try std.testing.expectEqual(@as(u16, 3), machine.bus.dispcnt);
+    try std.testing.expectEqual(@as(u16, 3), machine.bus.readData(u16, Bus.dispcnt_address));
+}
