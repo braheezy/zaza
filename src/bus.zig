@@ -124,6 +124,10 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
         self.next_fetch_nonsequential = true;
         return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
     }
+    if (iwramOffset(address)) |offset| {
+        self.next_fetch_nonsequential = true;
+        return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
+    }
     const value = self.readRom(T, address);
     // The cartridge starts a fresh sequence at each 128 KiB boundary.
     const effective_access = if (interrupted or address & 0x1_FFFF == 0)
@@ -676,4 +680,12 @@ test "the mirrored IRQ handler address shares the top word of IWRAM" {
     var bus: Bus = .{ .rom = &.{} };
     bus.writeData(u32, 0x03FF_FFFC, 0x0800_0100);
     try std.testing.expectEqual(@as(u32, 0x0800_0100), bus.readData(u32, 0x0300_7FFC));
+}
+
+test "IWRAM loaded as data can execute through its mirrors" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, iwram_base + 4, 0xE1A0_0000);
+    try std.testing.expectEqual(@as(u32, 0xE1A0_0000), bus.fetch32(0x03FF_8004, .nonsequential));
+    try std.testing.expectEqual(@as(u16, 0xE1A0), bus.fetch16(iwram_base + 6, .sequential));
+    try std.testing.expectEqual(@as(u64, 0), bus.rom_fetch_cycles);
 }
