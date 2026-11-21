@@ -104,6 +104,11 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
 
 fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstruction}!void {
     const pc = self.instruction_address +% 4;
+    if (self.decodeThumbTransfer(instruction)) |transfer| {
+        self.advanceThumbPipeline(bus, pc);
+        self.executeThumbTransfer(bus, transfer);
+        return;
+    }
     const immediate: u11 = @truncate(instruction);
     const signed_immediate: i32 = @as(i11, @bitCast(immediate));
     var target: ?u32 = null;
@@ -140,10 +145,7 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     }
 
     // A taken branch still performs the sequential fetch before refilling.
-    const queued = self.pipeline.?;
-    const fetched = bus.fetch16(pc);
-    self.pipeline = .{ queued[1], fetched };
-    self.instruction_address +%= 2;
+    self.advanceThumbPipeline(bus, pc);
     if (software_interrupt) {
         self.enterSoftwareInterrupt(bus);
     } else if (target) |address| {
@@ -156,6 +158,89 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
             self.refillThumbPipeline(bus);
         }
     }
+}
+
+fn advanceThumbPipeline(self: *Cpu, bus: anytype, fetch_address: u32) void {
+    const queued = self.pipeline.?;
+    self.pipeline = .{ queued[1], bus.fetch16(fetch_address) };
+    self.instruction_address +%= 2;
+}
+
+const ThumbTransfer = struct {
+    operation: enum(u3) { str, strh, strb, ldrsb, ldr, ldrh, ldrb, ldrsh },
+    address: u32,
+    register: u3,
+};
+
+fn decodeThumbTransfer(self: *Cpu, instruction: u16) ?ThumbTransfer {
+    const low_register: u3 = @truncate(instruction);
+    const high_register: u3 = @truncate(instruction >> 8);
+    const base_register: u3 = @truncate(instruction >> 3);
+    const offset: u32 = @as(u5, @truncate(instruction >> 6));
+    const load = instruction & (1 << 11) != 0;
+    const offset_word = @as(u32, @as(u8, @truncate(instruction))) * 4;
+    return switch (instruction >> 12) {
+        4 => if (load) .{
+            .operation = .ldr,
+            .address = (self.readRegister(program_counter) & ~@as(u32, 3)) +% offset_word,
+            .register = high_register,
+        } else null,
+        5 => .{
+            .operation = @fromBackingInt(@as(u3, @truncate(instruction >> 9))),
+            .address = self.readRegister(base_register) +% self.readRegister(@as(u3, @truncate(instruction >> 6))),
+            .register = low_register,
+        },
+        6, 7, 8 => blk: {
+            const width: u32 = switch (instruction >> 12) {
+                6 => 4,
+                7 => 1,
+                8 => 2,
+                else => unreachable,
+            };
+            break :blk .{
+                .operation = switch (width) {
+                    4 => if (load) .ldr else .str,
+                    2 => if (load) .ldrh else .strh,
+                    1 => if (load) .ldrb else .strb,
+                    else => unreachable,
+                },
+                .address = self.readRegister(base_register) +% (offset * width),
+                .register = low_register,
+            };
+        },
+        9 => .{
+            .operation = if (load) .ldr else .str,
+            .address = self.readRegister(stack_pointer) +% offset_word,
+            .register = high_register,
+        },
+        else => null,
+    };
+}
+
+fn executeThumbTransfer(self: *Cpu, bus: anytype, transfer: ThumbTransfer) void {
+    const address = transfer.address;
+    const register = transfer.register;
+    const result: u32 = switch (transfer.operation) {
+        // The bus receives the effective address but accesses naturally aligned data.
+        .str => return bus.writeData(u32, address, self.readRegister(register)),
+        .strh => return bus.writeData(u16, address, @truncate(self.readRegister(register))),
+        .strb => return bus.writeData(u8, address, @truncate(self.readRegister(register))),
+        .ldr => std.math.rotr(u32, bus.readData(u32, address), (address & 3) * 8),
+        .ldrh => std.math.rotr(u32, bus.readData(u16, address), (address & 1) * 8),
+        .ldrb => bus.readData(u8, address),
+        .ldrsb => signExtendByte(bus.readData(u8, address)),
+        .ldrsh => blk: {
+            const value = bus.readData(u16, address);
+            // An odd address selects and sign-extends the upper byte of the halfword.
+            if (address & 1 != 0) break :blk signExtendByte(@truncate(value >> 8));
+            break :blk @bitCast(@as(i32, @as(i16, @bitCast(value))));
+        },
+    };
+    self.writeGeneralRegister(register, result);
+}
+
+fn signExtendByte(value: u8) u32 {
+    return @bitCast(@as(i32, @as(i8, @bitCast(value))));
 }
 
 fn executeThumbHighAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!?u32 {
@@ -852,6 +937,14 @@ test "ARM pipeline refill and advance fetch words in address order" {
 test "ARM step executes the queued MOV and fetches the next word" {
     const TestBus = struct {
         fetched_address: ?u32 = null,
+
+        pub fn readData(_: *@This(), comptime T: type, _: u32) T {
+            unreachable;
+        }
+
+        pub fn writeData(_: *@This(), comptime T: type, _: u32, _: T) void {
+            unreachable;
+        }
 
         pub fn fetch16(_: *@This(), _: u32) u16 {
             unreachable;

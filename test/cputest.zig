@@ -156,31 +156,42 @@ const Reader = struct {
 
 const TestBus = struct {
     transactions: Reader,
-    failure: ?error{ InvalidVector, UnexpectedFetch } = null,
+    failure: ?error{ InvalidVector, UnexpectedTransaction, WrongWriteValue } = null,
+
+    const Kind = enum(u32) { fetch, read, write };
 
     pub fn fetch32(self: *TestBus, address: u32) u32 {
-        return self.fetch(address, 4);
+        return self.consume(.fetch, address, 4);
     }
 
     pub fn fetch16(self: *TestBus, address: u32) u16 {
-        return @truncate(self.fetch(address, 2));
+        return @truncate(self.consume(.fetch, address, 2));
     }
 
-    fn fetch(self: *TestBus, address: u32, width: u32) u32 {
+    pub fn readData(self: *TestBus, comptime T: type, address: u32) T {
+        return @truncate(self.consume(.read, address, @sizeOf(T)));
+    }
+
+    pub fn writeData(self: *TestBus, comptime T: type, address: u32, value: T) void {
+        const expected: T = @truncate(self.consume(.write, address, @sizeOf(T)));
+        if (self.failure == null and expected != value) self.failure = error.WrongWriteValue;
+    }
+
+    fn consume(self: *TestBus, kind: Kind, address: u32, width: u32) u32 {
         if (self.failure != null) return 0;
-        return self.expectFetch(address, width) catch |err| {
+        return self.expectTransaction(kind, address, width) catch |err| {
             // Keep the CPU bus API infallible; report mismatches after the step.
             self.failure = err;
             return 0;
         };
     }
 
-    fn expectFetch(self: *TestBus, address: u32, width: u32) !u32 {
-        if (self.transactions.remaining.len == 0) return error.UnexpectedFetch;
+    fn expectTransaction(self: *TestBus, kind: Kind, address: u32, width: u32) !u32 {
+        if (self.transactions.remaining.len == 0) return error.UnexpectedTransaction;
         const entry = try self.transactions.words(6);
-        if (entry[0] != 0) return error.UnexpectedFetch;
-        if (entry[1] != width) return error.UnexpectedFetch;
-        if (entry[2] != address) return error.UnexpectedFetch;
+        if (entry[0] != @backingInt(kind)) return error.UnexpectedTransaction;
+        if (entry[1] != width) return error.UnexpectedTransaction;
+        if (entry[2] != address) return error.UnexpectedTransaction;
         return entry[3];
     }
 
@@ -204,11 +215,11 @@ test "vector bus replays a fetch and detects missing or wrong fetches" {
     try std.testing.expectEqual(@as(u32, 42), bus.fetch32(0x0800_0008));
     try bus.finish();
     _ = bus.fetch32(0x0800_000C);
-    try std.testing.expectError(error.UnexpectedFetch, bus.finish());
+    try std.testing.expectError(error.UnexpectedTransaction, bus.finish());
 
     bus = .{ .transactions = .{ .remaining = &bytes } };
     _ = bus.fetch32(0x0800_0004);
-    try std.testing.expectError(error.UnexpectedFetch, bus.finish());
+    try std.testing.expectError(error.UnexpectedTransaction, bus.finish());
 }
 
 fn physicalBanks(state: State) Cpu.BankedRegisters {
@@ -449,6 +460,15 @@ const Report = struct {
             "thumb_add_cmp_mov_hi",
             "thumb_bx",
             "thumb_swi",
+            "thumb_ldr_pc_rel",
+            "thumb_ldr_str_imm_offset",
+            "thumb_ldr_str_reg_offset",
+            "thumb_ldr_str_sp_rel",
+            "thumb_ldrb_strb_imm_offset",
+            "thumb_ldrh_strh_imm_offset",
+            "thumb_ldrh_strh_reg_offset",
+            "thumb_ldrsb_strb_reg_offset",
+            "thumb_ldrsh_ldrsb_reg_offset",
             "arm_mrs",
             "arm_msr_imm",
             "arm_msr_reg",
