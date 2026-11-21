@@ -4,6 +4,7 @@ const Bus = @This();
 pub const rom_base: u32 = 0x0800_0000;
 pub const iwram_base: u32 = 0x0300_0000;
 pub const dispcnt_address: u32 = 0x0400_0000;
+pub const ime_address: u32 = 0x0400_0208;
 pub const vram_base: u32 = 0x0600_0000;
 const iwram_size_bytes = 32 * 1024;
 const vram_size_bytes = 96 * 1024;
@@ -14,6 +15,8 @@ iwram: [iwram_size_bytes]u8 = @splat(0),
 vram: [vram_size_bytes]u8 = @splat(0),
 // Only halfword storage is modeled; there is no display behavior yet.
 dispcnt: u16 = 0,
+// Interrupt delivery is not wired yet; only the master enable latch is modeled.
+ime_enabled: bool = false,
 
 pub fn fetch32(self: *const Bus, address: u32) u32 {
     return self.readRom(u32, address);
@@ -35,6 +38,7 @@ pub fn readData(self: *const Bus, comptime T: type, address: u32) T {
             return std.mem.readInt(u16, self.vram[offset..][0..2], .little);
         }
     }
+    if (aligned_address == ime_address) return @intFromBool(self.ime_enabled);
     return self.readRom(T, aligned_address);
 }
 
@@ -49,6 +53,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             std.mem.writeInt(u16, self.vram[offset..][0..2], value, .little);
             return;
         }
+    }
+    if (aligned_address == ime_address) {
+        self.ime_enabled = value & 1 != 0;
+        return;
     }
     const offset = iwramOffset(aligned_address) orelse
         std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
@@ -79,6 +87,21 @@ fn readRom(self: *const Bus, comptime T: type, address: u32) T {
     const offset = address - rom_base;
     if (offset + @sizeOf(T) > self.rom.len) @panic("read past end of ROM");
     return std.mem.readInt(T, self.rom[offset..][0..@sizeOf(T)], .little);
+}
+
+test "IME shares bit zero across access widths and ignores other bits" {
+    var bus: Bus = .{ .rom = &.{} };
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, ime_address));
+
+    bus.writeData(u32, ime_address, 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u16, 1), bus.readData(u16, ime_address));
+    try std.testing.expectEqual(@as(u32, 1), bus.readData(u32, ime_address));
+
+    bus.writeData(u16, ime_address, 0xFFFE);
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, ime_address));
+
+    bus.writeData(u8, ime_address, 1);
+    try std.testing.expectEqual(@as(u16, 1), bus.readData(u16, ime_address));
 }
 
 test "Thumb fetch reads two bytes at a halfword offset" {
