@@ -2,6 +2,7 @@ const std = @import("std");
 const Bus = @This();
 const timing = @import("timing.zig");
 const DisplayRegisters = @import("display_registers.zig");
+const DMA = @import("dma.zig");
 const Serial = @import("serial.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
@@ -25,6 +26,7 @@ const vram_size_bytes = 96 * 1024;
 // The caller owns both images and keeps them alive while the bus uses them.
 rom: []const u8,
 serial: Serial = .{},
+dma: DMA = .{},
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
@@ -107,6 +109,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         }
         return result;
     }
+    if (DMA.contains(aligned_address)) return self.dma.read(T, aligned_address);
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
     if (iwramOffset(aligned_address)) |offset| {
         self.chargeIwramDataAccess();
@@ -181,6 +184,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             return;
         }
     }
+    if (DMA.contains(aligned_address)) {
+        self.dma.write(T, aligned_address, value);
+        return;
+    }
     if (Serial.contains(aligned_address)) {
         self.serial.write(T, aligned_address, value);
         return;
@@ -203,6 +210,9 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             return;
         }
     }
+    // The gap between DMA and timers is unused.
+    if (aligned_address >= DMA.end and
+        aligned_address + @sizeOf(T) <= 0x0400_0100) return;
     // The gap between display and sound registers has no write side effects.
     if (aligned_address >= 0x0400_0058 and
         aligned_address + @sizeOf(T) <= 0x0400_0060) return;
@@ -373,4 +383,18 @@ test "system control byte lanes preserve masks and acknowledge only written IF b
     bus.writeData(u32, ime_address, 1);
     bus.writeData(u8, ime_address + 1, 0xFF);
     try std.testing.expectEqual(@as(u32, 1), bus.readData(u32, ime_address));
+}
+
+test "BIOS DMA reset stores reach every channel and the unused trailing gap" {
+    // Word stores must route to channels without accidentally touching timers.
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, DMA.base, 0x0300_1234);
+    bus.writeData(u16, DMA.base + 10, 0x4000);
+    try std.testing.expectEqual(@as(u16, 0x4000), bus.readData(u16, DMA.base + 10));
+    for (0..(0x100 - 0xB0) / 4) |index| {
+        bus.writeData(u32, DMA.base + @as(u32, @intCast(index * 4)), 0);
+    }
+    for (bus.dma.channels) |channel| {
+        try std.testing.expectEqualDeep(DMA.Channel{}, channel);
+    }
 }
