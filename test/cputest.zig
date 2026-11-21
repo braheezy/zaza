@@ -245,7 +245,9 @@ fn runSelectedVector(vector: Vector) !void {
     if (!std.mem.eql(u32, vector.final.registers[0..15], &cpu.registers)) {
         return error.RegisterMismatch;
     }
-    if (vector.final.registers[15] != cpu.instruction_address +% 8) return error.PcMismatch;
+    // The fixture can retain low target bits in R15 even when its fetches are aligned.
+    const expected_pc = vector.final.registers[15] & ~@as(u32, 3);
+    if (expected_pc != cpu.instruction_address +% 8) return error.PcMismatch;
     if (vector.final.cpsr != cpu.cpsr) return error.CpsrMismatch;
     if (!std.mem.eql(u32, &vector.final.pipeline, &cpu.pipeline.?)) return error.PipelineMismatch;
 }
@@ -348,6 +350,13 @@ const Report = struct {
             try self.style.cyan().print(self.writer, "  {s}{s}{s} r{d}, {s}\n", .{
                 mnemonic, condition_suffix, flag_suffix, destination, operand,
             });
+        }
+        if (destination == 15) {
+            try self.style.green().print(self.writer, "        PC: 0x{x:0>8} → 0x{x:0>8}\n", .{
+                vector.initial.registers[15] -% 8,
+                (vector.final.registers[15] & ~@as(u32, 3)) -% 8,
+            });
+            return;
         }
         try self.style.dim().print(self.writer, "        r{d}: 0x{x:0>8} → ", .{
             destination, visibleRegister(vector.initial, destination),

@@ -60,8 +60,12 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         return;
     }
     const decoded = try decodeArmDataProcessing(instruction);
-    self.executeArmDataProcessing(decoded);
+    const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
+    if (redirect) |target| {
+        self.instruction_address = target & ~@as(u32, 3);
+        self.refillArmPipeline(bus);
+    }
 }
 
 fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) void {
@@ -140,7 +144,7 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
         .destination = destination,
         .operand = undefined,
     };
-    if (destination == program_counter) return error.UnsupportedInstruction;
+    if (destination == program_counter and set_flags) return error.UnsupportedInstruction;
     switch (decoded.operation) {
         .mov, .mvn => {
             if (source != 0) return error.UnsupportedInstruction;
@@ -177,8 +181,9 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
     return decoded;
 }
 
-fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
-    if (!conditionPassed(decoded.condition, self.readFlags())) return;
+// Return a redirect instead of writing PC so step can preserve fetch ordering.
+fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
+    if (!conditionPassed(decoded.condition, self.readFlags())) return null;
     const old_flags = self.readFlags();
     const operand: ShifterResult = switch (decoded.operand) {
         .immediate => |immediate| .{
@@ -210,7 +215,10 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
             };
             switch (decoded.operation) {
                 .tst, .teq => {},
-                else => self.writeGeneralRegister(destination, result),
+                else => {
+                    if (destination == program_counter) return result;
+                    self.writeGeneralRegister(destination, result);
+                },
             }
             if (decoded.set_flags) self.writeFlags(.{
                 .negative = result >> 31 != 0,
@@ -232,11 +240,15 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
             };
             switch (decoded.operation) {
                 .cmp, .cmn => {},
-                else => self.writeGeneralRegister(destination, result.value),
+                else => {
+                    if (destination == program_counter) return result.value;
+                    self.writeGeneralRegister(destination, result.value);
+                },
             }
             if (decoded.set_flags) self.writeFlags(result.flags);
         },
     }
+    return null;
 }
 
 fn addWithCarry(left: u32, right: u32, carry_in: bool) struct { value: u32, flags: Flags } {
@@ -394,9 +406,9 @@ fn mode(self: *Cpu) Mode {
 test "ARM ALU PC operand depends on the shift encoding" {
     var cpu: Cpu = .{ .instruction_address = 0x0800_0000 };
     // MOV r0, pc; MOV r0, pc, LSL r1 (r1 contains zero).
-    cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_000F));
+    _ = cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_000F));
     try std.testing.expectEqual(@as(u32, 0x0800_0008), cpu.registers[0]);
-    cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_011F));
+    _ = cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_011F));
     try std.testing.expectEqual(@as(u32, 0x0800_000C), cpu.registers[0]);
 }
 
