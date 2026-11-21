@@ -5,6 +5,7 @@ pub fn main() void {
 const std = @import("std");
 const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
+const Machine = @import("machine.zig");
 
 test "ARM pipeline refills from cartridge ROM bytes" {
     const rom = [_]u8{
@@ -28,11 +29,10 @@ test "ARM program executes from ROM and stores a word in internal RAM" {
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
     };
-    var bus: Bus = .{ .rom = &rom };
-    var cpu: Cpu = .{ .instruction_address = Bus.rom_base };
-    cpu.refillArmPipeline(&bus);
-    for (0..3) |_| try cpu.step(&bus);
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    for (0..3) |_| try machine.step();
 
-    try std.testing.expectEqualSlices(u8, &.{ 42, 0, 0, 0 }, bus.iwram[0..4]);
-    try std.testing.expectEqual(@as(u32, 42), bus.readData(u32, Bus.iwram_base));
+    try std.testing.expectEqualSlices(u8, &.{ 42, 0, 0, 0 }, machine.bus.iwram[0..4]);
+    try std.testing.expectEqual(@as(u32, 42), machine.bus.readData(u32, Bus.iwram_base));
 }
