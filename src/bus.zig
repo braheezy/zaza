@@ -2,6 +2,7 @@ const std = @import("std");
 const Bus = @This();
 const timing = @import("timing.zig");
 const DisplayRegisters = @import("display_registers.zig");
+const Audio = @import("audio.zig");
 const Timers = @import("timers.zig");
 const DMA = @import("dma.zig");
 const Serial = @import("serial.zig");
@@ -29,6 +30,7 @@ rom: []const u8,
 serial: Serial = .{},
 dma: DMA = .{},
 timers: Timers = .{},
+audio: Audio = .{},
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
@@ -111,6 +113,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         }
         return result;
     }
+    if (Audio.contains(aligned_address)) return self.audio.read(T, aligned_address);
     if (Timers.contains(aligned_address)) return self.timers.read(T, aligned_address);
     if (DMA.contains(aligned_address)) return self.dma.read(T, aligned_address);
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
@@ -186,6 +189,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             self.display_registers.write(aligned_address, value);
             return;
         }
+    }
+    if (Audio.contains(aligned_address)) {
+        self.audio.write(T, aligned_address, value);
+        return;
     }
     if (Timers.contains(aligned_address)) {
         self.timers.write(T, aligned_address, value);

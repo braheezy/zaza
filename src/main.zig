@@ -206,3 +206,25 @@ test "bundled emibios RegisterRamReset returns to cartridge and restores System 
     try std.testing.expectEqual(original_status, machine.cpu.cpsr);
     try std.testing.expectEqual(original_stack, machine.cpu.registers[13]);
 }
+
+test "bundled emibios sound reset clears mixer routing and returns to the cartridge" {
+    const rom = [_]u8{
+        0x40, 0x00, 0xA0, 0xE3, // MOV r0, #0x40 (reset sound).
+        0x00, 0x00, 0x01, 0xEF, // SWI 0x010000 (RegisterRamReset).
+        0x2A, 0x40, 0xA0, 0xE3, // MOV r4, #42.
+        0xFE, 0xFF, 0xFF, 0xEA, // B to self.
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(&rom, bundled_bios);
+    machine.bus.writeData(u8, 0x0400_0084, 0x80);
+    machine.bus.writeData(u32, 0x0400_0080, 0x770F_FF77);
+    for (0..10_000) |_| {
+        if (machine.cpu.instruction_address == Bus.rom_base + 12) break;
+        try machine.step();
+    } else return error.BiosDidNotReturn;
+    try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[4]);
+    // emibios leaves the Direct Sound gain bits set and clears stereo routing.
+    try std.testing.expectEqual(@as(u32, 0x000E_0000), machine.bus.readData(u32, 0x0400_0080));
+}
