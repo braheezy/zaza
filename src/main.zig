@@ -1,5 +1,22 @@
-pub fn main() void {
-    _ = @sizeOf(Cpu);
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len != 2) {
+        std.debug.print("Usage: zaza <output.bmp>\n", .{});
+        return error.InvalidArguments;
+    }
+
+    var machine: Machine = undefined;
+    machine.initCartridge(&mode3_demo_rom);
+    for (0..mode3_demo_steps) |_| try machine.step();
+    var frame: video.Frame = undefined;
+    try machine.snapshotMode3(&frame);
+
+    const file = try std.Io.Dir.cwd().createFile(init.io, args[1], .{ .exclusive = true });
+    defer file.close(init.io);
+    var buffer: [4096]u8 = undefined;
+    var file_writer = file.writer(init.io, &buffer);
+    try bmp.write(&file_writer.interface, &frame);
+    try file_writer.interface.flush();
 }
 
 const std = @import("std");
@@ -7,6 +24,26 @@ const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @import("machine.zig");
 const video = @import("video.zig");
+const bmp = @import("bmp.zig");
+
+const mode3_demo_rom = [_]u8{
+    0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3
+    0x01, 0x13, 0xA0, 0xE3, // MOV r1, #0x04000000
+    0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1] (DISPCNT)
+    0x1F, 0x00, 0xA0, 0xE3, // MOV r0, #0x001F
+    0x06, 0x14, 0xA0, 0xE3, // MOV r1, #0x06000000
+    0xF0, 0x20, 0xA0, 0xE3, // MOV r2, #240
+    0xB2, 0x00, 0xC1, 0xE0, // loop: STRH r0, [r1], #2
+    0x01, 0x20, 0x52, 0xE2, // SUBS r2, r2, #1
+    0xFC, 0xFF, 0xFF, 0x1A, // BNE loop
+    0x00, 0x00, 0x00, 0x00, // Pipeline lookahead only.
+    0x00, 0x00, 0x00, 0x00,
+};
+const mode3_demo_steps = 6 + 3 * video.width;
+
+test {
+    _ = bmp;
+}
 
 test "ARM pipeline refills from cartridge ROM bytes" {
     const rom = [_]u8{
@@ -55,27 +92,18 @@ test "ARM program writes the memory-mapped display control register" {
     try std.testing.expectEqual(@as(u16, 3), machine.bus.readData(u16, Bus.dispcnt_address));
 }
 
-test "ARM program selects Mode 3 and writes a red pixel" {
-    const rom = [_]u8{
-        0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3
-        0x01, 0x13, 0xA0, 0xE3, // MOV r1, #0x04000000
-        0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1] (DISPCNT)
-        0x1F, 0x00, 0xA0, 0xE3, // MOV r0, #0x001F
-        0x06, 0x14, 0xA0, 0xE3, // MOV r1, #0x06000000
-        0xB0, 0x00, 0xC1, 0xE1, // STRH r0, [r1]
-        // Pipeline lookahead only.
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
+test "ARM program selects Mode 3 and writes a red row" {
     var machine: Machine = undefined;
-    machine.initCartridge(&rom);
+    machine.initCartridge(&mode3_demo_rom);
     var frame: video.Frame = undefined;
     try std.testing.expectError(error.NotMode3, machine.snapshotMode3(&frame));
-    for (0..6) |_| try machine.step();
+    for (0..mode3_demo_steps) |_| try machine.step();
 
     try std.testing.expectEqualSlices(u8, &.{ 0x1F, 0x00 }, machine.bus.vram[0..2]);
     try std.testing.expectEqual(@as(u16, 0x001F), machine.bus.readData(u16, Bus.vram_base));
     try machine.snapshotMode3(&frame);
-    try std.testing.expectEqual(video.Rgb{ .red = 255, .green = 0, .blue = 0 }, frame[0][0]);
-    try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 0, .blue = 0 }, frame[0][1]);
+    for (frame[0]) |pixel| {
+        try std.testing.expectEqual(video.Rgb{ .red = 255, .green = 0, .blue = 0 }, pixel);
+    }
+    try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 0, .blue = 0 }, frame[1][0]);
 }
