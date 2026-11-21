@@ -52,8 +52,14 @@ pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
 }
 
 pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
-    if (self.cpsr & thumb_bit != 0) return error.UnsupportedInstruction;
     const queued = self.pipeline orelse return error.PipelineNotReady;
+    if (self.cpsr & thumb_bit != 0) {
+        try self.executeThumbLowAlu(@truncate(queued[0]));
+        const fetched = bus.fetch16(self.instruction_address +% 4);
+        self.pipeline = .{ queued[1], fetched };
+        self.instruction_address +%= 2;
+        return;
+    }
     const instruction = queued[0];
     if (instruction & 0x0FFF_FFF0 == 0x012F_FF10) {
         try self.executeArmBx(bus, instruction);
@@ -96,6 +102,59 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     if (redirect) |target| {
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
+    }
+}
+
+fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!void {
+    switch (instruction >> 13) {
+        0b000 => {
+            const destination: u3 = @truncate(instruction);
+            const source: u3 = @truncate(instruction >> 3);
+            const kind: u2 = @truncate(instruction >> 11);
+            if (kind == 3) {
+                const operand: u3 = @truncate(instruction >> 6);
+                const right = if (instruction & (1 << 10) != 0)
+                    @as(u32, operand)
+                else
+                    self.readRegister(operand);
+                const subtract = instruction & (1 << 9) != 0;
+                const result = addWithCarry(self.readRegister(source), if (subtract) ~right else right, subtract);
+                self.writeGeneralRegister(destination, result.value);
+                self.writeFlags(result.flags);
+            } else {
+                const shifted = self.shiftedRegisterOperand(.{
+                    .register = source,
+                    .kind = kind,
+                    .amount = .{ .immediate = @truncate(instruction >> 6) },
+                });
+                var flags = self.readFlags();
+                flags.negative = shifted.value >> 31 != 0;
+                flags.zero = shifted.value == 0;
+                flags.carry = shifted.carry;
+                self.writeGeneralRegister(destination, shifted.value);
+                self.writeFlags(flags);
+            }
+        },
+        0b001 => {
+            const operation: u2 = @truncate(instruction >> 11);
+            const destination: u3 = @truncate(instruction >> 8);
+            const immediate: u32 = @as(u8, @truncate(instruction));
+            if (operation == 0) {
+                // MOV immediate updates N and Z but keeps C and V.
+                var flags = self.readFlags();
+                flags.negative = false;
+                flags.zero = immediate == 0;
+                self.writeGeneralRegister(destination, immediate);
+                self.writeFlags(flags);
+            } else {
+                const subtract = operation != 2;
+                const result = addWithCarry(self.readRegister(destination), if (subtract) ~immediate else immediate, subtract);
+                // CMP uses the subtraction flags without writing a result.
+                if (operation != 1) self.writeGeneralRegister(destination, result.value);
+                self.writeFlags(result.flags);
+            }
+        },
+        else => return error.UnsupportedInstruction,
     }
 }
 

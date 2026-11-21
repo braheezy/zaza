@@ -237,10 +237,12 @@ fn runSelectedVector(vector: Vector) !void {
         else => return error.UnsupportedInstruction,
     }
     if (vector.initial.pipeline[0] != vector.opcode) return error.InvalidVector;
+    const thumb = vector.initial.cpsr & (1 << 5) != 0;
+    const initial_pc_offset: u32 = if (thumb) 4 else 8;
     var cpu: Cpu = .{
         .registers = vector.initial.registers[0..15].*,
         .banked = physicalBanks(vector.initial),
-        .instruction_address = vector.initial.registers[15] -% 8,
+        .instruction_address = vector.initial.registers[15] -% initial_pc_offset,
         .cpsr = vector.initial.cpsr,
         .spsr = vector.initial.spsr,
         .pipeline = vector.initial.pipeline,
@@ -261,7 +263,7 @@ fn runSelectedVector(vector: Vector) !void {
     const opcode = vector.opcode;
     const multiply = opcode & 0x0FC0_00F0 == 0x0000_0090 or opcode & 0x0F80_00F0 == 0x0080_0090;
     // ARMv4T leaves C unspecified for flag-setting multiplies, and V for long forms.
-    const unspecified: u32 = if (multiply and opcode & (1 << 20) != 0)
+    const unspecified: u32 = if (!thumb and multiply and opcode & (1 << 20) != 0)
         (1 << 29) | (if (opcode & (1 << 23) != 0) @as(u32, 1 << 28) else 0)
     else
         0;
@@ -291,7 +293,9 @@ const Report = struct {
             try self.writer.print("  {s} (opcode 0x{x:0>8})\n", .{ @errorName(err), vector.opcode });
         } else {
             try self.style.bold().green().print(self.writer, "  PASS", .{});
-            if (std.mem.eql(u8, family, "arm_b_bl")) {
+            if (std.mem.startsWith(u8, family, "thumb_")) {
+                try self.style.cyan().print(self.writer, "  Thumb opcode 0x{x:0>4}\n", .{vector.opcode});
+            } else if (std.mem.eql(u8, family, "arm_b_bl")) {
                 const link = vector.opcode & (1 << 24) != 0;
                 try self.style.cyan().print(self.writer, "  {s}: PC 0x{x:0>8} → 0x{x:0>8}\n", .{
                     if (link) "BL" else "B",
@@ -430,6 +434,9 @@ const Report = struct {
             "arm_data_proc_register_shift",
             "arm_b_bl",
             "arm_bx",
+            "thumb_lsl_lsr_asr",
+            "thumb_add_sub",
+            "thumb_mov_cmp_add_sub",
             "arm_mrs",
             "arm_msr_imm",
             "arm_msr_reg",
