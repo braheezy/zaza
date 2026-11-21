@@ -1,6 +1,7 @@
 const std = @import("std");
 const Bus = @This();
 const timing = @import("timing.zig");
+const DisplayRegisters = @import("display_registers.zig");
 const Serial = @import("serial.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
@@ -24,6 +25,7 @@ const vram_size_bytes = 96 * 1024;
 // The caller owns both images and keeps them alive while the bus uses them.
 rom: []const u8,
 serial: Serial = .{},
+display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
 iwram: [iwram_size_bytes]u8 = @splat(0),
@@ -117,6 +119,36 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
+    if (T == u8 and aligned_address >= dispcnt_address and
+        aligned_address < 0x0400_0058)
+    {
+        const halfword_address = aligned_address & ~@as(u32, 1);
+        const previous: u16 = switch (halfword_address) {
+            dispcnt_address => self.dispcnt,
+            dispcnt_address + 2 => self.greenswap,
+            dispstat_address => self.dispstat,
+            0x0400_0006 => 0,
+            else => self.display_registers.values[(halfword_address - 0x0400_0008) / 2],
+        };
+        const shift: u4 = @intCast((aligned_address & 1) * 8);
+        const merged = (previous & ~(@as(u16, 0xFF) << shift)) | (@as(u16, value) << shift);
+        self.writeData(u16, halfword_address, merged);
+        return;
+    }
+    if (T == u32 and aligned_address >= dispcnt_address and
+        aligned_address < 0x0400_0058)
+    {
+        self.writeData(u16, aligned_address, @truncate(value));
+        self.writeData(u16, aligned_address + 2, @truncate(value >> 16));
+        return;
+    }
+    if (T == u16) {
+        if (aligned_address == 0x0400_0006) return; // VCOUNT is read-only.
+        if (DisplayRegisters.contains(aligned_address)) {
+            self.display_registers.write(aligned_address, value);
+            return;
+        }
+    }
     if (Serial.contains(aligned_address)) {
         self.serial.write(T, aligned_address, value);
         return;
@@ -153,12 +185,6 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             return;
         }
     }
-    if (T == u32 and aligned_address == dispcnt_address) {
-        // A word store spans DISPCNT and the adjacent green-swap register.
-        self.dispcnt = @truncate(value);
-        self.greenswap = @truncate((value >> 16) & 1);
-        return;
-    }
     if (T == u32 and aligned_address == ie_address) {
         // The low halfword writes IE; the high halfword acknowledges IF.
         self.irq_enable = @as(u16, @truncate(value)) & irq_source_mask;
@@ -169,6 +195,9 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         self.ime_enabled = value & 1 != 0;
         return;
     }
+    // The gap between display and sound registers has no write side effects.
+    if (aligned_address >= 0x0400_0058 and
+        aligned_address + @sizeOf(T) <= 0x0400_0060) return;
     // The gap between timers and serial registers has no write side effects.
     // Keep real peripheral registers outside this range visible as unsupported.
     if (aligned_address >= 0x0400_0110 and
@@ -304,4 +333,19 @@ test "display control word writes include the green swap register" {
     try std.testing.expectEqual(@as(u32, 0x0001_0403), bus.readData(u32, dispcnt_address));
     bus.writeData(u16, dispcnt_address + 2, 2);
     try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, dispcnt_address + 2));
+}
+
+test "BIOS display reset word stores and byte updates preserve status" {
+    // Exercise the complete display reset span, including read-only and unused addresses.
+    var bus: Bus = .{ .rom = &.{} };
+    bus.updateVBlank(true, true);
+    for (0..0x60 / 4) |index| {
+        bus.writeData(u32, dispcnt_address + @as(u32, @intCast(index * 4)), 0);
+    }
+    try std.testing.expectEqual(@as(u16, 1), bus.dispstat);
+    bus.writeData(u8, dispcnt_address + 1, 4);
+    bus.writeData(u8, dispcnt_address, 3);
+    try std.testing.expectEqual(@as(u16, 0x0403), bus.dispcnt);
+    bus.writeData(u8, 0x0400_0011, 0xFF);
+    try std.testing.expectEqual(@as(u16, 0x0100), bus.display_registers.values[4]);
 }
