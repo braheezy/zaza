@@ -386,10 +386,37 @@ fn readRom(self: *const Bus, comptime T: type, address: u32) T {
         std.debug.panic("unmapped {d}-bit read at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     }
     const offset = address - rom_base;
-    if (offset + @sizeOf(T) > self.rom.len) {
-        std.debug.panic("{d}-bit read past end of ROM at 0x{x:0>8}", .{ @bitSizeOf(T), address });
+    if (offset + @sizeOf(T) <= self.rom.len) {
+        return std.mem.readInt(T, self.rom[offset..][0..@sizeOf(T)], .little);
     }
-    return std.mem.readInt(T, self.rom[offset..][0..@sizeOf(T)], .little);
+
+    // Unbacked Game Pak ROM returns the low 16 bits of the halfword address.
+    // Preserve file bytes in a transfer that straddles the end of the image.
+    var result: T = 0;
+    for (0..@sizeOf(T)) |index| {
+        const byte_offset = offset + @as(u32, @intCast(index));
+        const byte = if (byte_offset < self.rom.len)
+            self.rom[byte_offset]
+        else
+            unbackedRomByte(rom_base + byte_offset);
+        result |= @as(T, byte) << @intCast(index * 8);
+    }
+    return result;
+}
+
+fn unbackedRomByte(address: u32) u8 {
+    const halfword_address: u16 = @truncate(address >> 1);
+    const shift: u4 = @intCast((address & 1) * 8);
+    return @truncate(halfword_address >> shift);
+}
+
+test "unbacked Game Pak data follows the halfword address on each byte lane" {
+    var bus: Bus = .{ .rom = &.{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 } };
+    try std.testing.expectEqual(@as(u32, 0x0003_6655), bus.readData(u32, rom_base + 4));
+    try std.testing.expectEqual(@as(u32, 0x0283_0282), bus.readData(u32, rom_base + 0x504));
+    try std.testing.expectEqual(@as(u8, 0x82), bus.readData(u8, rom_base + 0x504));
+    try std.testing.expectEqual(@as(u8, 0x02), bus.readData(u8, rom_base + 0x505));
+    try std.testing.expectEqual(@as(u16, 0x0283), bus.fetch16(rom_base + 0x506, .sequential));
 }
 
 test "WAITCNT masks reserved bits and exposes the prefetch enable bit" {
