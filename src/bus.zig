@@ -242,6 +242,8 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     }
     // The BIOS clears the unused word between serial registers and KEYINPUT.
     if (aligned_address >= 0x0400_012C and aligned_address < keyinput_address) return;
+    // The BIOS also clears the unused I/O after JOYSTAT.
+    if (aligned_address >= 0x0400_015C and aligned_address < ie_address) return;
     // The reset loop also clears the unused gap between RCNT and JOYCNT.
     if (aligned_address >= 0x0400_0138 and aligned_address < 0x0400_0140) return;
     if (aligned_address >= keyinput_address and aligned_address < keyinput_address + 4) {
