@@ -271,7 +271,16 @@ const Report = struct {
             try self.writer.print("  {s} (opcode 0x{x:0>8})\n", .{ @errorName(err), vector.opcode });
         } else {
             try self.style.bold().green().print(self.writer, "  PASS", .{});
-            try self.explainImmediate(vector);
+            if (std.mem.eql(u8, family, "arm_b_bl")) {
+                const link = vector.opcode & (1 << 24) != 0;
+                try self.style.cyan().print(self.writer, "  {s}: PC 0x{x:0>8} → 0x{x:0>8}\n", .{
+                    if (link) "BL" else "B",
+                    vector.initial.registers[15] -% 8,
+                    vector.final.registers[15] -% 8,
+                });
+            } else {
+                try self.explainImmediate(vector);
+            }
         }
 
         if (failure) |err| {
@@ -351,7 +360,9 @@ const Report = struct {
     fn outcome(family: []const u8, vector: Vector) ?anyerror {
         if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
             if (!std.mem.eql(u8, family, "arm_data_proc_immediate_shift")) {
-                if (!std.mem.eql(u8, family, "arm_data_proc_register_shift")) {
+                if (!std.mem.eql(u8, family, "arm_data_proc_register_shift") and
+                    !std.mem.eql(u8, family, "arm_b_bl"))
+                {
                     return error.UnsupportedInstruction;
                 }
             }

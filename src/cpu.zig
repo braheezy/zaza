@@ -52,9 +52,31 @@ pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
 pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
     if (self.cpsr & thumb_bit != 0) return error.UnsupportedInstruction;
     const queued = self.pipeline orelse return error.PipelineNotReady;
-    const decoded = try decodeArmDataProcessing(queued[0]);
+    const instruction = queued[0];
+    if (instruction >> 25 & 0b111 == 0b101) {
+        const condition: u4 = @truncate(instruction >> 28);
+        if (condition == 0xF) return error.UnsupportedInstruction;
+        self.executeArmBranch(bus, instruction, condition);
+        return;
+    }
+    const decoded = try decodeArmDataProcessing(instruction);
     self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
+}
+
+fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) void {
+    const address = self.instruction_address;
+    // The sequential fetch happens even if a taken branch discards it.
+    _ = self.advanceArmPipeline(bus);
+    if (!conditionPassed(condition, self.readFlags())) return;
+
+    if (instruction & (1 << 24) != 0) {
+        self.writeGeneralRegister(link_register, address +% 4);
+    }
+    const words: i24 = @bitCast(@as(u24, @truncate(instruction)));
+    const offset: u32 = @bitCast(@as(i32, words) * 4);
+    self.instruction_address = address +% 8 +% offset;
+    self.refillArmPipeline(bus);
 }
 
 const ArmDataProcessing = struct {
