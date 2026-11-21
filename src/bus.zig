@@ -7,6 +7,7 @@ const Timers = @import("timers.zig");
 const DMA = @import("dma.zig");
 const Serial = @import("serial.zig");
 const SaveMemory = @import("save_memory.zig");
+const DebugPort = @import("debug_port.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
 pub const ewram_base: u32 = 0x0200_0000;
@@ -47,6 +48,7 @@ const oam_size_bytes = 1024;
 
 // The caller owns both images and keeps them alive while the bus uses them.
 rom: []const u8,
+debug_port: DebugPort = .{},
 save: SaveMemory = .{},
 serial: Serial = .{},
 dma: DMA = .{},
@@ -281,6 +283,11 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
+    if (self.debug_port.read(T, aligned_address)) |value| return value;
+    // The no$gba identification probe sees open bus on a GBA without that extension.
+    if (aligned_address >= 0x04FF_FA00 and aligned_address < 0x04FF_FA08) {
+        return wordLane(T, self.prefetch_word, aligned_address);
+    }
     if (SaveMemory.containsParallel(address)) {
         const repeats = std.math.maxInt(T) / 0xFF;
         return @as(T, self.save.readParallel(address)) * repeats;
@@ -361,12 +368,15 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
+    if (self.debug_port.write(T, aligned_address, value)) return;
     if (SaveMemory.containsParallel(address)) {
         const shift: std.math.Log2Int(T) = @intCast((address - aligned_address) * 8);
         self.save.writeParallel(address, @truncate(value >> shift));
         return;
     }
     if (self.hasEepromAt(address)) return; // Commands arrive as a DMA3 bitstream.
+    // ROM stores occupy the bus, including DMA to Game Pak ROM.
+    if (aligned_address < bios_size_bytes or romWindow(aligned_address) != null) return;
     self.writeAligned(T, aligned_address, value);
 }
 
@@ -666,6 +676,15 @@ test "unbacked Game Pak data follows the halfword address on each byte lane" {
     try std.testing.expectEqual(@as(u8, 0x82), bus.readData(u8, rom_base + 0x504));
     try std.testing.expectEqual(@as(u8, 0x02), bus.readData(u8, rom_base + 0x505));
     try std.testing.expectEqual(@as(u16, 0x0283), bus.fetch16(rom_base + 0x506, .sequential));
+}
+
+test "plain ROM stores consume bus cycles and preserve the image" {
+    var bus: Bus = .{ .rom = &.{ 0x11, 0x22, 0x33, 0x44 } };
+    bus.writeData(u16, rom_base, 0xABCD);
+    try std.testing.expectEqual(@as(u64, 5), bus.bus_cycles);
+    try std.testing.expectEqual(@as(u16, 0x2211), bus.readData(u16, rom_base));
+    bus.writeData(u16, 0, 0xABCD);
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, 0));
 }
 
 test "WAITCNT masks reserved bits and exposes the prefetch enable bit" {
