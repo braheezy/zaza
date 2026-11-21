@@ -113,7 +113,7 @@ fn replayInput(
         };
     }
     var frame: video.Frame = undefined;
-    try machine.snapshotBitmap(&frame);
+    try machine.snapshotFrame(&frame);
     try writeBitmap(io, args[2], &frame);
     if (save) |*session| try session.flush(io, &machine.bus.save);
 }

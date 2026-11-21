@@ -35,7 +35,9 @@ everything and spaces to hold multiple buttons, such as `12 Right A`.
 Names are case-insensitive. Frame numbers must increase, and all rows must
 fall within the requested frame count. Blank lines and `#` comments are allowed.
 
-The runner writes a Mode 3 or Mode 4 BMP after the requested number of frames.
+The runner writes a Mode 0, 3, or 4 BMP after the requested number of frames.
+Mode 0 captures each visible scanline before HBlank DMA. The instruction-count
+viewer instead renders the current register and memory values as one image.
 Give each run a fresh output path to avoid overwriting a previous capture. The
 replay uses emulated time, so its input is independent of host timing or window
 focus. To drive the machine from Zig, use `Machine.runFrame(buttons)` with a

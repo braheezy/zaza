@@ -142,7 +142,7 @@ const App = struct {
             return;
         };
         var next_frame: video.Frame = undefined;
-        machine.snapshotBitmap(&next_frame) catch {
+        machine.snapshotFrame(&next_frame) catch {
             // Startup may run for several VBlanks before selecting a bitmap mode.
             next_frame = @splat(@splat(black));
         };

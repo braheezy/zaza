@@ -76,15 +76,17 @@ pub fn renderMode4(
             }
             pixel.* = colors[index];
         }
-        if (options.green_swap) {
-            for (0..width / 2) |pair| {
-                std.mem.swap(u8, &row[pair * 2].green, &row[pair * 2 + 1].green);
-            }
-        }
+        if (options.green_swap) swapGreen(row);
     }
 }
 
-fn decodeColor(color: u16) Rgb {
+pub fn swapGreen(row: *[width]Rgb) void {
+    for (0..width / 2) |pair| {
+        std.mem.swap(u8, &row[pair * 2].green, &row[pair * 2 + 1].green);
+    }
+}
+
+pub fn decodeColor(color: u16) Rgb {
     return .{
         .red = expandChannel(@truncate(color)),
         .green = expandChannel(@truncate(color >> 5)),

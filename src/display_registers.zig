@@ -3,7 +3,6 @@ const Registers = @This();
 const base: u32 = 0x0400_0008;
 
 // Storage for display configuration beyond DISPCNT/DISPSTAT/VCOUNT.
-// Raster effects and register read open-bus behavior are not implemented.
 values: [0x28]u16 = blk: {
     var values: [0x28]u16 = @splat(0);
     // BG2 and BG3 start with an identity transform (PA = PD = 1.0).
@@ -30,11 +29,28 @@ pub fn affineReference(self: *const Registers, address: u32) i32 {
     return signed;
 }
 
+pub fn readable(self: *const Registers, address: u32) ?u16 {
+    return switch (address) {
+        0x0400_0008,
+        0x0400_000A,
+        0x0400_000C,
+        0x0400_000E,
+        0x0400_0048,
+        0x0400_004A,
+        0x0400_0050,
+        0x0400_0052,
+        => self.stored(address),
+        else => null,
+    };
+}
+
 pub fn write(self: *Registers, address: u32, value: u16) void {
     std.debug.assert(contains(address));
     std.debug.assert(address & 1 == 0);
     const offset = address - base;
     const mask: u16 = switch (address) {
+        0x0400_0008, 0x0400_000A => 0xDFCF,
+        0x0400_000C, 0x0400_000E => 0xFFCF,
         0x0400_0010...0x0400_001E => 0x01FF,
         0x0400_002A, 0x0400_002E, 0x0400_003A, 0x0400_003E => 0x0FFF,
         0x0400_0048, 0x0400_004A => 0x3F3F,

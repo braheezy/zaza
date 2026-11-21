@@ -2,6 +2,7 @@ const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @This();
 const video = @import("video.zig");
+const mode0 = @import("mode0.zig");
 const timing = @import("timing.zig");
 const input = @import("input.zig");
 const SaveMemory = @import("save_memory.zig");
@@ -10,6 +11,9 @@ cpu: Cpu,
 bus: Bus,
 elapsed_cycles: u64 = 0,
 dma_cycles_pending: u64 = 0,
+mode0_frame: video.Frame = undefined,
+mode0_lines: usize = 0,
+mode0_frame_number: ?u64 = null,
 
 const vblank_start = timing.vblank_start;
 
@@ -122,10 +126,31 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
 
 fn advanceClock(self: *Machine, cycles: u64) void {
     const old_phase = self.elapsed_cycles % timing.cycles_per_frame;
+    self.renderVisibleLines(cycles);
     self.elapsed_cycles += cycles;
     const before_dma = self.bus.bus_cycles;
     self.bus.advanceDevices(old_phase, cycles);
     self.dma_cycles_pending += self.bus.bus_cycles - before_dma;
+}
+
+fn renderVisibleLines(self: *Machine, cycles: u64) void {
+    const line_phase = self.elapsed_cycles % timing.cycles_per_line;
+    const next_hblank = timing.cyclesUntil(line_phase, timing.hblank_start, timing.cycles_per_line);
+    const end = self.elapsed_cycles + cycles;
+    var edge = self.elapsed_cycles + next_hblank;
+    while (edge <= end) : (edge += timing.cycles_per_line) {
+        const line = (edge % timing.cycles_per_frame) / timing.cycles_per_line;
+        if (line >= video.height) continue;
+        if (line == 0) self.mode0_lines = 0;
+        if (self.bus.dispcnt & 7 != 0 or self.mode0_lines != line) continue;
+
+        // Sample the visible line before the bus applies HBlank DMA writes.
+        self.mode0Display().renderLine(@intCast(line), &self.mode0_frame[line]);
+        self.mode0_lines += 1;
+        if (self.mode0_lines == video.height) {
+            self.mode0_frame_number = edge / timing.cycles_per_frame;
+        }
+    }
 }
 
 test "ARM compare with Rd set to PC restores status and continues sequentially" {
@@ -455,13 +480,121 @@ pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!
     video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame);
 }
 
-/// Capture the selected bitmap using the current display registers and memory.
+/// Capture the current display configuration for instruction stepping and inspection.
 pub fn snapshotBitmap(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
     switch (self.bus.dispcnt & 7) {
+        0 => {
+            const display = self.mode0Display();
+            for (frame, 0..) |*row, y| display.renderLine(y, row);
+        },
         3 => video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame),
         4 => self.snapshotMode4(frame),
         else => return error.UnsupportedDisplayMode,
     }
+}
+
+/// Return the completed Mode 0 scanlines when called at the end of runFrame.
+pub fn snapshotFrame(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
+    if (self.mode0_frame_number == self.elapsed_cycles / timing.cycles_per_frame) {
+        frame.* = self.mode0_frame;
+        return;
+    }
+    try self.snapshotBitmap(frame);
+}
+
+fn mode0Display(self: *const Machine) mode0.Display {
+    return .{
+        .control = self.bus.dispcnt,
+        .green_swap = self.bus.greenswap != 0,
+        .registers = &self.bus.display_registers,
+        .vram = &self.bus.vram,
+        .palette = &self.bus.palette,
+        .oam = &self.bus.oam,
+    };
+}
+
+test "Mode 0 scrolls and flips 8bpp tiles across a four-block text map" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const bus = &machine.bus;
+    bus.writeData(u16, Bus.dispcnt_address, 0x0100);
+    // BG0 uses a 512×512 map at block 4, with both scroll offsets at the wrap point.
+    bus.writeData(u32, 0x0400_0008, 0xC480);
+    bus.writeData(u32, 0x0400_0010, 0x01FF_01FF);
+    bus.writeData(u16, Bus.vram_base + 0x3FFE, 0xFC01);
+    bus.writeData(u16, Bus.vram_base + 0x37C0, 2);
+    bus.writeData(u16, Bus.vram_base + 64, 1);
+    bus.writeData(u16, Bus.vram_base + 128 + 7 * 8, 2);
+    bus.writeData(u16, Bus.palette_base + 2, 0x03E0);
+    bus.writeData(u16, Bus.palette_base + 4, 0x001F);
+
+    var frame: video.Frame = undefined;
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.decodeColor(0x03E0), frame[0][0]);
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][1]);
+    try std.testing.expectEqual(video.decodeColor(0), frame[1][0]);
+    // A two-dot mosaic repeats the sample before the scroll coordinate wraps.
+    bus.writeData(u16, 0x0400_0008, 0xC4C0);
+    bus.writeData(u16, 0x0400_004C, 0x0011);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.decodeColor(0x03E0), frame[1][1]);
+}
+
+test "Mode 0 composites sprites through window masks, alpha and affine sampling" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const bus = &machine.bus;
+    bus.writeData(u16, Bus.dispcnt_address, 0xB100);
+    bus.writeData(u16, 0x0400_0008, 0x0400);
+    @memset(bus.vram[0..32], 0x11); // A solid red BG0 tile.
+    @memset(bus.vram[0x10020..0x10040], 0x22); // A solid blue OBJ tile.
+    bus.writeData(u16, Bus.palette_base + 2, 0x001F);
+    bus.writeData(u16, Bus.palette_base + 512 + 4, 0x7C00);
+    bus.writeData(u32, Bus.oam_base, 0x0000_0400); // Semi-transparent OBJ at (0, 0).
+    bus.writeData(u16, Bus.oam_base + 4, 1);
+    bus.writeData(u32, Bus.oam_base + 8, 0x0008_0800); // OBJ window at (8, 0).
+    bus.writeData(u16, Bus.oam_base + 12, 1);
+    bus.writeData(u16, 0x0400_0040, 4);
+    bus.writeData(u16, 0x0400_0044, 8);
+    // Window 0 draws BG0 and OBJ with effects off. The OBJ window hides both.
+    bus.writeData(u32, 0x0400_0048, 0x0031_0011);
+    bus.writeData(u32, 0x0400_0050, 0x0808_0100);
+
+    var frame: video.Frame = undefined;
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.decodeColor(0x7C00), frame[0][3]);
+    try std.testing.expectEqual(video.decodeColor(0x3C0F), frame[0][4]);
+    try std.testing.expectEqual(video.decodeColor(0), frame[0][8]);
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][16]);
+
+    bus.writeData(u16, Bus.dispcnt_address, 0x1100);
+    bus.writeData(u16, Bus.oam_base, 0x0300); // Double-size affine OBJ.
+    bus.writeData(u16, Bus.oam_base + 6, 0x0100);
+    bus.writeData(u16, Bus.oam_base + 30, 0x0100);
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[3][4]);
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[4][3]);
+    try std.testing.expectEqual(video.decodeColor(0x7C00), frame[4][4]);
+}
+
+test "Mode 0 replay samples visible lines before HBlank DMA updates the backdrop" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{ 0xFE, 0xFF, 0xFF, 0xEA }); // B to self.
+    const bus = &machine.bus;
+    bus.writeData(u32, Bus.iwram_base, 0x03E0_001F);
+    bus.writeData(u32, 0x0400_00D4, Bus.iwram_base);
+    bus.writeData(u32, 0x0400_00D8, Bus.palette_base);
+    bus.writeData(u32, 0x0400_00DC, 0xA240_0001);
+    try machine.runFrame(0);
+
+    var frame: video.Frame = undefined;
+    try machine.snapshotFrame(&frame);
+    try std.testing.expectEqual(video.decodeColor(0), frame[0][0]);
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[1][0]);
+    try std.testing.expectEqual(video.decodeColor(0x03E0), frame[2][0]);
 }
 
 fn snapshotMode4(self: *const Machine, frame: *video.Frame) void {
@@ -561,6 +694,7 @@ test "Mode 4 selects the front and back pages and uses the live background palet
     const blue: video.Rgb = .{ .red = 0, .green = 0, .blue = 255 };
     const white: video.Rgb = .{ .red = 255, .green = 255, .blue = 255 };
     var frame: video.Frame = undefined;
+    bus.writeData(u16, Bus.dispcnt_address, 1);
     try std.testing.expectError(error.UnsupportedDisplayMode, machine.snapshotBitmap(&frame));
     bus.writeData(u16, Bus.dispcnt_address, 0x0404);
     try machine.snapshotBitmap(&frame);

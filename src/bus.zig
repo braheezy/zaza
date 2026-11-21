@@ -345,6 +345,16 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         const shift: u5 = @intCast((aligned_address & 3) * 8);
         return @truncate(word >> shift);
     }
+    if (DisplayRegisters.contains(aligned_address)) {
+        const word_address = aligned_address & ~@as(u32, 3);
+        const low = self.display_registers.readable(word_address);
+        const high = self.display_registers.readable(word_address + 2);
+        const word = if (low == null and high == null)
+            self.prefetch_word
+        else
+            @as(u32, low orelse 0) | (@as(u32, high orelse 0) << 16);
+        return wordLane(T, word, aligned_address);
+    }
     return self.readRom(T, aligned_address);
 }
 
