@@ -93,6 +93,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         _ = self.advanceArmPipeline(bus);
         return;
     }
+    if (instruction & 0x0E00_0000 == 0x0800_0000) {
+        try self.executeArmBlockTransfer(bus, instruction);
+        return;
+    }
     const single_transfer = instruction & 0x0C00_0000 == 0x0400_0000;
     const extra_transfer = instruction & 0x0E00_0090 == 0x0000_0090 and
         instruction & 0x60 != 0;
@@ -106,6 +110,94 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     if (redirect) |target| {
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
+    }
+}
+
+fn executeArmBlockTransfer(
+    self: *Cpu,
+    bus: anytype,
+    instruction: u32,
+) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    if (!conditionPassed(condition, self.readFlags())) {
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
+
+    const before = instruction & (1 << 24) != 0;
+    const increment = instruction & (1 << 23) != 0;
+    const special = instruction & (1 << 22) != 0;
+    const writeback = instruction & (1 << 21) != 0;
+    const load = instruction & (1 << 20) != 0;
+    const base_register: u4 = @truncate(instruction >> 16);
+    if (base_register == program_counter) return error.UnsupportedInstruction;
+    var registers: u16 = @truncate(instruction);
+    // An empty list transfers PC but moves the base by sixteen words.
+    const count: u32 = if (registers == 0) 16 else @popCount(registers);
+    if (registers == 0) registers = 1 << program_counter;
+
+    const loads_pc = load and registers & (1 << program_counter) != 0;
+    const return_status: ?u32 = if (special and loads_pc) blk: {
+        const status = self.savedStatus() orelse return error.UnsupportedInstruction;
+        switch (@as(u5, @truncate(status))) {
+            0x10, 0x11, 0x12, 0x13, 0x17, 0x1B, 0x1F => {},
+            else => return error.UnsupportedInstruction,
+        }
+        break :blk status;
+    } else null;
+    const user_bank = special and !loads_pc;
+    if (user_bank and (writeback or self.mode() == .user or self.mode() == .system)) {
+        return error.UnsupportedInstruction;
+    }
+
+    const base = self.readRegister(base_register);
+    const updated_base = if (increment) base +% (count * 4) else base -% (count * 4);
+    // Even decrementing modes transfer the lowest register at the lowest address.
+    var address = if (increment) base else updated_base;
+    if (before == increment) address +%= 4;
+    const base_in_list = registers & (@as(u16, 1) << base_register) != 0;
+    const first_register: u4 = @intCast(@ctz(registers));
+    _ = self.advanceArmPipeline(bus);
+
+    var target: ?u32 = null;
+    while (registers != 0) {
+        const register: u4 = @intCast(@ctz(registers));
+        registers &= registers - 1;
+        if (load) {
+            const value = bus.readData(u32, address);
+            if (register == program_counter) {
+                target = value;
+            } else if (user_bank) {
+                self.registers[register] = value;
+            } else {
+                self.writeGeneralRegister(register, value);
+            }
+        } else {
+            // ARM7 stores the updated base if an earlier register transferred first.
+            const value = if (writeback and register == base_register and register != first_register)
+                updated_base
+            else if (user_bank and register != program_counter)
+                self.registers[register]
+            else
+                self.readRegister(register);
+            bus.writeData(u32, address, value);
+        }
+        address +%= 4;
+    }
+    if (writeback and (!load or !base_in_list)) {
+        self.writeGeneralRegister(base_register, updated_base);
+    }
+    if (target) |value| {
+        // Writeback belongs to the old bank; restore CPSR before fetching the return target.
+        if (return_status) |status| self.cpsr = status;
+        if (self.cpsr & thumb_bit != 0) {
+            self.instruction_address = value & ~@as(u32, 1);
+            self.refillThumbPipeline(bus);
+        } else {
+            self.instruction_address = value & ~@as(u32, 3);
+            self.refillArmPipeline(bus);
+        }
     }
 }
 
