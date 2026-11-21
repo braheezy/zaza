@@ -8,6 +8,8 @@ const DMA = @import("dma.zig");
 const Serial = @import("serial.zig");
 
 pub const rom_base: u32 = 0x0800_0000;
+pub const ewram_base: u32 = 0x0200_0000;
+const ewram_size_bytes = 256 * 1024;
 pub const iwram_base: u32 = 0x0300_0000;
 pub const dispcnt_address: u32 = 0x0400_0000;
 pub const dispstat_address: u32 = 0x0400_0004;
@@ -46,6 +48,7 @@ keypad_control: u16 = 0,
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
+ewram: [ewram_size_bytes]u8 = @splat(0),
 iwram: [iwram_size_bytes]u8 = @splat(0),
 palette: [palette_size_bytes]u8 = @splat(0),
 vram: [vram_size_bytes]u8 = @splat(0),
@@ -117,6 +120,10 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     const interrupted = self.next_fetch_nonsequential;
     self.next_fetch_nonsequential = false;
     if (address < bios_size_bytes) return self.readBios(T, address);
+    if (ewramOffset(address)) |offset| {
+        self.next_fetch_nonsequential = true;
+        return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
+    }
     const value = self.readRom(T, address);
     // The cartridge starts a fresh sequence at each 128 KiB boundary.
     const effective_access = if (interrupted or address & 0x1_FFFF == 0)
@@ -161,6 +168,10 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         return @truncate(registers >> shift);
     }
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
+    if (ewramOffset(aligned_address)) |offset| {
+        self.next_fetch_nonsequential = true;
+        return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
+    }
     if (iwramOffset(aligned_address)) |offset| {
         self.chargeIwramDataAccess();
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
@@ -329,6 +340,11 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     // Keep real peripheral registers outside this range visible as unsupported.
     if (aligned_address >= 0x0400_0110 and
         aligned_address + @sizeOf(T) <= 0x0400_0120) return;
+    if (ewramOffset(aligned_address)) |offset| {
+        std.mem.writeInt(T, self.ewram[offset..][0..@sizeOf(T)], value, .little);
+        self.next_fetch_nonsequential = true;
+        return;
+    }
     const offset = iwramOffset(aligned_address) orelse
         std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
@@ -346,9 +362,14 @@ fn alignDataAddress(comptime T: type, address: u32) u32 {
     return address & ~@as(u32, @sizeOf(T) - 1);
 }
 
+fn ewramOffset(address: u32) ?u32 {
+    if (address >> 24 != ewram_base >> 24) return null;
+    return address % ewram_size_bytes;
+}
+
 fn iwramOffset(address: u32) ?u32 {
-    if (address < iwram_base or address >= iwram_base + iwram_size_bytes) return null;
-    return address - iwram_base;
+    if (address >> 24 != iwram_base >> 24) return null;
+    return address % iwram_size_bytes;
 }
 
 fn paletteOffset(address: u32) ?u32 {
@@ -635,4 +656,24 @@ test "OAM mirrors preserve both sprite attributes and affine coefficients" {
     bus.writeData(u16, 0x07FF_FFFE, 0x0100);
     try std.testing.expectEqual(@as(u32, 0x0100_1234), bus.readData(u32, oam_base + 0x7FC));
     try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, oam_base));
+}
+
+test "EWRAM data and instruction accesses share mirrored storage" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, ewram_base + 0x40001, 0x4433_2211);
+    bus.writeData(u8, ewram_base + 1, 0xAA);
+    bus.writeData(u16, 0x02FC_0003, 0x6655);
+    try std.testing.expectEqual(@as(u32, 0x6655_AA11), bus.readData(u32, ewram_base));
+    try std.testing.expectEqual(@as(u8, 0x55), bus.readData(u8, ewram_base + 0x80002));
+    try std.testing.expectEqual(@as(u16, 0x6655), bus.fetch16(ewram_base + 0xC0002, .sequential));
+    try std.testing.expectEqual(@as(u32, 0x6655_AA11), bus.fetch32(ewram_base, .nonsequential));
+    bus.writeData(u16, 0x02FF_FFFE, 0xCDEF);
+    try std.testing.expectEqual(@as(u16, 0xCDEF), bus.readData(u16, ewram_base + 0x3FFFE));
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, iwram_base));
+}
+
+test "the mirrored IRQ handler address shares the top word of IWRAM" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, 0x03FF_FFFC, 0x0800_0100);
+    try std.testing.expectEqual(@as(u32, 0x0800_0100), bus.readData(u32, 0x0300_7FFC));
 }

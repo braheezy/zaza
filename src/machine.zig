@@ -89,8 +89,7 @@ fn isTimedIwramTransfer(self: *Machine, instruction: u32) bool {
     const data_register: u4 = @truncate(instruction >> 12);
     if (base_register == 15 or data_register == 15) return false;
     const address = self.cpu.readRegister(base_register);
-    return address & 3 == 0 and address >= Bus.iwram_base and
-        address - Bus.iwram_base < self.bus.iwram.len;
+    return address & 3 == 0 and address >> 24 == Bus.iwram_base >> 24;
 }
 
 fn romContainsWord(self: *const Machine, address: u32) bool {
