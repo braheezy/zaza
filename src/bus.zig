@@ -30,6 +30,8 @@ irq_enable: u16 = 0,
 irq_flags: u16 = 0,
 ime_enabled: bool = false,
 rom_fetch_cycles: u64 = 0,
+iwram_write_cycles: u64 = 0,
+next_fetch_nonsequential: bool = false,
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
     // A device latches its request even while IRQ delivery is disabled.
@@ -54,13 +56,18 @@ pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
 }
 
 fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
+    const interrupted = self.next_fetch_nonsequential;
+    self.next_fetch_nonsequential = false;
     if (address < bios_size_bytes) {
         const bios = self.bios orelse @panic("BIOS fetch without a BIOS image");
         return std.mem.readInt(T, bios[address..][0..@sizeOf(T)], .little);
     }
     const value = self.readRom(T, address);
     // The cartridge starts a fresh sequence at each 128 KiB boundary.
-    const effective_access = if (address & 0x1_FFFF == 0) .nonsequential else access;
+    const effective_access = if (interrupted or address & 0x1_FFFF == 0)
+        .nonsequential
+    else
+        access;
     self.rom_fetch_cycles += timing.gamePak0AccessCycles(T, effective_access);
     return value;
 }
@@ -125,6 +132,9 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const offset = iwramOffset(aligned_address) orelse
         std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
+    // IWRAM is 32-bit wide. The store also breaks the cartridge fetch sequence.
+    self.iwram_write_cycles += 1;
+    self.next_fetch_nonsequential = true;
 }
 
 fn alignDataAddress(comptime T: type, address: u32) u32 {
