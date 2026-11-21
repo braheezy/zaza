@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         if (bytes.len != Bus.bios_size_bytes) return error.InvalidBiosSize;
         machine.initCartridgeWithBios(run.rom, bytes[0..Bus.bios_size_bytes]);
     } else {
-        machine.initCartridge(run.rom);
+        machine.initCartridgeWithBios(run.rom, bundled_bios);
     }
     for (0..run.steps) |step| {
         const address = machine.cpu.instruction_address;
@@ -168,4 +168,15 @@ test "ARM program selects Mode 3 and writes a red row" {
         try std.testing.expectEqual(video.Rgb{ .red = 255, .green = 0, .blue = 0 }, pixel);
     }
     try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 0, .blue = 0 }, frame[1][0]);
+}
+
+const bundled_bios = @embedFile("emibios");
+comptime {
+    @setEvalBranchQuota(2_000_000);
+    if (bundled_bios.len != Bus.bios_size_bytes) @compileError("Invalid bundled BIOS size");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bundled_bios, &digest, .{});
+    var expected_buffer: [32]u8 = undefined;
+    const expected = std.fmt.hexToBytes(&expected_buffer, "95e6c8a6c236ed8e2629bdb60bc75791434c4f08ca69ad2305e30ca3f3c29d1b") catch unreachable;
+    if (!std.mem.eql(u8, &digest, expected)) @compileError("Bundled BIOS checksum mismatch");
 }

@@ -8,6 +8,15 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    // Declared output files make Run cache this download until its inputs change.
+    const bios_download = b.addSystemCommand(&.{
+        "curl",                                                                      "--fail",   "--location", "--silent", "--show-error",
+        "https://github.com/coolbho3k/emibios/releases/download/0.2.1/gba_bios.bin", "--output",
+    });
+    const bios_image = bios_download.addOutputFileArg("gba_bios.bin");
+    module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
+    b.installFile("vendor/emibios/LICENSE", "share/licenses/emibios/LICENSE");
+    b.installFile("vendor/emibios/NOTICE", "share/licenses/emibios/NOTICE");
     const executable = b.addExecutable(.{ .name = "zaza", .root_module = module });
     b.installArtifact(executable);
 
