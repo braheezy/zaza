@@ -99,6 +99,7 @@ fn romContainsWord(self: *const Machine, address: u32) bool {
 }
 
 fn advanceClock(self: *Machine, cycles: u64) void {
+    self.bus.requestInterrupt(self.bus.timers.advance(cycles));
     const old_phase = self.elapsed_cycles % cycles_per_frame;
     const until_vblank = if (old_phase < vblank_start)
         vblank_start - old_phase
@@ -289,4 +290,18 @@ test "Machine takes a pending IRQ at a Thumb instruction boundary" {
 pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!void {
     if (self.bus.dispcnt & 0b111 != 3) return error.NotMode3;
     video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame);
+}
+
+test "machine clock routes timer overflow IRQs while delivery is masked" {
+    const std = @import("std");
+    // Keep the CPU idle to isolate shared-clock device advancement and IRQ latching.
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    machine.bus.writeData(u32, 0x0400_0100, 0x00C0_FFFE);
+    machine.advanceClock(1);
+    try std.testing.expectEqual(@as(u16, 0), machine.bus.irq_flags);
+    machine.advanceClock(1);
+    try std.testing.expectEqual(@as(u16, 8), machine.bus.irq_flags);
+    try std.testing.expect(!machine.bus.irqLine());
+    try std.testing.expectEqual(@as(u16, 0xFFFE), machine.bus.readData(u16, 0x0400_0100));
 }

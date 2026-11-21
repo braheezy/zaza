@@ -2,6 +2,7 @@ const std = @import("std");
 const Bus = @This();
 const timing = @import("timing.zig");
 const DisplayRegisters = @import("display_registers.zig");
+const Timers = @import("timers.zig");
 const DMA = @import("dma.zig");
 const Serial = @import("serial.zig");
 
@@ -27,6 +28,7 @@ const vram_size_bytes = 96 * 1024;
 rom: []const u8,
 serial: Serial = .{},
 dma: DMA = .{},
+timers: Timers = .{},
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
@@ -109,6 +111,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         }
         return result;
     }
+    if (Timers.contains(aligned_address)) return self.timers.read(T, aligned_address);
     if (DMA.contains(aligned_address)) return self.dma.read(T, aligned_address);
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
     if (iwramOffset(aligned_address)) |offset| {
@@ -183,6 +186,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             self.display_registers.write(aligned_address, value);
             return;
         }
+    }
+    if (Timers.contains(aligned_address)) {
+        self.timers.write(T, aligned_address, value);
+        return;
     }
     if (DMA.contains(aligned_address)) {
         self.dma.write(T, aligned_address, value);
