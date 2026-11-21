@@ -21,6 +21,20 @@ pub fn initCartridge(self: *Machine, rom: []const u8) void {
     self.cpu.refillArmPipeline(&self.bus);
 }
 
+pub fn initCartridgeWithBios(
+    self: *Machine,
+    rom: []const u8,
+    bios: *const [Bus.bios_size_bytes]u8,
+) void {
+    self.initCartridge(rom);
+    self.bus.bios = bios;
+    // Fast boot skips the BIOS routine that initializes the banked stacks.
+    self.cpu.cpsr = 0x1F; // System mode, ARM state.
+    self.cpu.registers[13] = 0x0300_7F00;
+    self.cpu.banked.irq[0] = 0x0300_7FA0;
+    self.cpu.banked.supervisor[0] = 0x0300_7FE0;
+}
+
 pub fn step(self: *Machine) !void {
     // Sample IRQ before executing the next queued instruction.
     if (self.bus.irqLine() and !self.cpu.irqMasked()) {
@@ -28,11 +42,15 @@ pub fn step(self: *Machine) !void {
         self.cpu.enterIrq(&self.bus);
         return;
     }
+    // BIOS data visibility depends on the executing instruction, not lookahead fetches.
+    self.bus.executing_bios = self.cpu.instruction_address < Bus.bios_size_bytes;
+    defer self.bus.executing_bios = false;
     try self.cpu.step(&self.bus);
 }
 
 // Use this from cartridge startup; ordinary step() does not advance the clock.
 pub fn stepTimed(self: *Machine) !void {
+    if (self.bus.prefetchEnabled()) return error.UntimedPrefetch;
     if (self.bus.irqLine() and !self.cpu.irqMasked()) return error.UntimedIrq;
     const instruction = (self.cpu.pipeline orelse return error.PipelineNotReady)[0];
     const address = self.cpu.instruction_address;
@@ -117,6 +135,32 @@ test "timed cartridge branch loop raises VBlank IF even with IRQ delivery masked
     try std.testing.expectEqual(@as(u16, 0), machine.bus.readData(u16, Bus.if_address));
 }
 
+test "timed ROM fetches use WAITCNT and reject unmodeled prefetch" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0xFE, 0xFF, 0xFF, 0xEA, // B to self.
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 20), machine.elapsed_cycles);
+
+    machine.bus.writeData(u16, Bus.waitcnt_address, 0x0018);
+    try machine.stepTimed();
+    // The register write breaks the sequence, then the branch breaks it again.
+    try std.testing.expectEqual(@as(u64, 20 + 5 + 5 + 4), machine.elapsed_cycles);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 34 + 4 + 5 + 4), machine.elapsed_cycles);
+
+    machine.bus.writeData(u16, Bus.waitcnt_address, 0x4018);
+    const fetch_cycles = machine.bus.rom_fetch_cycles;
+    try std.testing.expectError(error.UntimedPrefetch, machine.stepTimed());
+    try std.testing.expectEqual(fetch_cycles, machine.bus.rom_fetch_cycles);
+    try std.testing.expectEqual(@as(u64, 47), machine.elapsed_cycles);
+}
+
 test "timed IWRAM store charges one data cycle and breaks the next ROM fetch" {
     const std = @import("std");
     const rom = [_]u8{
@@ -178,6 +222,29 @@ test "timed stepping rejects a load outside IWRAM before advancing the CPU or cl
     try std.testing.expectError(error.UntimedInstruction, machine.stepTimed());
     try std.testing.expectEqual(Bus.rom_base, machine.cpu.instruction_address);
     try std.testing.expectEqual(@as(u64, 0), machine.elapsed_cycles);
+}
+
+test "cartridge SWI executes a BIOS handler that reads a BIOS literal" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x01, 0x00, 0x00, 0xEF, // SWI
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    const bios = comptime blk: {
+        var bytes: [Bus.bios_size_bytes]u8 = @splat(0);
+        std.mem.writeInt(u32, bytes[8..12], 0xE59F_0000, .little); // LDR r0, [pc]
+        std.mem.writeInt(u32, bytes[16..20], 0x1234_5678, .little);
+        break :blk bytes;
+    };
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(&rom, &bios);
+    try std.testing.expectEqual(@as(u32, 0x0300_7F00), machine.cpu.readRegister(13));
+    try machine.step();
+    try std.testing.expectEqual(@as(u32, 8), machine.cpu.instruction_address);
+    try std.testing.expectEqual(@as(u32, 0x0300_7FE0), machine.cpu.readRegister(13));
+    try machine.step();
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), machine.cpu.readRegister(0));
 }
 
 test "Machine takes a pending IRQ at a Thumb instruction boundary" {

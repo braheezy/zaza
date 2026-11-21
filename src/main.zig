@@ -1,28 +1,45 @@
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-    const run: struct { rom: []const u8, steps: usize, output: []const u8 } = switch (args.len) {
-        2 => .{ .rom = &mode3_demo_rom, .steps = mode3_demo_steps, .output = args[1] },
-        4 => blk: {
-            const steps = try std.fmt.parseInt(usize, args[2], 10);
+    const args = (try init.minimal.args.toSlice(arena))[1..];
+    const with_bios = args.len == 5 and std.mem.eql(u8, args[0], "--bios");
+    const run_args = if (with_bios) args[2..] else args;
+    const run: struct { rom: []const u8, steps: usize, output: []const u8 } = switch (run_args.len) {
+        1 => .{ .rom = &mode3_demo_rom, .steps = mode3_demo_steps, .output = run_args[0] },
+        3 => blk: {
+            const steps = try std.fmt.parseInt(usize, run_args[1], 10);
             if (steps == 0) return error.InvalidStepCount;
             const rom = try std.Io.Dir.cwd().readFileAlloc(
                 init.io,
-                args[1],
+                run_args[0],
                 arena,
                 .limited(32 * 1024 * 1024 + 1),
             );
             if (rom.len < 8) return error.RomTooShort;
-            break :blk .{ .rom = rom, .steps = steps, .output = args[3] };
+            break :blk .{ .rom = rom, .steps = steps, .output = run_args[2] };
         },
         else => {
-            std.debug.print("Usage: zaza [<input.gba> <steps>] <output.bmp>\n", .{});
+            std.debug.print(
+                "Usage: zaza <output.bmp>\n" ++
+                    "       zaza [--bios <bios.bin>] <input.gba> <steps> <output.bmp>\n",
+                .{},
+            );
             return error.InvalidArguments;
         },
     };
 
     var machine: Machine = undefined;
-    machine.initCartridge(run.rom);
+    if (with_bios) {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            args[1],
+            arena,
+            .limited(Bus.bios_size_bytes + 1),
+        );
+        if (bytes.len != Bus.bios_size_bytes) return error.InvalidBiosSize;
+        machine.initCartridgeWithBios(run.rom, bytes[0..Bus.bios_size_bytes]);
+    } else {
+        machine.initCartridge(run.rom);
+    }
     for (0..run.steps) |step| {
         const address = machine.cpu.instruction_address;
         machine.step() catch |err| {
