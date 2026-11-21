@@ -32,6 +32,8 @@ const palette_size_bytes = 1024;
 pub const vram_base: u32 = 0x0600_0000;
 const iwram_size_bytes = 32 * 1024;
 const vram_size_bytes = 96 * 1024;
+pub const oam_base: u32 = 0x0700_0000;
+const oam_size_bytes = 1024;
 
 // The caller owns both images and keeps them alive while the bus uses them.
 rom: []const u8,
@@ -47,6 +49,7 @@ executing_bios: bool = false,
 iwram: [iwram_size_bytes]u8 = @splat(0),
 palette: [palette_size_bytes]u8 = @splat(0),
 vram: [vram_size_bytes]u8 = @splat(0),
+oam: [oam_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
 greenswap: u16 = 0,
@@ -168,6 +171,9 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (aligned_address >> 24 == vram_base >> 24) {
         const offset = self.vramOffset(aligned_address) orelse return 0;
         return std.mem.readInt(T, self.vram[offset..][0..@sizeOf(T)], .little);
+    }
+    if (oamOffset(aligned_address)) |offset| {
+        return std.mem.readInt(T, self.oam[offset..][0..@sizeOf(T)], .little);
     }
     if (T == u16) {
         if (aligned_address == dispcnt_address) return self.dispcnt;
@@ -308,6 +314,11 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         }
         return;
     }
+    if (oamOffset(aligned_address)) |offset| {
+        // The OAM bus ignores byte stores, including stores through mirrored addresses.
+        if (T != u8) std.mem.writeInt(T, self.oam[offset..][0..@sizeOf(T)], value, .little);
+        return;
+    }
     // The gap between DMA and timers is unused.
     if (aligned_address >= DMA.end and
         aligned_address + @sizeOf(T) <= 0x0400_0100) return;
@@ -345,6 +356,11 @@ fn paletteOffset(address: u32) ?u32 {
     return address % palette_size_bytes;
 }
 
+fn oamOffset(address: u32) ?u32 {
+    if (address >> 24 != oam_base >> 24) return null;
+    return address % oam_size_bytes;
+}
+
 fn bitmapMode(self: *const Bus) bool {
     return self.dispcnt & 7 >= 3;
 }
@@ -370,7 +386,9 @@ fn readRom(self: *const Bus, comptime T: type, address: u32) T {
         std.debug.panic("unmapped {d}-bit read at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     }
     const offset = address - rom_base;
-    if (offset + @sizeOf(T) > self.rom.len) @panic("read past end of ROM");
+    if (offset + @sizeOf(T) > self.rom.len) {
+        std.debug.panic("{d}-bit read past end of ROM at 0x{x:0>8}", .{ @bitSizeOf(T), address });
+    }
     return std.mem.readInt(T, self.rom[offset..][0..@sizeOf(T)], .little);
 }
 
@@ -576,4 +594,18 @@ test "VRAM byte stores honor the background and sprite boundary" {
     bus.writeData(u8, vram_base + 0x1C000, 0x78);
     try std.testing.expectEqual(@as(u16, 0x5656), bus.readData(u16, vram_base + 0x13FFE));
     try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, vram_base + 0x14000));
+}
+
+test "OAM mirrors preserve both sprite attributes and affine coefficients" {
+    var bus: Bus = .{ .rom = &.{} };
+    // The last two halfwords hold a sprite attribute and an affine coefficient.
+    bus.writeData(u32, oam_base + 0x7FC, 0xFEDC_1234);
+    try std.testing.expectEqual(@as(u16, 0x1234), bus.readData(u16, oam_base + 0x3FC));
+    try std.testing.expectEqual(@as(u8, 0xFE), bus.readData(u8, 0x07FF_FFFF));
+    bus.writeData(u8, oam_base + 0x3FD, 0);
+    bus.writeData(u8, 0x07FF_FFFE, 0);
+    try std.testing.expectEqual(@as(u32, 0xFEDC_1234), bus.readData(u32, oam_base + 0x3FC));
+    bus.writeData(u16, 0x07FF_FFFE, 0x0100);
+    try std.testing.expectEqual(@as(u32, 0x0100_1234), bus.readData(u32, oam_base + 0x7FC));
+    try std.testing.expectEqual(@as(u32, 0), bus.readData(u32, oam_base));
 }
