@@ -93,12 +93,105 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         _ = self.advanceArmPipeline(bus);
         return;
     }
+    const single_transfer = instruction & 0x0C00_0000 == 0x0400_0000;
+    const extra_transfer = instruction & 0x0E00_0090 == 0x0000_0090 and
+        instruction & 0x60 != 0;
+    if (single_transfer or extra_transfer) {
+        try self.executeArmTransfer(bus, instruction, extra_transfer);
+        return;
+    }
     const decoded = try decodeArmDataProcessing(instruction);
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
     if (redirect) |target| {
         self.instruction_address = target & ~@as(u32, 3);
         self.refillArmPipeline(bus);
+    }
+}
+
+fn executeArmTransfer(
+    self: *Cpu,
+    bus: anytype,
+    instruction: u32,
+    extra: bool,
+) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    if (!conditionPassed(condition, self.readFlags())) {
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
+
+    const pre_index = instruction & (1 << 24) != 0;
+    const add = instruction & (1 << 23) != 0;
+    const writeback_bit = instruction & (1 << 21) != 0;
+    const load = instruction & (1 << 20) != 0;
+    const base_register: u4 = @truncate(instruction >> 16);
+    const data_register: u4 = @truncate(instruction >> 12);
+    const offset_register: u4 = @truncate(instruction);
+    // Post-indexed T forms use the same data bus path until it models access privilege.
+    const writeback = !pre_index or writeback_bit;
+    if (writeback and base_register == program_counter) return error.UnsupportedInstruction;
+
+    const Operation = enum { word, byte, halfword, signed_byte, signed_halfword };
+    const operation: Operation = if (extra) switch (@as(u2, @truncate(instruction >> 5))) {
+        1 => .halfword,
+        2 => .signed_byte,
+        3 => .signed_halfword,
+        else => unreachable,
+    } else if (instruction & (1 << 22) != 0) .byte else .word;
+
+    const offset: u32 = if (extra) blk: {
+        // Halfword and signed transfers have no post-indexed T encoding on ARMv4T.
+        if (!pre_index and writeback_bit) return error.UnsupportedInstruction;
+        if (!load and operation != .halfword) return error.UnsupportedInstruction;
+        if (instruction & (1 << 22) != 0) {
+            break :blk ((instruction >> 4) & 0xF0) | (instruction & 0xF);
+        }
+        if (instruction & 0xF00 != 0) return error.UnsupportedInstruction;
+        break :blk self.readRegister(offset_register);
+    } else if (instruction & (1 << 25) != 0) blk: {
+        if (instruction & (1 << 4) != 0) return error.UnsupportedInstruction;
+        break :blk self.shiftedRegisterOperand(.{
+            .register = offset_register,
+            .kind = @truncate(instruction >> 5),
+            .amount = .{ .immediate = @truncate(instruction >> 7) },
+        }).value;
+    } else instruction & 0xFFF;
+
+    const base = self.readRegister(base_register);
+    const updated_base = if (add) base +% offset else base -% offset;
+    const address = if (pre_index) updated_base else base;
+    _ = self.advanceArmPipeline(bus);
+
+    if (!load) {
+        // A store of R15 sees the PC after the sequential fetch (instruction + 12).
+        const value = self.readRegister(data_register);
+        switch (operation) {
+            .word => bus.writeData(u32, address, value),
+            .byte => bus.writeData(u8, address, @truncate(value)),
+            .halfword => bus.writeData(u16, address, @truncate(value)),
+            .signed_byte, .signed_halfword => unreachable,
+        }
+        if (writeback) self.writeGeneralRegister(base_register, updated_base);
+        return;
+    }
+
+    const value: u32 = switch (operation) {
+        .word => std.math.rotr(u32, bus.readData(u32, address), (address & 3) * 8),
+        .byte => bus.readData(u8, address),
+        .halfword => std.math.rotr(u32, bus.readData(u16, address), (address & 1) * 8),
+        .signed_byte => signExtendByte(bus.readData(u8, address)),
+        .signed_halfword => readSignedHalfword(bus, address),
+    };
+    if (writeback and base_register != data_register) {
+        self.writeGeneralRegister(base_register, updated_base);
+    }
+    if (data_register == program_counter) {
+        self.instruction_address = value & ~@as(u32, 3);
+        self.refillArmPipeline(bus);
+    } else {
+        self.writeGeneralRegister(data_register, value);
     }
 }
 
@@ -235,12 +328,7 @@ fn executeThumbTransfer(self: *Cpu, bus: anytype, transfer: ThumbTransfer) void 
         .ldrh => std.math.rotr(u32, bus.readData(u16, address), (address & 1) * 8),
         .ldrb => bus.readData(u8, address),
         .ldrsb => signExtendByte(bus.readData(u8, address)),
-        .ldrsh => blk: {
-            const value = bus.readData(u16, address);
-            // An odd address selects and sign-extends the upper byte of the halfword.
-            if (address & 1 != 0) break :blk signExtendByte(@truncate(value >> 8));
-            break :blk @bitCast(@as(i32, @as(i16, @bitCast(value))));
-        },
+        .ldrsh => readSignedHalfword(bus, address),
     };
     self.writeGeneralRegister(register, result);
 }
@@ -291,6 +379,13 @@ fn executeThumbBlockTransfer(self: *Cpu, bus: anytype, instruction: u16, stack: 
         self.instruction_address = value & ~@as(u32, 1);
         self.refillThumbPipeline(bus);
     }
+}
+
+fn readSignedHalfword(bus: anytype, address: u32) u32 {
+    const value = bus.readData(u16, address);
+    // An odd address selects and sign-extends the upper byte of the halfword.
+    if (address & 1 != 0) return signExtendByte(@truncate(value >> 8));
+    return @bitCast(@as(i32, @as(i16, @bitCast(value))));
 }
 
 fn signExtendByte(value: u8) u32 {

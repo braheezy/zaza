@@ -477,6 +477,10 @@ const Report = struct {
             "arm_swi",
             "arm_mul_mla",
             "arm_mull_mlal",
+            "arm_ldr_str_immediate_offset",
+            "arm_ldr_str_register_offset",
+            "arm_ldrh_strh",
+            "arm_ldrsb_ldrsh",
         };
         for (supported_families) |supported| {
             if (std.mem.eql(u8, family, supported)) {
