@@ -234,6 +234,7 @@ fn runSelectedVector(vector: Vector) !void {
         .banked = physicalBanks(vector.initial),
         .instruction_address = vector.initial.registers[15] -% 8,
         .cpsr = vector.initial.cpsr,
+        .spsr = vector.initial.spsr,
         .pipeline = vector.initial.pipeline,
     };
 
@@ -249,6 +250,7 @@ fn runSelectedVector(vector: Vector) !void {
     const expected_pc = vector.final.registers[15] & ~@as(u32, 3);
     if (expected_pc != cpu.instruction_address +% 8) return error.PcMismatch;
     if (vector.final.cpsr != cpu.cpsr) return error.CpsrMismatch;
+    if (!std.mem.eql(u32, &vector.final.spsr, &cpu.spsr)) return error.SpsrMismatch;
     if (!std.mem.eql(u32, &vector.final.pipeline, &cpu.pipeline.?)) return error.PipelineMismatch;
 }
 
@@ -279,6 +281,17 @@ const Report = struct {
                     if (link) "BL" else "B",
                     vector.initial.registers[15] -% 8,
                     vector.final.registers[15] -% 8,
+                });
+            } else if (std.mem.eql(u8, family, "arm_mrs")) {
+                const destination: u4 = @truncate(vector.opcode >> 12);
+                const status = if (vector.opcode & (1 << 22) != 0) "SPSR" else "CPSR";
+                try self.style.cyan().print(self.writer, "  MRS r{d}, {s}\n", .{
+                    destination, status,
+                });
+                try self.style.green().print(self.writer, "        r{d}: 0x{x:0>8} → 0x{x:0>8}\n", .{
+                    destination,
+                    visibleRegister(vector.initial, destination),
+                    visibleRegister(vector.final, destination),
                 });
             } else {
                 try self.explainImmediate(vector);
@@ -370,7 +383,7 @@ const Report = struct {
         if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
             if (!std.mem.eql(u8, family, "arm_data_proc_immediate_shift")) {
                 if (!std.mem.eql(u8, family, "arm_data_proc_register_shift") and
-                    !std.mem.eql(u8, family, "arm_b_bl"))
+                    !std.mem.eql(u8, family, "arm_b_bl") and !std.mem.eql(u8, family, "arm_mrs"))
                 {
                     return error.UnsupportedInstruction;
                 }

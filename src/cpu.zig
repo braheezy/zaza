@@ -18,6 +18,8 @@ instruction_address: u32 = 0,
 // Current instruction first, then the next one. Null until the initial refill.
 pipeline: ?[2]u32 = null,
 cpsr: u32 = 0xD3, // Supervisor mode, ARM state, IRQ and FIQ masked.
+// FIQ, Supervisor, Abort, IRQ, Undefined, in bank order.
+spsr: [5]u32 = @splat(0),
 
 pub const BankedRegisters = struct {
     fiq: [7]u32 = @splat(0),
@@ -59,6 +61,11 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.executeArmBranch(bus, instruction, condition);
         return;
     }
+    if (instruction & 0x0FBF_0FFF == 0x010F_0000) {
+        try self.executeArmMrs(instruction);
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
     const decoded = try decodeArmDataProcessing(instruction);
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
@@ -81,6 +88,31 @@ fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) v
     const offset: u32 = @bitCast(@as(i32, words) * 4);
     self.instruction_address = address +% 8 +% offset;
     self.refillArmPipeline(bus);
+}
+
+fn executeArmMrs(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    const destination: u4 = @truncate(instruction >> 12);
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    if (destination == program_counter) return error.UnsupportedInstruction;
+    if (!conditionPassed(condition, self.readFlags())) return;
+
+    const value = if (instruction & (1 << 22) != 0)
+        self.savedStatus() orelse return error.UnsupportedInstruction
+    else
+        self.cpsr;
+    self.writeGeneralRegister(destination, value);
+}
+
+fn savedStatus(self: *Cpu) ?u32 {
+    return switch (self.mode()) {
+        .user, .system => null,
+        .fiq => self.spsr[0],
+        .supervisor => self.spsr[1],
+        .abort => self.spsr[2],
+        .irq => self.spsr[3],
+        .undefined_instruction => self.spsr[4],
+    };
 }
 
 const ArmDataProcessing = struct {
