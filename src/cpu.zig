@@ -107,7 +107,16 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     const immediate: u11 = @truncate(instruction);
     const signed_immediate: i32 = @as(i11, @bitCast(immediate));
     var target: ?u32 = null;
-    if (instruction >> 12 == 0xD) {
+    const software_interrupt = instruction >> 8 == 0xDF;
+    const exchange = instruction & 0xFF87 == 0x4700;
+    if (software_interrupt) {
+        // Exception entry runs after the sequential Thumb fetch.
+    } else if (exchange) {
+        const source: u4 = @truncate(instruction >> 3);
+        target = self.readRegister(source);
+    } else if (instruction >> 10 == 0b010001) {
+        target = try self.executeThumbHighAlu(instruction);
+    } else if (instruction >> 12 == 0xD) {
         const condition: u4 = @truncate(instruction >> 8);
         if (condition >= 0xE) return error.UnsupportedInstruction;
         if (conditionPassed(condition, self.readFlags())) {
@@ -135,10 +144,37 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     const fetched = bus.fetch16(pc);
     self.pipeline = .{ queued[1], fetched };
     self.instruction_address +%= 2;
-    if (target) |address| {
-        self.instruction_address = address;
-        self.refillThumbPipeline(bus);
+    if (software_interrupt) {
+        self.enterSoftwareInterrupt(bus);
+    } else if (target) |address| {
+        if (exchange and address & 1 == 0) {
+            self.cpsr &= ~thumb_bit;
+            self.instruction_address = address & ~@as(u32, 3);
+            self.refillArmPipeline(bus);
+        } else {
+            self.instruction_address = address & ~@as(u32, 1);
+            self.refillThumbPipeline(bus);
+        }
     }
+}
+
+fn executeThumbHighAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!?u32 {
+    const operation: u2 = @truncate(instruction >> 8);
+    if (operation == 3) return error.UnsupportedInstruction;
+    const source: u4 = @truncate(instruction >> 3);
+    const destination: u4 = (@as(u4, @truncate(instruction >> 4)) & 8) |
+        @as(u3, @truncate(instruction));
+    if (source < 8 and destination < 8) return error.UnsupportedInstruction;
+    const right = self.readRegister(source);
+    if (operation == 1) {
+        self.writeFlags(addWithCarry(self.readRegister(destination), ~right, true).flags);
+        return null;
+    }
+    const result = if (operation == 0) self.readRegister(destination) +% right else right;
+    // High-register ADD and MOV can redirect PC without exchanging state.
+    if (destination == program_counter) return result;
+    self.writeGeneralRegister(destination, result);
+    return null;
 }
 
 fn refillThumbPipeline(self: *Cpu, bus: anytype) void {
@@ -362,6 +398,10 @@ fn executeArmSwi(self: *Cpu, bus: anytype, condition: u4) void {
     _ = self.advanceArmPipeline(bus);
     if (!conditionPassed(condition, self.readFlags())) return;
 
+    self.enterSoftwareInterrupt(bus);
+}
+
+fn enterSoftwareInterrupt(self: *Cpu, bus: anytype) void {
     const supervisor_spsr = 1;
     const irq_disable_bit: u32 = 1 << 7;
     const mode_mask: u32 = 0x1F;
