@@ -109,11 +109,26 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         return;
     }
     const decoded = try decodeArmDataProcessing(instruction);
+    const writes_result = switch (decoded.operation) {
+        .tst, .teq, .cmp, .cmn => false,
+        else => true,
+    };
+    const return_status: ?u32 = if (writes_result and decoded.destination == program_counter and
+        decoded.set_flags and conditionPassed(decoded.condition, self.readFlags()))
+        self.spsr[self.savedStatusIndex() orelse return error.UnsupportedInstruction]
+    else
+        null;
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
     if (redirect) |target| {
-        self.instruction_address = target & ~@as(u32, 3);
-        self.refillArmPipeline(bus);
+        if (return_status) |status| self.cpsr = status;
+        if (self.cpsr & thumb_bit != 0) {
+            self.instruction_address = target & ~@as(u32, 1);
+            self.refillThumbPipeline(bus);
+        } else {
+            self.instruction_address = target & ~@as(u32, 3);
+            self.refillArmPipeline(bus);
+        }
     }
 }
 
@@ -888,7 +903,6 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
         .destination = destination,
         .operand = undefined,
     };
-    if (destination == program_counter and set_flags) return error.UnsupportedInstruction;
     switch (decoded.operation) {
         .mov, .mvn => {
             if (source != 0) return error.UnsupportedInstruction;

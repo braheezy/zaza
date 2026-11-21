@@ -91,15 +91,28 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         if (!self.executing_bios) @panic("protected BIOS data read not modeled");
         return self.readBios(T, aligned_address);
     }
+    if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
+        var result: T = 0;
+        for (0..@sizeOf(T)) |index| {
+            const byte_address = aligned_address + @as(u32, @intCast(index));
+            const halfword: u16 = switch (byte_address & ~@as(u32, 1)) {
+                ie_address => self.irq_enable,
+                if_address => self.irq_flags,
+                waitcnt_address => self.waitcnt,
+                ime_address => @intFromBool(self.ime_enabled),
+                else => 0,
+            };
+            const byte: u8 = @truncate(halfword >> @intCast((byte_address & 1) * 8));
+            result |= @as(T, byte) << @intCast(index * 8);
+        }
+        return result;
+    }
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
     if (iwramOffset(aligned_address)) |offset| {
         self.chargeIwramDataAccess();
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
     if (T == u16) {
-        if (aligned_address == ie_address) return self.irq_enable;
-        if (aligned_address == if_address) return self.irq_flags;
-        if (aligned_address == waitcnt_address) return self.waitcnt;
         if (aligned_address == dispcnt_address) return self.dispcnt;
         if (aligned_address == dispcnt_address + 2) return self.greenswap;
         if (aligned_address == dispstat_address) return self.dispstat;
@@ -110,15 +123,34 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (T == u32 and aligned_address == dispcnt_address) {
         return @as(u32, self.dispcnt) | (@as(u32, self.greenswap) << 16);
     }
-    if (T == u32 and aligned_address == ie_address) {
-        return @as(u32, self.irq_enable) | (@as(u32, self.irq_flags) << 16);
-    }
-    if (aligned_address == ime_address) return @intFromBool(self.ime_enabled);
     return self.readRom(T, aligned_address);
 }
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
+    if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
+        for (0..@sizeOf(T)) |index| {
+            const byte_address = aligned_address + @as(u32, @intCast(index));
+            const shift: u4 = @intCast((byte_address & 1) * 8);
+            const byte: u8 = @truncate(value >> @intCast(index * 8));
+            const bits = @as(u16, byte) << shift;
+            const preserve = ~(@as(u16, 0xFF) << shift);
+            switch (byte_address & ~@as(u32, 1)) {
+                ie_address => self.irq_enable = ((self.irq_enable & preserve) | bits) & irq_source_mask,
+                // IF acknowledges only the written byte, without a read-modify-write.
+                if_address => self.irq_flags &= ~bits,
+                waitcnt_address => {
+                    self.waitcnt = ((self.waitcnt & preserve) | bits) & waitcnt_write_mask;
+                    self.next_fetch_nonsequential = true;
+                },
+                ime_address => if (shift == 0) {
+                    self.ime_enabled = byte & 1 != 0;
+                },
+                else => {}, // Unused halfwords at 0x206 and 0x20A.
+            }
+        }
+        return;
+    }
     if (T == u8 and aligned_address >= dispcnt_address and
         aligned_address < 0x0400_0058)
     {
@@ -154,20 +186,6 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         return;
     }
     if (T == u16) {
-        if (aligned_address == ie_address) {
-            self.irq_enable = value & irq_source_mask;
-            return;
-        }
-        if (aligned_address == if_address) {
-            // Software acknowledges requests by writing ones to the corresponding bits.
-            self.irq_flags &= ~value;
-            return;
-        }
-        if (aligned_address == waitcnt_address) {
-            self.waitcnt = value & waitcnt_write_mask;
-            self.next_fetch_nonsequential = true;
-            return;
-        }
         if (aligned_address == dispcnt_address) {
             self.dispcnt = value;
             return;
@@ -184,16 +202,6 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
             std.mem.writeInt(u16, self.vram[offset..][0..2], value, .little);
             return;
         }
-    }
-    if (T == u32 and aligned_address == ie_address) {
-        // The low halfword writes IE; the high halfword acknowledges IF.
-        self.irq_enable = @as(u16, @truncate(value)) & irq_source_mask;
-        self.irq_flags &= ~@as(u16, @truncate(value >> 16));
-        return;
-    }
-    if (aligned_address == ime_address) {
-        self.ime_enabled = value & 1 != 0;
-        return;
     }
     // The gap between display and sound registers has no write side effects.
     if (aligned_address >= 0x0400_0058 and
@@ -348,4 +356,21 @@ test "BIOS display reset word stores and byte updates preserve status" {
     try std.testing.expectEqual(@as(u16, 0x0403), bus.dispcnt);
     bus.writeData(u8, 0x0400_0011, 0xFF);
     try std.testing.expectEqual(@as(u16, 0x0100), bus.display_registers.values[4]);
+}
+
+test "system control byte lanes preserve masks and acknowledge only written IF bits" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.requestInterrupt(0x3FFF);
+    bus.writeData(u8, if_address + 1, 1);
+    try std.testing.expectEqual(@as(u16, 0x3EFF), bus.readData(u16, if_address));
+    bus.writeData(u8, ie_address + 1, 0xFF);
+    bus.writeData(u8, ie_address, 0x55);
+    try std.testing.expectEqual(@as(u16, 0x3F55), bus.readData(u16, ie_address));
+    bus.writeData(u32, waitcnt_address, 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u32, 0x5FFF), bus.readData(u32, waitcnt_address));
+    bus.writeData(u8, waitcnt_address, 0);
+    try std.testing.expectEqual(@as(u16, 0x5F00), bus.readData(u16, waitcnt_address));
+    bus.writeData(u32, ime_address, 1);
+    bus.writeData(u8, ime_address + 1, 0xFF);
+    try std.testing.expectEqual(@as(u32, 1), bus.readData(u32, ime_address));
 }

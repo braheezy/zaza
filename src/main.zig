@@ -180,3 +180,29 @@ comptime {
     const expected = std.fmt.hexToBytes(&expected_buffer, "95e6c8a6c236ed8e2629bdb60bc75791434c4f08ca69ad2305e30ca3f3c29d1b") catch unreachable;
     if (!std.mem.eql(u8, &digest, expected)) @compileError("Bundled BIOS checksum mismatch");
 }
+
+test "bundled emibios RegisterRamReset returns to cartridge and restores System mode" {
+    // A zero reset mask isolates exception return from unimplemented peripherals.
+    const rom = [_]u8{
+        0x00, 0x00, 0xA0, 0xE3, // MOV r0, #0
+        0x00, 0x00, 0x01, 0xEF, // SWI 0x010000 (RegisterRamReset)
+        0x2A, 0x40, 0xA0, 0xE3, // MOV r4, #42
+        0xFE, 0xFF, 0xFF, 0xEA, // B to self
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(&rom, bundled_bios);
+    const original_status = machine.cpu.cpsr;
+    const original_stack = machine.cpu.registers[13];
+    var entered_bios = false;
+    for (0..10_000) |_| {
+        if (machine.cpu.instruction_address < Bus.bios_size_bytes) entered_bios = true;
+        if (machine.cpu.instruction_address == Bus.rom_base + 12) break;
+        try machine.step();
+    } else return error.BiosDidNotReturn;
+    try std.testing.expect(entered_bios);
+    try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[4]);
+    try std.testing.expectEqual(original_status, machine.cpu.cpsr);
+    try std.testing.expectEqual(original_stack, machine.cpu.registers[13]);
+}
