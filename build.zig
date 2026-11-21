@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) !void {
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const module = b.createModule(.{
@@ -28,6 +28,35 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    const window_step = b.step("window", "Run the Mach framebuffer viewer (-Ddesktop=true)");
+    const desktop_enabled = b.option(bool, "desktop", "Build the macOS Mach framebuffer viewer") orelse false;
+    if (desktop_enabled and target.result.os.tag != .macos) {
+        const unsupported = b.addFail("The Mach framebuffer viewer currently supports macOS.");
+        b.getInstallStep().dependOn(&unsupported.step);
+        check.dependOn(&unsupported.step);
+        window_step.dependOn(&unsupported.step);
+    } else if (desktop_enabled) {
+        if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true })) |mach| {
+            const desktop = b.addExecutable(.{
+                .name = "zaza-window",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/desktop.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            desktop.root_module.addImport("mach", mach.module("mach"));
+            desktop.root_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
+            b.installArtifact(desktop);
+            check.dependOn(&desktop.step);
+            const run = b.addRunArtifact(desktop);
+            if (b.args) |args| run.addArgs(args);
+            window_step.dependOn(&run.step);
+        }
+    } else {
+        window_step.dependOn(&b.addFail("Use zig build window -Ddesktop=true -- <rom.gba> <steps>").step);
+    }
+
     const cputest_enabled = b.option(bool, "cputest-internal", "Configure CPU vector tests") orelse false;
     if (!cputest_enabled) {
         const run_cputest = b.addSystemCommand(&.{
@@ -38,12 +67,12 @@ pub fn build(b: *std.Build) !void {
             b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         });
         run_cputest.addArg("--");
-        run_cputest.addPassthruArgs();
+        if (b.args) |args| run_cputest.addArgs(args);
         b.step("cputest", "Run supported ARM7TDMI SingleStepTests vectors").dependOn(&run_cputest.step);
         return;
     }
 
-    const vectors = try b.dependencyLazy("arm7tdmi_vectors", .{});
+    const vectors = b.lazyDependency("arm7tdmi_vectors", .{}) orelse return;
     const runner = b.addExecutable(.{
         .name = "cputest",
         .root_module = b.createModule(.{
@@ -55,10 +84,10 @@ pub fn build(b: *std.Build) !void {
     runner.root_module.addImport("cpu", b.createModule(.{
         .root_source_file = b.path("src/cpu.zig"),
     }));
-    const styling = try b.dependencyLazy("chameleon", .{ .target = b.graph.host, .optimize = optimize });
+    const styling = b.lazyDependency("chameleon", .{ .target = b.graph.host, .optimize = optimize }) orelse return;
     runner.root_module.addImport("chameleon", styling.module("chameleon"));
     const run_vectors = b.addRunArtifact(runner);
-    run_vectors.addDirectoryArg2(vectors.path("v1"), .{});
-    run_vectors.addPassthruArgs();
+    run_vectors.addDirectoryArg(vectors.path("v1"));
+    if (b.args) |args| run_vectors.addArgs(args);
     b.step("cputest", "Run supported ARM7TDMI SingleStepTests vectors").dependOn(&run_vectors.step);
 }

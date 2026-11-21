@@ -37,7 +37,7 @@ fn runSelection(
         for (family) |byte| {
             if (!std.ascii.isAlphanumeric(byte) and byte != '_') return usage();
         }
-        const filename = try init.arena.allocator().print("{s}{s}", .{ family, suffix });
+        const filename = try std.fmt.allocPrint(init.arena.allocator(), "{s}{s}", .{ family, suffix });
         _ = try inspectFile(directory, init.io, init.gpa, filename, case_index, report);
     } else {
         var iterator = directory.iterate();
@@ -189,7 +189,7 @@ const TestBus = struct {
     fn expectTransaction(self: *TestBus, kind: Kind, address: u32, width: u32) !u32 {
         if (self.transactions.remaining.len == 0) return error.UnexpectedTransaction;
         const entry = try self.transactions.words(6);
-        if (entry[0] != @backingInt(kind)) return error.UnexpectedTransaction;
+        if (entry[0] != @intFromEnum(kind)) return error.UnexpectedTransaction;
         if (entry[1] != width) return error.UnexpectedTransaction;
         if (entry[2] != address) return error.UnexpectedTransaction;
         return entry[3];

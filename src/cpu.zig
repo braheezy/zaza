@@ -398,7 +398,7 @@ fn decodeThumbTransfer(self: *Cpu, instruction: u16) ?ThumbTransfer {
             .register = high_register,
         } else null,
         5 => .{
-            .operation = @fromBackingInt(@as(u3, @truncate(instruction >> 9))),
+            .operation = @enumFromInt(@as(u3, @truncate(instruction >> 9))),
             .address = self.readRegister(base_register) +% self.readRegister(@as(u3, @truncate(instruction >> 6))),
             .register = low_register,
         },
@@ -766,7 +766,7 @@ fn enterException(self: *Cpu, bus: anytype, target_mode: Mode, vector: u32, retu
     const old_status = self.cpsr;
     const mode_mask: u32 = 0x1F;
     self.cpsr = (old_status & ~(mode_mask | thumb_bit)) |
-        irq_disable_bit | @as(u32, @backingInt(target_mode));
+        irq_disable_bit | @as(u32, @intFromEnum(target_mode));
     // SPSR and LR belong to the exception mode, not the interrupted mode.
     self.spsr[self.savedStatusIndex().?] = old_status;
     self.writeGeneralRegister(link_register, return_link);
@@ -1158,7 +1158,7 @@ fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
 
 fn mode(self: *Cpu) Mode {
     const mode_bits: u5 = @truncate(self.cpsr);
-    return @fromBackingInt(mode_bits);
+    return @enumFromInt(mode_bits);
 }
 
 test "ARM ALU PC operand depends on the shift encoding" {

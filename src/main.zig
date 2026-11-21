@@ -27,8 +27,7 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    var machine: Machine = undefined;
-    if (with_bios) {
+    const bios = if (with_bios) blk: {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(
             init.io,
             args[1],
@@ -36,19 +35,10 @@ pub fn main(init: std.process.Init) !void {
             .limited(Bus.bios_size_bytes + 1),
         );
         if (bytes.len != Bus.bios_size_bytes) return error.InvalidBiosSize;
-        machine.initCartridgeWithBios(run.rom, bytes[0..Bus.bios_size_bytes]);
-    } else {
-        machine.initCartridgeWithBios(run.rom, bundled_bios);
-    }
-    for (0..run.steps) |step| {
-        const address = machine.cpu.instruction_address;
-        machine.step() catch |err| {
-            std.debug.print("CPU stopped after {d} steps at 0x{x:0>8}\n", .{ step, address });
-            return err;
-        };
-    }
+        break :blk bytes[0..Bus.bios_size_bytes];
+    } else bundled_bios;
     var frame: video.Frame = undefined;
-    try machine.snapshotMode3(&frame);
+    try captureMode3(run.rom, bios, run.steps, &frame);
 
     const file = try std.Io.Dir.cwd().createFile(init.io, run.output, .{ .exclusive = true });
     defer file.close(init.io);
@@ -56,6 +46,24 @@ pub fn main(init: std.process.Init) !void {
     var file_writer = file.writer(init.io, &buffer);
     try bmp.write(&file_writer.interface, &frame);
     try file_writer.interface.flush();
+}
+
+pub fn captureMode3(
+    rom: []const u8,
+    bios: *const [Bus.bios_size_bytes]u8,
+    steps: usize,
+    frame: *video.Frame,
+) !void {
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(rom, bios);
+    for (0..steps) |step| {
+        const address = machine.cpu.instruction_address;
+        machine.step() catch |err| {
+            std.debug.print("CPU stopped after {d} steps at 0x{x:0>8}\n", .{ step, address });
+            return err;
+        };
+    }
+    try machine.snapshotMode3(frame);
 }
 
 const std = @import("std");
@@ -170,7 +178,7 @@ test "ARM program selects Mode 3 and writes a red row" {
     try std.testing.expectEqual(video.Rgb{ .red = 0, .green = 0, .blue = 0 }, frame[1][0]);
 }
 
-const bundled_bios = @embedFile("emibios");
+pub const bundled_bios = @embedFile("emibios");
 comptime {
     @setEvalBranchQuota(2_000_000);
     if (bundled_bios.len != Bus.bios_size_bytes) @compileError("Invalid bundled BIOS size");
