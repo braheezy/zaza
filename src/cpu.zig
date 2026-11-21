@@ -49,7 +49,7 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
 }
 
 const ArmDataProcessing = struct {
-    operation: enum { mov, mvn, and_, eor, orr, bic, tst, teq, add, sub, cmp },
+    operation: enum { mov, mvn, and_, eor, orr, bic, tst, teq, add, adc, sub, sbc, rsb, rsc, cmp, cmn },
     condition: u4,
     set_flags: bool,
     source: u4,
@@ -94,7 +94,11 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
             0b0100 => .add,
             0b0010 => .sub,
             0b1010 => .cmp,
-            else => return error.UnsupportedInstruction,
+            0b0011 => .rsb,
+            0b0101 => .adc,
+            0b0110 => .sbc,
+            0b0111 => .rsc,
+            0b1011 => .cmn,
         },
         .condition = condition,
         .set_flags = set_flags,
@@ -118,14 +122,11 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
                 if (!set_flags) return error.UnsupportedInstruction;
             }
         },
-        .add, .sub, .cmp => {
-            // Banking and special PC operands are outside the current implementation.
+        .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
             if (source >= 8) return error.UnsupportedInstruction;
             if (destination >= 8) return error.UnsupportedInstruction;
-            if (decoded.operation == .cmp) {
-                // Preserve the existing CMP coverage in this refactor.
+            if (decoded.operation == .cmp or decoded.operation == .cmn) {
                 if (!set_flags) return error.UnsupportedInstruction;
-                if (source != 0) return error.UnsupportedInstruction;
             }
         },
     }
@@ -181,34 +182,38 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
                 .overflow = old_flags.overflow,
             });
         },
-        .add => {
+        .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
             const left = self.readRegister(source);
-            const sum, const carry = @addWithOverflow(left, value);
-            self.writeGeneralRegister(destination, sum);
-            if (decoded.set_flags) {
-                self.writeFlags(.{
-                    .negative = sum >> 31 != 0,
-                    .zero = sum == 0,
-                    .carry = carry != 0,
-                    .overflow = ((left ^ sum) & (value ^ sum)) >> 31 != 0,
-                });
+            const result = switch (decoded.operation) {
+                .add, .cmn => addWithCarry(left, value, false),
+                .adc => addWithCarry(left, value, old_flags.carry),
+                .sub, .cmp => addWithCarry(left, ~value, true),
+                .sbc => addWithCarry(left, ~value, old_flags.carry),
+                .rsb => addWithCarry(value, ~left, true),
+                .rsc => addWithCarry(value, ~left, old_flags.carry),
+                else => unreachable,
+            };
+            switch (decoded.operation) {
+                .cmp, .cmn => {},
+                else => self.writeGeneralRegister(destination, result.value),
             }
-        },
-        .sub, .cmp => {
-            const left = self.readRegister(source);
-            const difference, const borrow = @subWithOverflow(left, value);
-            // CMP uses the subtraction flags but discards the result.
-            if (decoded.operation == .sub) self.writeGeneralRegister(destination, difference);
-            if (decoded.set_flags) {
-                self.writeFlags(.{
-                    .negative = difference >> 31 != 0,
-                    .zero = difference == 0,
-                    .carry = borrow == 0,
-                    .overflow = ((left ^ value) & (left ^ difference)) >> 31 != 0,
-                });
-            }
+            if (decoded.set_flags) self.writeFlags(result.flags);
         },
     }
+}
+
+fn addWithCarry(left: u32, right: u32, carry_in: bool) struct { value: u32, flags: Flags } {
+    const wide = @as(u64, left) + right + @intFromBool(carry_in);
+    const result: u32 = @truncate(wide);
+    return .{
+        .value = result,
+        .flags = .{
+            .negative = result >> 31 != 0,
+            .zero = result == 0,
+            .carry = wide >> 32 != 0,
+            .overflow = ((left ^ result) & (right ^ result)) >> 31 != 0,
+        },
+    };
 }
 
 const ShifterResult = struct { value: u32, carry: bool };

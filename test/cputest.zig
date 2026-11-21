@@ -288,7 +288,7 @@ const Report = struct {
             "TST", "TEQ", "CMP", "CMN", "ORR", "MOV", "BIC", "MVN",
         };
         const mnemonic = mnemonics[opcode];
-        if (opcode >= 8 and opcode <= 10) {
+        if (opcode >= 8 and opcode <= 11) {
             const source: u4 = @truncate(instruction >> 16);
             try self.style.cyan().print(self.writer, "  {s}{s} r{d}, {s}\n", .{
                 mnemonic, condition_suffix, source, operand,
