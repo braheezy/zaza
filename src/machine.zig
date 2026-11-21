@@ -8,6 +8,7 @@ const input = @import("input.zig");
 cpu: Cpu,
 bus: Bus,
 elapsed_cycles: u64 = 0,
+dma_cycles_pending: u64 = 0,
 
 const vblank_start = timing.vblank_start;
 
@@ -32,6 +33,15 @@ pub fn initCartridgeWithBios(
     self.cpu.registers[13] = 0x0300_7F00;
     self.cpu.banked.irq[0] = 0x0300_7FA0;
     self.cpu.banked.supervisor[0] = 0x0300_7FE0;
+    self.bus.post_boot = true;
+}
+
+pub fn initBios(self: *Machine, rom: []const u8, bios: *const [Bus.bios_size_bytes]u8) void {
+    self.* = .{
+        .cpu = .{},
+        .bus = .{ .rom = rom, .bios = bios, .dispcnt = 0x0080 },
+    };
+    self.cpu.refillArmPipeline(&self.bus);
 }
 
 pub fn step(self: *Machine) !void {
@@ -47,13 +57,22 @@ pub fn step(self: *Machine) !void {
     }
     // BIOS data visibility depends on the executing instruction, not lookahead fetches.
     self.bus.executing_bios = self.cpu.instruction_address < Bus.bios_size_bytes;
-    defer self.bus.executing_bios = false;
-    try self.cpu.step(&self.bus);
+    const result = self.cpu.step(&self.bus);
+    self.bus.executing_bios = false;
+    try result;
+    self.bus.runDma(.immediate);
 }
 
 /// Advance the clock for one CPU instruction, IRQ entry, or halted interval.
 /// Cartridge prefetch hits and contention are not included in the bus costs.
 pub fn stepTimed(self: *Machine) !void {
+    if (self.dma_cycles_pending != 0) {
+        // A display-triggered DMA owns the bus before the CPU can step again.
+        const cycles = self.dma_cycles_pending;
+        self.dma_cycles_pending = 0;
+        self.advanceClock(cycles);
+        return;
+    }
     if (self.bus.halted and !self.bus.hasEnabledInterrupt()) {
         const line_phase = self.elapsed_cycles % timing.cycles_per_line;
         const display_cycles = if (line_phase < timing.hblank_start)
@@ -98,7 +117,9 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
 fn advanceClock(self: *Machine, cycles: u64) void {
     const old_phase = self.elapsed_cycles % timing.cycles_per_frame;
     self.elapsed_cycles += cycles;
+    const before_dma = self.bus.bus_cycles;
     self.bus.advanceDevices(old_phase, cycles);
+    self.dma_cycles_pending += self.bus.bus_cycles - before_dma;
 }
 
 test "ARM compare with Rd set to PC restores status and continues sequentially" {
@@ -306,6 +327,35 @@ test "a BIOS SWI can read its literal and leaves a protected fetch word after re
     try machine.step();
     try std.testing.expectEqual(Bus.rom_base + 8, machine.cpu.instruction_address);
     try machine.step();
+    try std.testing.expectEqual(@as(u32, 0xE1A0_0000), machine.cpu.readRegister(3));
+}
+
+test "cold boot executes BIOS reset code before the cartridge reads POSTFLG and the latch" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x00, 0x20, 0xD1, 0xE5, // LDRB r2, [r1] (POSTFLG)
+        0x00, 0x30, 0x94, 0xE5, // LDR r3, [r4] (protected BIOS)
+    };
+    const bios = comptime blk: {
+        var bytes: [Bus.bios_size_bytes]u8 = @splat(0);
+        std.mem.writeInt(u32, bytes[0..4], 0xE59F_100C, .little); // LDR r1, [pc, #12]
+        std.mem.writeInt(u32, bytes[4..8], 0xE3A0_0001, .little); // MOV r0, #1
+        std.mem.writeInt(u32, bytes[8..12], 0xE5C1_0000, .little); // STRB r0, [r1]
+        std.mem.writeInt(u32, bytes[12..16], 0xE3A0_0302, .little); // MOV r0, #0x08000000
+        std.mem.writeInt(u32, bytes[16..20], 0xE12F_FF10, .little); // BX r0
+        std.mem.writeInt(u32, bytes[20..24], 0x0400_0300, .little);
+        std.mem.writeInt(u32, bytes[24..28], 0xE1A0_0000, .little); // Last BIOS fetch.
+        break :blk bytes;
+    };
+    var machine: Machine = undefined;
+    machine.initBios(&rom, &bios);
+    try std.testing.expectEqual(@as(u32, 0), machine.cpu.instruction_address);
+    try std.testing.expectEqual(@as(u8, 0), machine.bus.readData(u8, 0x0400_0300));
+    for (0..5) |_| try machine.stepTimed();
+    try std.testing.expectEqual(Bus.rom_base, machine.cpu.instruction_address);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 1), machine.cpu.readRegister(2));
+    try machine.stepTimed();
     try std.testing.expectEqual(@as(u32, 0xE1A0_0000), machine.cpu.readRegister(3));
 }
 

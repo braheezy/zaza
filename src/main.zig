@@ -2,14 +2,19 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = (try init.minimal.args.toSlice(arena))[1..];
     const with_bios = args.len >= 2 and std.mem.eql(u8, args[0], "--bios");
-    const run_args = if (with_bios) args[2..] else args;
+    const remaining = if (with_bios) args[2..] else args;
+    const boot = remaining.len != 0 and std.mem.eql(u8, remaining[0], "--boot");
+    const run_args = if (boot) remaining[1..] else remaining;
     const bios = if (with_bios) try loadBios(init.io, arena, args[1]) else bundled_bios;
     if (run_args.len > 1 and std.mem.eql(u8, run_args[0], "replay")) {
-        return replayInput(init.io, arena, bios, run_args[1..]);
+        return replayInput(init.io, arena, bios, boot, run_args[1..]);
     }
 
     const run: struct { rom: []const u8, steps: usize, output: []const u8 } = switch (run_args.len) {
-        1 => .{ .rom = &mode3_demo_rom, .steps = mode3_demo_steps, .output = run_args[0] },
+        1 => if (boot)
+            return error.BootNeedsCartridge
+        else
+            .{ .rom = &mode3_demo_rom, .steps = mode3_demo_steps, .output = run_args[0] },
         3 => blk: {
             const steps = try std.fmt.parseInt(usize, run_args[1], 10);
             if (steps == 0) return error.InvalidStepCount;
@@ -19,8 +24,9 @@ pub fn main(init: std.process.Init) !void {
         else => {
             std.debug.print(
                 "Usage: zaza <output.bmp>\n" ++
-                    "       zaza [--bios <bios.bin>] <input.gba> <steps> <output.bmp>\n" ++
-                    "       zaza [--bios <bios.bin>] replay <input.gba> <frames> <output.bmp> " ++
+                    "       zaza [--bios <bios.bin>] [--boot] <input.gba> <steps> <output.bmp>\n" ++
+                    "       zaza [--bios <bios.bin>] [--boot] replay <input.gba> " ++
+                    "<frames> <output.bmp> " ++
                     "(--input <script> | --input-file <path>)\n",
                 .{},
             );
@@ -29,7 +35,9 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var frame: video.Frame = undefined;
-    try captureBitmap(run.rom, bios, run.steps, &frame);
+    var machine: Machine = undefined;
+    if (boot) machine.initBios(run.rom, bios) else machine.initCartridgeWithBios(run.rom, bios);
+    try captureMachineBitmap(&machine, run.steps, &frame);
 
     try writeBitmap(init.io, run.output, &frame);
 }
@@ -58,6 +66,7 @@ fn replayInput(
     io: std.Io,
     arena: std.mem.Allocator,
     bios: *const [Bus.bios_size_bytes]u8,
+    boot: bool,
     args: []const [:0]const u8,
 ) !void {
     if (args.len != 5) return error.InvalidReplayArguments;
@@ -76,7 +85,7 @@ fn replayInput(
 
     const rom = try loadRom(io, arena, args[0]);
     var machine: Machine = undefined;
-    machine.initCartridgeWithBios(rom, bios);
+    if (boot) machine.initBios(rom, bios) else machine.initCartridgeWithBios(rom, bios);
     var replay: input.Replay = .{ .remaining = changes };
     for (0..frames) |index| {
         machine.runFrame(replay.buttonsForFrame(@intCast(index))) catch |err| {
@@ -106,6 +115,10 @@ pub fn captureBitmap(
 ) !void {
     var machine: Machine = undefined;
     machine.initCartridgeWithBios(rom, bios);
+    try captureMachineBitmap(&machine, steps, frame);
+}
+
+fn captureMachineBitmap(machine: *Machine, steps: usize, frame: *video.Frame) !void {
     for (0..steps) |step| {
         const address = machine.cpu.instruction_address;
         machine.stepTimed() catch |err| {

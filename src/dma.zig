@@ -3,6 +3,8 @@ const DMA = @This();
 
 pub const base: u32 = 0x0400_00B0;
 pub const end: u32 = base + 4 * 12;
+pub const enable: u16 = 1 << 15;
+pub const Trigger = enum(u2) { immediate, vblank, hblank, special };
 channels: [4]Channel = @splat(.{}),
 
 pub const Channel = struct {
@@ -10,10 +12,24 @@ pub const Channel = struct {
     destination: u32 = 0,
     count: u16 = 0,
     control: u16 = 0,
+    next_source: u32 = 0,
+    next_destination: u32 = 0,
+
+    pub fn trigger(self: Channel) Trigger {
+        return @enumFromInt(@as(u2, @truncate(self.control >> 12)));
+    }
 };
 
 pub fn contains(address: u32) bool {
     return address >= base and address < end;
+}
+
+pub fn sourceMask(index: usize) u32 {
+    return if (index == 0) 0x07FF_FFFF else 0x0FFF_FFFF;
+}
+
+pub fn destinationMask(index: usize) u32 {
+    return if (index == 3) 0x0FFF_FFFF else 0x07FF_FFFF;
 }
 
 pub fn write(self: *DMA, comptime T: type, address: u32, value: T) void {
@@ -30,24 +46,28 @@ pub fn write(self: *DMA, comptime T: type, address: u32, value: T) void {
             const shift: u5 = @intCast((register_offset % 4) * 8);
             const target = if (register_offset < 4) &channel.source else &channel.destination;
             const mask: u32 = if (register_offset < 4)
-                (if (channel_index == 0) 0x07FF_FFFF else 0x0FFF_FFFF)
+                sourceMask(channel_index)
             else
-                (if (channel_index == 3) 0x0FFF_FFFF else 0x07FF_FFFF);
+                destinationMask(channel_index);
             target.* = ((target.* & ~(@as(u32, 0xFF) << shift)) |
                 (@as(u32, byte) << shift)) & mask;
         } else {
             const shift: u4 = @intCast((register_offset & 1) * 8);
             const target = if (register_offset < 10) &channel.count else &channel.control;
-            // Enabling DMA needs scheduling, bus arbitration and transfer timing.
-            if (register_offset == 11 and byte & 0x80 != 0) {
-                @panic("DMA transfers are not modeled");
-            }
+            const was_enabled = channel.control & enable != 0;
             const mask: u16 = if (register_offset < 10)
                 (if (channel_index == 3) 0xFFFF else 0x3FFF)
             else
                 (if (channel_index == 3) 0xFFE0 else 0xF7E0);
             target.* = ((target.* & ~(@as(u16, 0xFF) << shift)) |
                 (@as(u16, byte) << shift)) & mask;
+            if (register_offset == 11 and !was_enabled and channel.control & enable != 0) {
+                if (channel.trigger() == .special or channel.control & (1 << 11) != 0) {
+                    @panic("Special DMA triggers are unsupported");
+                }
+                channel.next_source = channel.source;
+                channel.next_destination = channel.destination;
+            }
         }
     }
 }

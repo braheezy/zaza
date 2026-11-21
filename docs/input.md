@@ -40,3 +40,14 @@ Give each run a fresh output path to avoid overwriting a previous capture. The
 replay uses emulated time, so its input is independent of host timing or window
 focus. To drive the machine from Zig, use `Machine.runFrame(buttons)` with a
 complete mask built from `input.Button` values.
+
+Use `--boot` before the ROM path or the `replay` command to run the BIOS from
+its reset vector. Replay frame numbers then include the BIOS startup sequence.
+For example, the jsmolka BIOS test reaches its results screen within this run.
+
+```sh
+zig-out/bin/zaza --boot replay /path/to/bios.gba 400 /tmp/bios-test.bmp \
+  --input '0 none'
+```
+
+To select a different BIOS, place `--bios /path/to/bios.bin` before `--boot`.

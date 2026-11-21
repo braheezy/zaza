@@ -31,6 +31,7 @@ pub const waitcnt_address: u32 = 0x0400_0204;
 const waitcnt_write_mask: u16 = 0x5FFF;
 const waitcnt_prefetch_enable: u16 = 1 << 14;
 pub const ime_address: u32 = 0x0400_0208;
+const postflg_address: u32 = 0x0400_0300;
 pub const haltcnt_address: u32 = 0x0400_0301;
 const haltcnt_stop: u8 = 1 << 7;
 pub const bios_size_bytes = 16 * 1024;
@@ -56,6 +57,7 @@ bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
 // Cartridge fast boot starts before any emulated BIOS instruction fetch.
 bios_fetch_word: u32 = 0,
+post_boot: bool = false,
 halted: bool = false,
 ewram: [ewram_size_bytes]u8 = @splat(0),
 iwram: [iwram_size_bytes]u8 = @splat(0),
@@ -122,10 +124,14 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
     var events: u14 = 0;
     if (cycles >= timing.cyclesUntil(old_phase, timing.vblank_start, timing.cycles_per_frame)) {
         events |= 1;
+        self.runDma(.vblank);
     }
     const old_line_phase = old_phase % timing.cycles_per_line;
-    if (cycles >= timing.cyclesUntil(old_line_phase, timing.hblank_start, timing.cycles_per_line)) {
+    const until_hblank = timing.cyclesUntil(old_line_phase, timing.hblank_start, timing.cycles_per_line);
+    if (cycles >= until_hblank) {
         events |= 2;
+        const edge = (old_phase + until_hblank) % timing.cycles_per_frame;
+        if (edge < timing.vblank_start) self.runDma(.hblank);
     }
     if (compare < timing.lines_per_frame) {
         const edge = @as(u64, compare) * timing.cycles_per_line;
@@ -150,6 +156,53 @@ pub fn hasEnabledInterrupt(self: *const Bus) bool {
 
 pub fn irqLine(self: *const Bus) bool {
     return self.ime_enabled and self.hasEnabledInterrupt();
+}
+
+pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
+    for (0..self.dma.channels.len) |index| {
+        const channel = self.dma.channels[index];
+        if (channel.control & DMA.enable == 0 or channel.trigger() != trigger) continue;
+        if (trigger == .immediate or channel.control & (1 << 9) == 0) {
+            self.dma.channels[index].control &= ~DMA.enable;
+        }
+        if (channel.control & (1 << 10) == 0) {
+            self.transferDma(u16, index, channel);
+        } else {
+            self.transferDma(u32, index, channel);
+        }
+        if (channel.control & (1 << 14) != 0) {
+            self.requestInterrupt(@as(u14, 1) << @intCast(8 + index));
+        }
+    }
+}
+
+fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel) void {
+    const count: u32 = if (channel.count != 0) channel.count else if (index == 3) 0x10000 else 0x4000;
+    const source_step = switch ((channel.control >> 7) & 3) {
+        0 => @sizeOf(T),
+        1 => -%@as(u32, @sizeOf(T)),
+        2 => 0,
+        else => @panic("Prohibited DMA source mode"),
+    };
+    const destination_step = switch ((channel.control >> 5) & 3) {
+        1 => -%@as(u32, @sizeOf(T)),
+        2 => 0,
+        else => @sizeOf(T),
+    };
+    var source = alignDataAddress(T, channel.next_source);
+    var destination = alignDataAddress(T, channel.next_destination);
+    // Charge the transfers on the shared bus. Arbitration and startup delays are approximate.
+    self.bus_cycles += 2;
+    for (0..count) |_| {
+        if (source < ewram_base) @panic("DMA reads below EWRAM are unsupported");
+        const value = self.readData(T, source);
+        self.writeData(T, destination, value);
+        source = (source +% source_step) & DMA.sourceMask(index);
+        destination = (destination +% destination_step) & DMA.destinationMask(index);
+    }
+    self.dma.channels[index].next_source = source;
+    self.dma.channels[index].next_destination =
+        if ((channel.control >> 5) & 3 == 3) channel.destination else destination;
 }
 
 pub fn prefetchEnabled(self: *const Bus) bool {
@@ -220,6 +273,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (aligned_address < ewram_base or aligned_address >= 0x1000_0000) {
         return wordLane(T, self.prefetch_word, aligned_address);
     }
+    if (aligned_address == postflg_address) return @intFromBool(self.post_boot);
     if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
         var result: T = 0;
         for (0..@sizeOf(T)) |index| {
@@ -281,6 +335,10 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
 }
 
 fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) void {
+    if (T == u8 and aligned_address == postflg_address) {
+        if (self.executing_bios) self.post_boot = value & 1 != 0;
+        return;
+    }
     if (T == u8 and aligned_address == haltcnt_address) {
         if (!self.executing_bios) return;
         if (value & haltcnt_stop != 0) @panic("GBA STOP mode is unsupported");
@@ -699,6 +757,28 @@ test "BIOS DMA reset stores reach every channel and the unused trailing gap" {
     for (bus.dma.channels) |channel| {
         try std.testing.expectEqualDeep(DMA.Channel{}, channel);
     }
+}
+
+test "HBlank DMA repeats with a running source and a reloaded destination" {
+    var bus: Bus = .{ .rom = &.{} };
+    const channel = DMA.end - 12;
+    bus.writeData(u32, iwram_base, 0x5678_1234);
+    bus.writeData(u32, channel, iwram_base);
+    bus.writeData(u32, channel + 4, palette_base);
+    // DMA3 transfers one halfword on each visible HBlank, reloading the destination.
+    bus.writeData(u32, channel + 8, 0xE260_0001);
+
+    bus.advanceDevices(0, timing.hblank_start - 1);
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, palette_base));
+    bus.advanceDevices(timing.hblank_start - 1, 1);
+    try std.testing.expectEqual(@as(u16, 0x1234), bus.readData(u16, palette_base));
+    try std.testing.expectEqual(@as(u16, 1 << 11), bus.irq_flags);
+    bus.advanceDevices(timing.hblank_start, timing.cycles_per_line);
+    try std.testing.expectEqual(@as(u16, 0x5678), bus.readData(u16, palette_base));
+    try std.testing.expect(bus.readData(u16, channel + 10) & DMA.enable != 0);
+
+    bus.advanceDevices(timing.vblank_start, timing.hblank_start);
+    try std.testing.expectEqual(@as(u16, 0x5678), bus.readData(u16, palette_base));
 }
 
 test "keypad word accesses pair active-low input with masked control" {
