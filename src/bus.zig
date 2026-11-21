@@ -30,7 +30,7 @@ irq_enable: u16 = 0,
 irq_flags: u16 = 0,
 ime_enabled: bool = false,
 rom_fetch_cycles: u64 = 0,
-iwram_write_cycles: u64 = 0,
+iwram_data_cycles: u64 = 0,
 next_fetch_nonsequential: bool = false,
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
@@ -72,10 +72,11 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     return value;
 }
 
-pub fn readData(self: *const Bus, comptime T: type, address: u32) T {
+pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
     if (iwramOffset(aligned_address)) |offset| {
+        self.chargeIwramDataAccess();
         return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
     }
     if (T == u16) {
@@ -132,8 +133,12 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const offset = iwramOffset(aligned_address) orelse
         std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), address });
     std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
-    // IWRAM is 32-bit wide. The store also breaks the cartridge fetch sequence.
-    self.iwram_write_cycles += 1;
+    self.chargeIwramDataAccess();
+}
+
+fn chargeIwramDataAccess(self: *Bus) void {
+    // One IWRAM access fits in a single cycle and breaks the ROM fetch sequence.
+    self.iwram_data_cycles += 1;
     self.next_fetch_nonsequential = true;
 }
 
@@ -204,7 +209,7 @@ test "Thumb fetch reads two bytes at a halfword offset" {
 }
 
 test "ROM data reads align to their transfer width without rotating" {
-    const bus: Bus = .{ .rom = &.{ 0x11, 0x22, 0x33, 0x44 } };
+    var bus: Bus = .{ .rom = &.{ 0x11, 0x22, 0x33, 0x44 } };
     const address = rom_base + 3;
     try std.testing.expectEqual(@as(u8, 0x44), bus.readData(u8, address));
     try std.testing.expectEqual(@as(u16, 0x4433), bus.readData(u16, address));

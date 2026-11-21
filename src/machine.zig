@@ -41,7 +41,7 @@ pub fn stepTimed(self: *Machine) !void {
         return error.UntimedInstruction;
     }
 
-    // None of the supported instructions needs a CPU-internal cycle.
+    // Only admit instructions whose complete cost is tracked below.
     const mov_immediate = instruction & 0xFFF0_0000 == 0xE3A0_0000 and
         instruction >> 12 & 0xF != 0xF;
     if (instruction >> 24 == 0xEA) {
@@ -50,24 +50,26 @@ pub fn stepTimed(self: *Machine) !void {
         if (!self.romContainsWord(target) or !self.romContainsWord(target +% 4)) {
             return error.UntimedInstruction;
         }
-    } else if (!mov_immediate and !self.isTimedIwramStore(instruction)) {
+    } else if (!mov_immediate and !self.isTimedIwramTransfer(instruction)) {
         return error.UntimedInstruction;
     }
 
     const fetch_cycles_before = self.bus.rom_fetch_cycles;
-    const write_cycles_before = self.bus.iwram_write_cycles;
+    const data_cycles_before = self.bus.iwram_data_cycles;
+    const internal_cycles_before = self.cpu.internal_cycles;
     try self.step();
     const fetch_cycles = self.bus.rom_fetch_cycles - fetch_cycles_before;
-    const write_cycles = self.bus.iwram_write_cycles - write_cycles_before;
-    self.advanceClock(fetch_cycles + write_cycles);
+    const data_cycles = self.bus.iwram_data_cycles - data_cycles_before;
+    const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
+    self.advanceClock(fetch_cycles + data_cycles + internal_cycles);
 }
 
-fn isTimedIwramStore(self: *Machine, instruction: u32) bool {
-    // Limit timing to unconditional STR Rd, [Rn], without offset or writeback.
-    if (instruction & 0xFFF0_0FFF != 0xE580_0000) return false;
+fn isTimedIwramTransfer(self: *Machine, instruction: u32) bool {
+    // Match unconditional word LDR/STR Rd, [Rn], without offset or writeback.
+    if (instruction & 0xFFE0_0FFF != 0xE580_0000) return false;
     const base_register: u4 = @truncate(instruction >> 16);
-    const source_register: u4 = @truncate(instruction >> 12);
-    if (base_register == 15 or source_register == 15) return false;
+    const data_register: u4 = @truncate(instruction >> 12);
+    if (base_register == 15 or data_register == 15) return false;
     const address = self.cpu.readRegister(base_register);
     return address & 3 == 0 and address >= Bus.iwram_base and
         address - Bus.iwram_base < self.bus.iwram.len;
@@ -130,7 +132,8 @@ test "timed IWRAM store charges one data cycle and breaks the next ROM fetch" {
     machine.cpu.registers[1] = Bus.iwram_base;
 
     try machine.stepTimed();
-    try std.testing.expectEqual(@as(u32, 42), machine.bus.readData(u32, Bus.iwram_base));
+    try std.testing.expectEqualSlices(u8, &.{ 42, 0, 0, 0 }, machine.bus.iwram[0..4]);
+    try std.testing.expectEqual(@as(u64, 0), machine.cpu.internal_cycles);
     try std.testing.expectEqual(@as(u64, 6 + 1), machine.elapsed_cycles);
 
     try machine.stepTimed();
@@ -139,12 +142,39 @@ test "timed IWRAM store charges one data cycle and breaks the next ROM fetch" {
     try std.testing.expectEqual(@as(u64, 15 + 6), machine.elapsed_cycles);
 }
 
-test "timed stepping rejects an unmodeled load before advancing the CPU or clock" {
+test "timed IWRAM load charges a data cycle and an internal cycle" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x00, 0x00, 0x91, 0xE5, // LDR r0, [r1]
+        0x01, 0x20, 0xA0, 0xE3, // MOV r2, #1
+        0x02, 0x20, 0xA0, 0xE3, // MOV r2, #2
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    machine.cpu.registers[1] = Bus.iwram_base;
+    // Seed the bytes without issuing a bus transaction before the load.
+    std.mem.writeInt(u32, machine.bus.iwram[0..4], 42, .little);
+
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[0]);
+    try std.testing.expectEqual(@as(u64, 1), machine.bus.iwram_data_cycles);
+    try std.testing.expectEqual(@as(u64, 1), machine.cpu.internal_cycles);
+    try std.testing.expectEqual(@as(u64, 6 + 1 + 1), machine.elapsed_cycles);
+
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 8 + 8), machine.elapsed_cycles);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 16 + 6), machine.elapsed_cycles);
+}
+
+test "timed stepping rejects a load outside IWRAM before advancing the CPU or clock" {
     const std = @import("std");
     const rom = [_]u8{ 0x00, 0x00, 0x91, 0xE5, 0, 0, 0, 0, 0, 0, 0, 0 }; // LDR r0, [r1]
     var machine: Machine = undefined;
     machine.initCartridge(&rom);
-    machine.cpu.registers[1] = Bus.iwram_base;
+    machine.cpu.registers[1] = Bus.rom_base;
     try std.testing.expectError(error.UntimedInstruction, machine.stepTimed());
     try std.testing.expectEqual(Bus.rom_base, machine.cpu.instruction_address);
     try std.testing.expectEqual(@as(u64, 0), machine.elapsed_cycles);

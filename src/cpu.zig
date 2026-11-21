@@ -21,6 +21,8 @@ pipeline: ?[2]u32 = null,
 cpsr: u32 = 0xD3, // Supervisor mode, ARM state, IRQ and FIQ masked.
 // FIQ, Supervisor, Abort, IRQ, Undefined, in bank order.
 spsr: [5]u32 = @splat(0),
+// Counts only the internal cycles explicitly modeled by instruction handlers.
+internal_cycles: u64 = 0,
 
 pub const BankedRegisters = struct {
     fiq: [7]u32 = @splat(0),
@@ -278,6 +280,8 @@ fn executeArmTransfer(
         .signed_byte => signExtendByte(bus.readData(u8, address)),
         .signed_halfword => readSignedHalfword(bus, address),
     };
+    // The load completes with an internal cycle before the result is available.
+    self.internal_cycles += 1;
     if (writeback and base_register != data_register) {
         self.writeGeneralRegister(base_register, updated_base);
     }
