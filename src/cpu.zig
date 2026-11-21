@@ -86,7 +86,6 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
             const shift_register: u4 = @truncate(instruction >> 8);
             if (shift_register == program_counter) return error.UnsupportedInstruction;
         }
-        if (operand_register == program_counter) return error.UnsupportedInstruction;
     }
     // Bits 27–26 select the encoding family; bits 24–21 name the ALU operation.
     const family: u2 = @truncate(instruction >> 26);
@@ -125,14 +124,12 @@ fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDa
             if (source != 0) return error.UnsupportedInstruction;
         },
         .and_, .eor, .orr, .bic, .tst, .teq => {
-            if (source == program_counter) return error.UnsupportedInstruction;
             // With S clear, these test opcodes overlap other encoding families.
             if (decoded.operation == .tst or decoded.operation == .teq) {
                 if (!set_flags) return error.UnsupportedInstruction;
             }
         },
         .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
-            if (source == program_counter) return error.UnsupportedInstruction;
             if (decoded.operation == .cmp or decoded.operation == .cmn) {
                 if (!set_flags) return error.UnsupportedInstruction;
             }
@@ -169,6 +166,13 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
         .shifted_register => |shift| self.shiftedRegisterOperand(shift),
     };
     const value = operand.value;
+    const register_shift = switch (decoded.operand) {
+        .immediate => false,
+        .shifted_register => |shift| switch (shift.amount) {
+            .immediate => false,
+            .register => true,
+        },
+    };
     const source = decoded.source;
     const destination = decoded.destination;
     switch (decoded.operation) {
@@ -176,10 +180,10 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
             const result = switch (decoded.operation) {
                 .mov => value,
                 .mvn => ~value,
-                .and_, .tst => self.readRegister(source) & value,
-                .eor, .teq => self.readRegister(source) ^ value,
-                .orr => self.readRegister(source) | value,
-                .bic => self.readRegister(source) & ~value,
+                .and_, .tst => self.readArmAluRegister(source, register_shift) & value,
+                .eor, .teq => self.readArmAluRegister(source, register_shift) ^ value,
+                .orr => self.readArmAluRegister(source, register_shift) | value,
+                .bic => self.readArmAluRegister(source, register_shift) & ~value,
                 else => unreachable,
             };
             switch (decoded.operation) {
@@ -194,7 +198,7 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) void {
             });
         },
         .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
-            const left = self.readRegister(source);
+            const left = self.readArmAluRegister(source, register_shift);
             const result = switch (decoded.operation) {
                 .add, .cmn => addWithCarry(left, value, false),
                 .adc => addWithCarry(left, value, old_flags.carry),
@@ -230,7 +234,11 @@ fn addWithCarry(left: u32, right: u32, carry_in: bool) struct { value: u32, flag
 const ShifterResult = struct { value: u32, carry: bool };
 
 fn shiftedRegisterOperand(self: *Cpu, shift: ArmDataProcessing.RegisterShift) ShifterResult {
-    const value = self.readRegister(shift.register);
+    const register_shift = switch (shift.amount) {
+        .immediate => false,
+        .register => true,
+    };
+    const value = self.readArmAluRegister(shift.register, register_shift);
     const kind = shift.kind;
     const amount = switch (shift.amount) {
         .immediate => |count| count,
@@ -323,6 +331,12 @@ fn activeBank(self: *Cpu) []u32 {
     };
 }
 
+fn readArmAluRegister(self: *Cpu, index: u4, register_shift: bool) u32 {
+    // Register-controlled shifts read ALU operands one pipeline cycle later.
+    if (index == program_counter and register_shift) return self.instruction_address +% 12;
+    return self.readRegister(index);
+}
+
 pub fn readRegister(self: *Cpu, index: u4) u32 {
     if (index == program_counter) {
         const offset: u32 = if (self.cpsr & thumb_bit != 0) 4 else 8;
@@ -353,6 +367,15 @@ fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
 fn mode(self: *Cpu) Mode {
     const mode_bits: u5 = @truncate(self.cpsr);
     return @fromBackingInt(mode_bits);
+}
+
+test "ARM ALU PC operand depends on the shift encoding" {
+    var cpu: Cpu = .{ .instruction_address = 0x0800_0000 };
+    // MOV r0, pc; MOV r0, pc, LSL r1 (r1 contains zero).
+    cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_000F));
+    try std.testing.expectEqual(@as(u32, 0x0800_0008), cpu.registers[0]);
+    cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_011F));
+    try std.testing.expectEqual(@as(u32, 0x0800_000C), cpu.registers[0]);
 }
 
 test "SP banks follow mode and User and System share storage" {
