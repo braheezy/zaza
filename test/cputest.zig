@@ -294,7 +294,18 @@ const Report = struct {
                     visibleRegister(vector.final, destination),
                 });
             } else {
-                try self.explainImmediate(vector);
+                if (std.mem.eql(u8, family, "arm_swi")) {
+                    try self.style.cyan().print(self.writer, "  SWI #0x{x} → PC 0x{x:0>8}\n", .{
+                        vector.opcode & 0xFF_FFFF, vector.final.registers[15] -% 8,
+                    });
+                } else if (std.mem.startsWith(u8, family, "arm_msr_")) {
+                    const status = if (vector.opcode & (1 << 22) != 0) "SPSR" else "CPSR";
+                    try self.style.cyan().print(self.writer, "  MSR {s} (opcode 0x{x:0>8})\n", .{
+                        status, vector.opcode,
+                    });
+                } else {
+                    try self.explainImmediate(vector);
+                }
             }
         }
 
@@ -383,7 +394,10 @@ const Report = struct {
         if (!std.mem.eql(u8, family, "arm_data_proc_immediate")) {
             if (!std.mem.eql(u8, family, "arm_data_proc_immediate_shift")) {
                 if (!std.mem.eql(u8, family, "arm_data_proc_register_shift") and
-                    !std.mem.eql(u8, family, "arm_b_bl") and !std.mem.eql(u8, family, "arm_mrs"))
+                    !std.mem.eql(u8, family, "arm_b_bl") and !std.mem.eql(u8, family, "arm_mrs") and
+                    !std.mem.eql(u8, family, "arm_swi") and
+                    !std.mem.eql(u8, family, "arm_msr_imm") and
+                    !std.mem.eql(u8, family, "arm_msr_reg"))
                 {
                     return error.UnsupportedInstruction;
                 }

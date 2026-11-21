@@ -66,6 +66,26 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         _ = self.advanceArmPipeline(bus);
         return;
     }
+    if (instruction & 0x0FB0_FFF0 == 0x0120_F000 or
+        instruction & 0x0FB0_F000 == 0x0320_F000)
+    {
+        try self.executeArmMsr(instruction);
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
+    if (instruction >> 24 & 0xF == 0xF) {
+        const condition: u4 = @truncate(instruction >> 28);
+        if (condition == 0xF) return error.UnsupportedInstruction;
+        _ = self.advanceArmPipeline(bus);
+        if (conditionPassed(condition, self.readFlags())) {
+            self.spsr[1] = self.cpsr;
+            self.cpsr = (self.cpsr & ~@as(u32, 0x3F)) | 0x93;
+            self.writeGeneralRegister(link_register, self.instruction_address);
+            self.instruction_address = 0x08;
+            self.refillArmPipeline(bus);
+        }
+        return;
+    }
     const decoded = try decodeArmDataProcessing(instruction);
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
@@ -104,14 +124,57 @@ fn executeArmMrs(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!voi
     self.writeGeneralRegister(destination, value);
 }
 
+fn executeArmMsr(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!void {
+    const condition: u4 = @truncate(instruction >> 28);
+    if (condition == 0xF) return error.UnsupportedInstruction;
+    if (!conditionPassed(condition, self.readFlags())) return;
+
+    const value = if (instruction & (1 << 25) != 0) blk: {
+        const immediate: u8 = @truncate(instruction);
+        const rotation: u4 = @truncate(instruction >> 8);
+        break :blk std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
+    } else blk: {
+        const source: u4 = @truncate(instruction);
+        if (source == program_counter) return error.UnsupportedInstruction;
+        break :blk self.readRegister(source);
+    };
+    const fields: u4 = @truncate(instruction >> 16);
+    var mask: u32 = 0;
+    for (0..4) |field| {
+        if (fields & (@as(u4, 1) << @as(u2, @intCast(field))) != 0) {
+            mask |= @as(u32, 0xFF) << @as(u5, @intCast(field * 8));
+        }
+    }
+    if (instruction & (1 << 22) != 0) {
+        const index = self.savedStatusIndex() orelse return error.UnsupportedInstruction;
+        self.spsr[index] = (self.spsr[index] & ~mask) | (value & mask);
+        return;
+    }
+    // User mode can write only the selected flags byte, not the control bytes.
+    if (self.mode() == .user) mask &= 0xFF00_0000;
+    // MSR is not an instruction-set transition. Leave those encodings unsupported.
+    const updated = (self.cpsr & ~mask) | (value & mask);
+    if (updated & thumb_bit != 0) return error.UnsupportedInstruction;
+    switch (@as(u5, @truncate(updated))) {
+        0x10, 0x11, 0x12, 0x13, 0x17, 0x1B, 0x1F => {},
+        else => return error.UnsupportedInstruction,
+    }
+    self.cpsr = updated;
+}
+
 fn savedStatus(self: *Cpu) ?u32 {
+    const index = self.savedStatusIndex() orelse return null;
+    return self.spsr[index];
+}
+
+fn savedStatusIndex(self: *Cpu) ?usize {
     return switch (self.mode()) {
         .user, .system => null,
-        .fiq => self.spsr[0],
-        .supervisor => self.spsr[1],
-        .abort => self.spsr[2],
-        .irq => self.spsr[3],
-        .undefined_instruction => self.spsr[4],
+        .fiq => 0,
+        .supervisor => 1,
+        .abort => 2,
+        .irq => 3,
+        .undefined_instruction => 4,
     };
 }
 
