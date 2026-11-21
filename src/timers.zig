@@ -2,6 +2,7 @@ const std = @import("std");
 const Timers = @This();
 
 pub const base: u32 = 0x0400_0100;
+const prescalers = [_]u16{ 1, 64, 256, 1024 };
 channels: [4]Timer = @splat(.{}),
 
 pub const Timer = struct {
@@ -58,7 +59,19 @@ pub fn write(self: *Timers, comptime T: type, address: u32, value: T) void {
     }
 }
 
-// Advances an instruction-sized batch. Sub-instruction enable delays and audio
+// Cascade timers only tick when a clock-driven timer overflows.
+pub fn cyclesUntilOverflow(self: *const Timers) u64 {
+    var earliest: u64 = std.math.maxInt(u64);
+    for (self.channels) |timer| {
+        if (timer.control & 0x80 == 0 or timer.control & 4 != 0) continue;
+        const ticks = @as(u64, 0x10000) - timer.counter;
+        const period = prescalers[timer.control & 3];
+        earliest = @min(earliest, @max(1, ticks * period -| timer.phase));
+    }
+    return earliest;
+}
+
+// Advances a batch of cycles. Sub-instruction enable delays and audio
 // FIFO clocks still need scheduler events when those devices are implemented.
 pub fn advance(self: *Timers, cycles: u64) u14 {
     var previous_overflows: u64 = 0;
@@ -70,8 +83,7 @@ pub fn advance(self: *Timers, cycles: u64) u14 {
         }
         var ticks = previous_overflows;
         if (timer.control & 4 == 0) {
-            const divisor = [_]u16{ 1, 64, 256, 1024 };
-            const period = divisor[timer.control & 3];
+            const period = prescalers[timer.control & 3];
             ticks = cycles / period;
             const remainder = cycles % period + timer.phase;
             ticks += remainder / period;

@@ -31,6 +31,8 @@ pub const waitcnt_address: u32 = 0x0400_0204;
 const waitcnt_write_mask: u16 = 0x5FFF;
 const waitcnt_prefetch_enable: u16 = 1 << 14;
 pub const ime_address: u32 = 0x0400_0208;
+pub const haltcnt_address: u32 = 0x0400_0301;
+const haltcnt_stop: u8 = 1 << 7;
 pub const bios_size_bytes = 16 * 1024;
 const irq_source_mask: u16 = 0x3FFF;
 pub const palette_base: u32 = 0x0500_0000;
@@ -52,6 +54,7 @@ keypad_control: u16 = 0,
 display_registers: DisplayRegisters = .{},
 bios: ?*const [bios_size_bytes]u8 = null,
 executing_bios: bool = false,
+halted: bool = false,
 ewram: [ewram_size_bytes]u8 = @splat(0),
 iwram: [iwram_size_bytes]u8 = @splat(0),
 palette: [palette_size_bytes]u8 = @splat(0),
@@ -138,8 +141,12 @@ fn writeDisplayStatus(self: *Bus, value: u16) void {
     }
 }
 
+pub fn hasEnabledInterrupt(self: *const Bus) bool {
+    return self.irq_enable & self.irq_flags != 0;
+}
+
 pub fn irqLine(self: *const Bus) bool {
-    return self.ime_enabled and (self.irq_enable & self.irq_flags) != 0;
+    return self.ime_enabled and self.hasEnabledInterrupt();
 }
 
 pub fn prefetchEnabled(self: *const Bus) bool {
@@ -254,6 +261,12 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
 }
 
 fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) void {
+    if (T == u8 and aligned_address == haltcnt_address) {
+        if (!self.executing_bios) return;
+        if (value & haltcnt_stop != 0) @panic("GBA STOP mode is unsupported");
+        self.halted = true;
+        return;
+    }
     if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
         for (0..@sizeOf(T)) |index| {
             const byte_address = aligned_address + @as(u32, @intCast(index));

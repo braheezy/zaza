@@ -35,6 +35,10 @@ pub fn initCartridgeWithBios(
 }
 
 pub fn step(self: *Machine) !void {
+    if (self.bus.halted) {
+        if (!self.bus.hasEnabledInterrupt()) return;
+        self.bus.halted = false;
+    }
     // Sample IRQ before executing the next queued instruction.
     if (self.bus.irqLine() and !self.cpu.irqMasked()) {
         if (self.bus.bios == null) return error.IrqNeedsBios;
@@ -47,9 +51,20 @@ pub fn step(self: *Machine) !void {
     try self.cpu.step(&self.bus);
 }
 
-/// Advance the clock for one supported CPU instruction or IRQ entry.
+/// Advance the clock for one CPU instruction, IRQ entry, or halted interval.
 /// Cartridge prefetch hits and contention are not included in the bus costs.
 pub fn stepTimed(self: *Machine) !void {
+    if (self.bus.halted and !self.bus.hasEnabledInterrupt()) {
+        const line_phase = self.elapsed_cycles % timing.cycles_per_line;
+        const display_cycles = if (line_phase < timing.hblank_start)
+            timing.hblank_start - line_phase
+        else
+            timing.cycles_per_line - line_phase;
+        // Timer and display events can wake the CPU. Line boundaries also
+        // let runToVBlank stop exactly at its target while the CPU sleeps.
+        self.advanceClock(@min(display_cycles, self.bus.timers.cyclesUntilOverflow()));
+        return;
+    }
     const bus_cycles_before = self.bus.bus_cycles;
     const internal_cycles_before = self.cpu.internal_cycles;
     try self.step();
@@ -61,11 +76,11 @@ pub fn stepTimed(self: *Machine) !void {
 /// Apply a full keypad snapshot and run to the next VBlank for frontends and replay.
 pub fn runFrame(self: *Machine, buttons: input.Buttons) !void {
     self.bus.setPressedButtons(buttons);
-    // Every supported instruction advances at least one cycle.
+    // Every timed step advances at least one cycle.
     try self.runToVBlank(timing.cycles_per_frame);
 }
 
-/// Stop on the first instruction boundary at or after the next VBlank edge.
+/// Stop on the first timed step boundary at or after the next VBlank edge.
 pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
     const phase = self.elapsed_cycles % timing.cycles_per_frame;
     const target = self.elapsed_cycles + timing.cyclesUntil(
@@ -219,6 +234,52 @@ test "cartridge SWI executes a BIOS handler that reads a BIOS literal" {
     try std.testing.expectEqual(@as(u32, 0x0300_7FE0), machine.cpu.readRegister(13));
     try machine.step();
     try std.testing.expectEqual(@as(u32, 0x1234_5678), machine.cpu.readRegister(0));
+}
+
+test "BIOS HALT wakes on a cascaded timer interrupt with IME disabled" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x00, 0x00, 0xC1, 0xE5, // STRB r0, [r1] outside BIOS is ignored.
+        0x02, 0x00, 0x00, 0xEF, // SWI
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    const bios = comptime blk: {
+        var bytes: [Bus.bios_size_bytes]u8 = @splat(0);
+        std.mem.writeInt(u32, bytes[8..12], 0xE5C1_0000, .little); // STRB r0, [r1]
+        std.mem.writeInt(u32, bytes[12..16], 0xE3A0_202A, .little); // MOV r2, #42
+        break :blk bytes;
+    };
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(&rom, &bios);
+    machine.cpu.registers[1] = Bus.haltcnt_address;
+
+    try machine.stepTimed();
+    try std.testing.expect(!machine.bus.halted);
+    try machine.stepTimed();
+    try machine.stepTimed();
+    try std.testing.expect(machine.bus.halted);
+
+    machine.bus.writeData(u16, Bus.ie_address, 1 << 4);
+    machine.bus.requestInterrupt(1); // A pending VBlank cannot wake without IE.
+    machine.bus.writeData(u32, 0x0400_0100, 0x0081_FFFF); // Timer 0 ticks every 64 cycles.
+    machine.bus.writeData(u32, 0x0400_0104, 0x00C4_FFFE); // Timer 1 overflows on the second cascade tick.
+    const halted_at = machine.elapsed_cycles;
+    const bus_cycles = machine.bus.bus_cycles;
+
+    try machine.stepTimed();
+    try std.testing.expectEqual(halted_at + 64, machine.elapsed_cycles);
+    try std.testing.expect(!machine.bus.hasEnabledInterrupt());
+    try machine.stepTimed();
+    try std.testing.expectEqual(halted_at + 128, machine.elapsed_cycles);
+    try std.testing.expectEqual(@as(u16, 0x11), machine.bus.irq_flags);
+    try std.testing.expectEqual(bus_cycles, machine.bus.bus_cycles);
+    try std.testing.expectEqual(@as(u32, 12), machine.cpu.instruction_address);
+
+    try machine.stepTimed();
+    try std.testing.expect(!machine.bus.halted);
+    try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[2]);
+    try std.testing.expectEqual(@as(u16, 0x11), machine.bus.irq_flags);
 }
 
 test "Machine takes a pending IRQ at a Thumb instruction boundary" {
