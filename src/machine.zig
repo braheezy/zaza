@@ -575,7 +575,7 @@ pub fn snapshotBitmap(self: *const Machine, frame: *video.Frame) error{Unsupport
 
 fn supportsDisplayMode(self: *const Machine) bool {
     return switch (self.bus.dispcnt & 7) {
-        0, 3, 4, 5 => true,
+        0...5 => true,
         else => false,
     };
 }
@@ -784,7 +784,7 @@ test "Mode 4 selects the front and back pages and uses the live background palet
     const blue: video.Rgb = .{ .red = 0, .green = 0, .blue = 255 };
     const white: video.Rgb = .{ .red = 255, .green = 255, .blue = 255 };
     var frame: video.Frame = undefined;
-    bus.writeData(u16, Bus.dispcnt_address, 1);
+    bus.writeData(u16, Bus.dispcnt_address, 6);
     try std.testing.expectError(error.UnsupportedDisplayMode, machine.snapshotBitmap(&frame));
     bus.writeData(u16, Bus.dispcnt_address, 0x0404);
     try machine.snapshotBitmap(&frame);
@@ -845,4 +845,33 @@ test "Mode 4 samples signed BG2 coordinates with mosaic and backdrop clipping" {
     try std.testing.expectEqual(black, frame[0][1]);
     try std.testing.expectEqual(green, frame[0][2]);
     try std.testing.expectEqual(green, frame[1][3]);
+}
+
+test "Mode 2 composes two affine tilemaps with signed coordinates, scaling and overflow" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    const bus = &machine.bus;
+    bus.writeData(u16, Bus.dispcnt_address, 0x0C02);
+    bus.writeData(u16, 0x0400_000C, 0x0400); // BG2 map at 0x2000.
+    bus.writeData(u16, 0x0400_000E, 0x0500); // BG3 map at 0x2800.
+    bus.writeData(u16, 0x0400_0020, 0x0200); // Sample every second BG2 texel.
+    bus.writeData(u32, 0x0400_0028, 0x0FFF_FF00); // BG2 starts at x = -1.
+    bus.writeData(u16, Bus.palette_base + 2, 0x001F);
+    bus.writeData(u16, Bus.palette_base + 4, 0x03E0);
+    bus.vram[0x2000] = 1;
+    bus.vram[0x200F] = 1;
+    bus.vram[0x2800] = 2;
+    bus.vram[64 + 1] = 1;
+    bus.vram[64 + 7] = 1;
+    @memset(bus.vram[128..136], 2);
+
+    var frame: video.Frame = undefined;
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.decodeColor(0x03E0), frame[0][0]); // BG2 clips.
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][1]); // BG2 wins the tie.
+    try std.testing.expectEqual(video.decodeColor(0x03E0), frame[0][2]); // Transparent texel.
+    bus.writeData(u16, 0x0400_000C, 0x2400); // Wrap x = -1 to 127.
+    try machine.snapshotBitmap(&frame);
+    try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][0]);
 }

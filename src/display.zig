@@ -42,12 +42,23 @@ pub const Display = struct {
         const mosaic = self.registers.stored(0x0400_004C);
         var backgrounds: [4]?Background = @splat(null);
         const mode = self.control & 7;
-        if (mode == 0) for (&backgrounds, 0..) |*background, index| {
+        const text_count: usize = switch (mode) {
+            0 => 4,
+            1 => 2,
+            else => 0,
+        };
+        for (backgrounds[0..text_count], 0..) |*background, index| {
             if (self.control & (@as(u16, 0x100) << @intCast(index)) != 0) {
                 background.* = self.backgroundForLine(index, y, mosaic);
             }
-        };
-        const bitmap = if (mode >= 3 and self.control & (1 << 10) != 0) BitmapLine.init(self, y, mosaic) else null;
+        }
+        var affine: [2]?AffineLine = @splat(null);
+        for (&affine, 0..) |*layer, i| {
+            if (mode == 0 or (i == 1 and mode != 2)) continue;
+            if (self.control & (@as(u16, 0x400) << @intCast(i)) != 0) {
+                layer.* = AffineLine.init(self, i, y, mosaic);
+            }
+        }
 
         var objects: [video.width]ObjectPixel = @splat(.{});
         if (self.control & (1 << 12) != 0) self.drawObjects(y, mosaic, &objects);
@@ -57,16 +68,17 @@ pub const Display = struct {
             var mask = self.windowMask(x, object.window);
             if (self.bg_pixel_mask) |pixels| mask &= 0xF0 | pixels[x];
             var layers: Layers = .{ .front = backdrop, .behind = backdrop };
-            for (backgrounds, 0..) |maybe_background, index| {
+            for (backgrounds[0..text_count], 0..) |maybe_background, index| {
                 if (mask & (@as(u8, 1) << @intCast(index)) == 0) continue;
                 const bg = maybe_background orelse continue;
                 const color = self.backgroundPixel(bg, x) orelse continue;
                 layers.insert(.{ .color = color, .rank = bg.rank, .layer = @intCast(index) });
             }
-            if (bitmap) |bg| {
-                if (mask & (1 << 2) != 0) {
-                    if (bg.pixel(self, x)) |color| layers.insert(.{ .color = color, .layer = 2, .rank = bg.rank });
-                }
+            for (affine, 0..) |maybe_bg, i| {
+                const bg = maybe_bg orelse continue;
+                const index: u3 = @intCast(2 + i);
+                if (mask & (@as(u8, 1) << index) == 0) continue;
+                if (bg.pixel(self, x)) |color| layers.insert(.{ .color = color, .layer = index, .rank = bg.rank });
             }
             if (mask & (1 << object_layer) != 0) {
                 if (object.pixel) |pixel| layers.insert(pixel);
@@ -192,7 +204,7 @@ pub const Display = struct {
     }
 };
 
-const BitmapLine = struct {
+const AffineLine = struct {
     start_x: i32,
     start_y: i32,
     dx: i16,
@@ -200,28 +212,43 @@ const BitmapLine = struct {
     mosaic_width: usize,
     rank: u5,
 
-    fn init(display: Display, y: usize, mosaic: u16) BitmapLine {
+    control: u16,
+
+    fn init(display: Display, index: usize, y: usize, mosaic: u16) AffineLine {
         const regs = display.registers;
-        const control = regs.stored(0x0400_000C);
+        const offset: u32 = @intCast(index * 16);
+        const control = regs.stored(0x0400_000C + @as(u32, @intCast(index * 2)));
         const use_mosaic = control & (1 << 6) != 0;
         const line: i32 = @intCast(if (use_mosaic) y - y % mosaicSize(mosaic, 4) else y);
-        const pb: i16 = @bitCast(regs.stored(0x0400_0022));
-        const pd: i16 = @bitCast(regs.stored(0x0400_0026));
+        const pb: i16 = @bitCast(regs.stored(0x0400_0022 + offset));
+        const pd: i16 = @bitCast(regs.stored(0x0400_0026 + offset));
         return .{
-            .start_x = regs.affineReference(0x0400_0028) + pb * line,
-            .start_y = regs.affineReference(0x0400_002C) + pd * line,
-            .dx = @bitCast(regs.stored(0x0400_0020)),
-            .dy = @bitCast(regs.stored(0x0400_0024)),
+            .start_x = regs.affineReference(0x0400_0028 + offset) + pb * line,
+            .start_y = regs.affineReference(0x0400_002C + offset) + pd * line,
+            .dx = @bitCast(regs.stored(0x0400_0020 + offset)),
+            .dy = @bitCast(regs.stored(0x0400_0024 + offset)),
             .mosaic_width = if (use_mosaic) mosaicSize(mosaic, 0) else 1,
-            .rank = @intCast((control & 3) * 5 + 3),
+            .rank = @intCast((control & 3) * 5 + 3 + index),
+            .control = control,
         };
     }
 
-    fn pixel(self: BitmapLine, display: Display, x: usize) ?u16 {
+    fn pixel(self: AffineLine, display: Display, x: usize) ?u16 {
         const screen_x: i32 = @intCast(x - x % self.mosaic_width);
         const sx = (self.start_x + self.dx * screen_x) >> 8;
         const sy = (self.start_y + self.dy * screen_x) >> 8;
         const mode = display.control & 7;
+        if (mode <= 2) {
+            const size: usize = @as(usize, 128) << @intCast(self.control >> 14);
+            if (self.control & (1 << 13) == 0 and (sx < 0 or sy < 0 or sx >= size or sy >= size)) return null;
+            const tx = @as(u32, @bitCast(sx)) & (size - 1);
+            const ty = @as(u32, @bitCast(sy)) & (size - 1);
+            const screen_base = @as(usize, (self.control >> 8) & 31) * 0x800;
+            const tile = display.vram[(screen_base + (ty / 8) * (size / 8) + tx / 8) % background_vram_size];
+            const char_base = @as(usize, (self.control >> 2) & 3) * 0x4000;
+            const index = display.vram[char_base + @as(usize, tile) * 64 + (ty % 8) * 8 + tx % 8];
+            return if (index == 0) null else readHalf(display.palette, @as(usize, index) * 2);
+        }
         const width: usize = if (mode == 5) 160 else video.width;
         const height: usize = if (mode == 5) 128 else video.height;
         if (sx < 0 or sy < 0 or sx >= width or sy >= height) return null;
