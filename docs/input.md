@@ -31,12 +31,15 @@ screen or chooses an action. Send one newline-terminated command at a time.
 | `step 60 none` | Advance 60 frames with all buttons released. |
 | `step 4 Right A` | Hold exactly Right and A for four frames. |
 | `screen /tmp/turn-1.bmp` | Write the current 240×160 framebuffer to a fresh path without advancing. |
+| `checkpoint` | Remember the machine and frame number in the session’s single in-memory slot. A later checkpoint replaces it. |
+| `restore` | Return to the remembered frame. The checkpoint remains available until replaced or the session exits. |
 | `quit` or end of input | Flush any configured cartridge save and exit. |
 
-Each successful step or screen request replies on stdout with `ok <total frames>`.
+Step, screen, checkpoint, and restore reply on stdout with `ok <current frame>`.
+Restoring before the first checkpoint returns `error NoCheckpoint` and leaves the game running.
 Invalid commands and capture errors reply with `error <reason>`; the session
 stays open. Quit closes stdout. Guest logs and fatal errors go to stderr.
-To reproduce a run, keep the initial ROM, BIOS, save, and sequence of step commands.
+To reproduce a run, keep the initial ROM, BIOS, save, and sequence of step, checkpoint, and restore commands.
 
 ## Headless execution
 
