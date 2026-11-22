@@ -14,6 +14,9 @@ pub const joycnt_address: u32 = 0x0400_0140;
 const joy_receive_address: u32 = 0x0400_0150;
 const joy_transmit_address: u32 = 0x0400_0154;
 const joystat_address: u32 = 0x0400_0158;
+// Effective fixed overhead calibrated against the normal-mode SIO timing ROM.
+// Its timer includes BIOS Halt and IRQ return, so it cannot isolate the wire delay.
+const normal_transfer_overhead: u32 = 6;
 const joy_irq_enable: u8 = 1 << 6;
 const joy_event_flags: u8 = 0x07;
 const joy_transmit_pending: u8 = 1 << 1;
@@ -63,7 +66,7 @@ pub fn write(self: *Serial, comptime T: type, address: u32, value: T) void {
     } else if (!was_busy) {
         const bits: u32 = if (self.mode() == 1) 32 else 8;
         const period: u32 = if (control & 2 == 0) 64 else 8;
-        self.remaining = bits * period;
+        self.remaining = normal_transfer_overhead + bits * period;
     }
 }
 
@@ -192,7 +195,8 @@ test "normal serial transfers need a clock and raise one IRQ at completion" {
 
     serial.write(u16, base + 8, 0);
     serial.write(u16, base + 8, 0x4083); // Eight bits at eight CPU clocks per bit.
-    try std.testing.expectEqual(@as(u14, 0), serial.advance(63));
+    try std.testing.expectEqual(@as(u14, 0), serial.advance(69));
+    try std.testing.expect(serial.read(u16, base + 8) & 0x80 != 0);
     try std.testing.expectEqual(@as(u14, 1 << 7), serial.advance(1));
     try std.testing.expect(serial.read(u16, base + 8) & 0x80 == 0);
     try std.testing.expectEqual(@as(u8, 0xFF), serial.read(u8, base + 10));
