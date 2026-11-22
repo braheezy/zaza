@@ -6,6 +6,9 @@ On macOS, run a ROM in the live Mach window with:
 zig build window -Ddesktop=true -- --live ../ziggba/zig-out/keydemo.gba
 ```
 
+Live mode plays through the default audio device at 30% volume. Put
+`--volume 5` before `--live` for a quiet sound test, or `--mute` for silence.
+
 | GBA button | Keyboard |
 | --- | --- |
 | D-pad | Arrow keys |

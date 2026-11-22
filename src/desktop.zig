@@ -4,6 +4,7 @@ const objc = @import("objc");
 const gpu = mach.gpu;
 const snapshot = @import("main.zig");
 const video = @import("video.zig");
+const Playback = @import("desktop_audio.zig");
 const Machine = @import("machine.zig");
 const input = @import("input.zig");
 const timing = @import("timing.zig");
@@ -21,17 +22,29 @@ const Modules = mach.Modules(.{ mach.Core, App });
 // published under Mach's snapshot lock (also held by the render callback).
 var frame: video.Frame = @splat(@splat(black));
 var live_machine: ?*Machine = null;
+var live_audio: ?*Playback = null;
 var live_error: ?anyerror = null;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     var args = (try init.minimal.args.toSlice(arena))[1..];
     var save_options: save_file.Options = .{};
-    while (try save_options.take(&args)) {}
+    var volume: u8 = 30;
+    while (args.len != 0) {
+        if (try save_options.take(&args)) continue;
+        if (std.mem.eql(u8, args[0], "--mute")) {
+            volume = 0;
+            args = args[1..];
+        } else if (std.mem.eql(u8, args[0], "--volume") and args.len >= 2) {
+            volume = try std.fmt.parseInt(u8, args[1], 10);
+            if (volume > 100) return error.InvalidVolume;
+            args = args[2..];
+        } else break;
+    }
     if (args.len != 2) {
         std.debug.print(
             "Usage: zaza-window <input.gba> <steps>\n" ++
-                "       zaza-window --live <input.gba>\n" ++
+                "       zaza-window [--mute | --volume 0..100] --live <input.gba>\n" ++
                 "       Cartridge options: --save <path>, --save-type <type>\n",
             .{},
         );
@@ -43,7 +56,15 @@ pub fn main(init: std.process.Init) !void {
     machine.initCartridgeWithBios(rom, snapshot.bundled_bios);
     var save = try save_options.open(init.io, arena, &machine.bus.save);
     defer if (save) |session| session.close(init.io);
+    var playback: Playback = undefined;
+    defer if (live_audio) |audio| audio.deinit();
     if (live) {
+        if (volume != 0) {
+            if (playback.init(init.gpa, volume)) {
+                live_audio = &playback;
+                machine.bus.audio.capture = &playback.capture;
+            } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
+        }
         live_machine = machine;
     } else {
         const steps = try std.fmt.parseInt(usize, args[1], 10);
@@ -141,6 +162,14 @@ const App = struct {
             core.exit();
             return;
         };
+        if (live_audio) |audio| {
+            if (audio.capture.failure) |err| {
+                live_error = err;
+                core.exit();
+                return;
+            }
+            audio.publish();
+        }
         var next_frame: video.Frame = undefined;
         machine.snapshotFrame(&next_frame) catch {
             // Startup may run for several VBlanks before selecting a bitmap mode.

@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
         check.dependOn(&unsupported.step);
         window_step.dependOn(&unsupported.step);
     } else if (desktop_enabled) {
-        if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true })) |mach| {
+        if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
             const desktop = b.addExecutable(.{
                 .name = "zaza-window",
                 .root_module = b.createModule(.{
