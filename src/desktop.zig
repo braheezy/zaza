@@ -109,7 +109,7 @@ const App = struct {
             switch (event) {
                 .close => core.exit(),
                 .focus_lost => app.keys = .{},
-                .key_press => |key| if (app.config.action(key.key, key.mods)) |action| {
+                .key_press => |key| if (shortcutAction(&app.config, key.key, key.mods)) |action| {
                     switch (action) {
                         .quit => core.exit(),
                         .showFps => app.config.show_fps = !app.config.show_fps,
@@ -237,6 +237,13 @@ fn lockWindowSize(window: *objc.app_kit.Window) void {
     const content = window.contentRectForFrameRect(window.frame()).size;
     std.debug.assert(content.width == size.width);
     std.debug.assert(content.height == size.height);
+}
+
+fn shortcutAction(config: *const Config, key: mach.Core.KeyButtonID, mods: mach.Core.KeyMods) ?Config.Action {
+    const physical: Config.Key = switch (key) {
+        inline else => |button| @field(Config.Key, @tagName(button)),
+    };
+    return config.action(physical, .{ .ctrl = mods.control, .shift = mods.shift, .alt = mods.alt, .meta = mods.super });
 }
 
 fn mappedButton(key: mach.Core.KeyButtonID) ?input.Button {

@@ -3,11 +3,11 @@
 On macOS, build the player and open a cartridge.
 
 ```sh
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/zaza-app /path/to/game.gba
+zig build desktop -Doptimize=ReleaseFast
+./zig-out/bin/zaza /path/to/game.gba
 ```
 
-With both executables installed together, `zaza game.gba` also launches the player.
+For headless automation, build with `zig build cli` and run `zaza-cli`.
 
 Live mode plays through the default audio device at 30% volume. Put
 `--volume 5` before the ROM path for a quiet sound test, or `--mute` for silence.
@@ -49,7 +49,7 @@ over a GBA button on the same key. Toggling affects the current session.
 
 ## Operating a game from an agent
 
-Start `zaza session game.gba` as a subprocess and keep its stdin and stdout
+Start `zaza-cli session game.gba` as a subprocess and keep its stdin and stdout
 open. The game starts at frame zero and waits while the agent examines the
 screen or chooses an action. Send one newline-terminated command at a time.
 
@@ -71,16 +71,16 @@ To reproduce a run, keep the initial ROM, BIOS, save, and sequence of step, chec
 ## Headless execution
 
 The same executable can run a complete experiment in one command. Use
-`zaza snapshot game.gba 10000 frame.bmp` for an instruction-count snapshot,
-`zaza demo frame.bmp` for the built-in cartridge, or `zaza replay` for
+`zaza-cli snapshot game.gba 10000 frame.bmp` for an instruction-count snapshot,
+`zaza-cli demo frame.bmp` for the built-in cartridge, or `zaza-cli replay` for
 frame-indexed input and optional WAV capture. These commands and `session`
 work without opening a window or an audio device. Build with
-`zig build -Ddesktop=false` to omit Mach and retain the same CLI.
+`zig build cli` to omit Mach and retain the same CLI.
 
 ```sh
-zig build
+zig build cli
 printf '2 A\n18 none\n' > /tmp/zaza-input.txt
-zig-out/bin/zaza replay ../ziggba/zig-out/keydemo.gba 20 /tmp/keydemo.bmp \
+zig-out/bin/zaza-cli replay ../ziggba/zig-out/keydemo.gba 20 /tmp/keydemo.bmp \
   --input-file /tmp/zaza-input.txt
 ```
 
@@ -106,7 +106,7 @@ its reset vector. Replay frame numbers then include the BIOS startup sequence.
 For example, the jsmolka BIOS test reaches its results screen within this run.
 
 ```sh
-zig-out/bin/zaza --boot replay /path/to/bios.gba 400 /tmp/bios-test.bmp \
+zig-out/bin/zaza-cli --boot replay /path/to/bios.gba 400 /tmp/bios-test.bmp \
   --input '0 none'
 ```
 
@@ -139,9 +139,8 @@ as stereo, signed 16-bit PCM at
 device. Input is optional. Use fresh output paths for each run.
 
 ```sh
-zig build
-zig build audio-test-rom
-zig-out/bin/zaza replay zig-out/roms/direct-sound.gba 1 /tmp/direct-sound.bmp --wav /tmp/direct-sound.wav
+zig build cli audio-test-rom
+zig-out/bin/zaza-cli replay zig-out/roms/direct-sound.gba 1 /tmp/direct-sound.bmp --wav /tmp/direct-sound.wav
 ```
 
 The test cartridge sends an ascending ramp to the left channel on timer 0

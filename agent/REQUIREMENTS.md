@@ -585,7 +585,7 @@ The completed product shall offer a competitive superset of the most useful esta
 
 - [ ] **REQ-134 — First-class agent operation**
 
-The released application shall expose a documented, stable interface for an agent to start a ROM, observe the screen, apply GBA buttons for an exact number of frames, and inspect the result in the same session. Emulated time shall wait while the agent decides. An evaluation harness shall be able to record the inputs and starting configuration so another user can reproduce the attempt. The existing `zaza session` and `zaza replay` commands provide the initial implementation.
+The released application shall expose a documented, stable interface for an agent to start a ROM, observe the screen, apply GBA buttons for an exact number of frames, and inspect the result in the same session. Emulated time shall wait while the agent decides. An evaluation harness shall be able to record the inputs and starting configuration so another user can reproduce the attempt. The existing `zaza-cli session` and `zaza-cli replay` commands provide the initial implementation.
 
 - [ ] **REQ-135 — First-class ziggba development workflow**
 
