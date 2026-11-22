@@ -26,7 +26,7 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8
     };
     const rom = try cartridge.loadRom(init.io, arena, path);
     const machine = try arena.create(Machine);
-    var save = try options.start(machine, init.io, arena, rom);
+    const save = try options.start(machine, init.io, arena, rom);
     defer if (save) |session| session.close(init.io);
     var playback: Playback = undefined;
     var live_audio: ?*Playback = null;
@@ -41,10 +41,9 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8
     var modules: Modules = undefined;
     try modules.init(init.gpa, init.io);
     defer modules.deinit(init.gpa);
-    modules.mods.app = .{ .machine = machine, .audio = live_audio, .config = config };
+    modules.mods.app = .{ .machine = machine, .audio = live_audio, .config = config, .save = save };
     modules.get(.app).run(.main);
     if (modules.mods.app.failure) |err| return err;
-    if (save) |*session| try session.flush(init.io, machine.saveMemory());
 }
 
 const App = struct {
@@ -64,6 +63,7 @@ const App = struct {
     });
 
     config: Config,
+    save: ?@import("save_file.zig").Session,
     display_fps: bool = false,
     machine: *Machine,
     audio: ?*Playback,
@@ -214,8 +214,10 @@ const App = struct {
         window.queue.submit(&.{command});
     }
 
-    pub fn deinit(app: *App) void {
+    pub fn deinit(app: *App, io: std.Io) !void {
         app.app_thread.join();
+        // Mach exits the process after this callback, so publish SRAM here.
+        if (app.save) |*session| try session.flush(io, app.machine.saveMemory());
         if (app.renderer) |renderer| {
             renderer.bind_group.release();
             renderer.pipeline.release();
