@@ -110,7 +110,8 @@ fn readByte(self: *Serial, address: u32) u8 {
             self.joy_status &= ~joy_receive_pending;
             break :result self.joy_receive[address - joy_receive_address];
         },
-        joy_transmit_address...joy_transmit_address + 3 => self.joy_transmit[address - joy_transmit_address],
+        // The link master reads the outgoing payload. Local reads return zero.
+        joy_transmit_address...joy_transmit_address + 3 => 0,
         joystat_address => self.joy_status,
         // BIOS word accesses include unused lanes. Open-bus reads remain unmodeled.
         else => 0,
@@ -130,7 +131,8 @@ fn writeByte(self: *Serial, address: u32, byte: u8) void {
             const pending = self.joy_control & joy_event_flags & ~byte;
             self.joy_control = pending | (byte & joy_irq_enable);
         },
-        joy_receive_address...joy_receive_address + 3 => self.joy_receive[address - joy_receive_address] = byte,
+        // Incoming data belongs to the link master.
+        joy_receive_address...joy_receive_address + 3 => {},
         joy_transmit_address...joy_transmit_address + 3 => {
             self.joy_transmit[address - joy_transmit_address] = byte;
             self.joy_status |= joy_transmit_pending;
@@ -167,12 +169,16 @@ test "JoyBus control writes acknowledge only selected events" {
 }
 
 test "JoyBus data accesses update local status without creating link events" {
-    var serial: Serial = .{ .joy_status = joy_receive_pending };
-    serial.write(u32, joy_receive_address, 0x1234_5678);
+    var serial: Serial = .{
+        .joy_status = joy_receive_pending,
+        .joy_receive = .{ 0x78, 0x56, 0x34, 0x12 },
+    };
+    serial.write(u32, joy_receive_address, 0xFFFF_FFFF);
     serial.write(u32, joy_transmit_address, 0xABCD_EF12);
     serial.write(u32, joystat_address, 0xFFFF_FFFF);
     try std.testing.expectEqual(@as(u32, 0x3A), serial.read(u32, joystat_address));
-    try std.testing.expectEqual(@as(u32, 0xABCD_EF12), serial.read(u32, joy_transmit_address));
+    try std.testing.expectEqual(@as(u32, 0), serial.read(u32, joy_transmit_address));
+    try std.testing.expectEqual(@as(u32, 0xABCD_EF12), std.mem.readInt(u32, &serial.joy_transmit, .little));
     try std.testing.expectEqual(@as(u16, 0x1234), serial.read(u16, joy_receive_address + 2));
     try std.testing.expectEqual(@as(u8, 0x32), serial.read(u8, joystat_address));
     try std.testing.expectEqual(@as(u32, 0), serial.read(u32, joycnt_address));
