@@ -91,12 +91,16 @@ pub fn stepTimed(self: *Machine) !void {
             timing.cycles_per_line - line_phase;
         // Timer and display events can wake the CPU. Line boundaries also
         // let runToVBlank stop exactly at its target while the CPU sleeps.
-        self.advanceClock(@min(display_cycles, self.bus.timers.cyclesUntilOverflow()));
+        const timer_cycles = if (self.bus.timer_irq_pending != 0) 1 else self.bus.timers.cyclesUntilOverflow();
+        self.advanceClock(@min(display_cycles, timer_cycles));
         return;
     }
     const bus_cycles_before = self.bus.bus_cycles;
     const internal_cycles_before = self.cpu.internal_cycles;
+    self.bus.timer_bus_origin = bus_cycles_before;
+    defer self.bus.timer_bus_origin = null;
     try self.step();
+    self.bus.timer_bus_origin = null;
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
     const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
     self.advanceClock(bus_cycles + internal_cycles);
@@ -422,10 +426,12 @@ test "BIOS HALT wakes on a cascaded timer interrupt with IME disabled" {
     const bus_cycles = machine.bus.bus_cycles;
 
     try machine.stepTimed();
-    try std.testing.expectEqual(halted_at + 64, machine.elapsed_cycles);
+    try std.testing.expectEqual(halted_at + 65, machine.elapsed_cycles);
     try std.testing.expect(!machine.bus.hasEnabledInterrupt());
     try machine.stepTimed();
-    try std.testing.expectEqual(halted_at + 128, machine.elapsed_cycles);
+    try std.testing.expectEqual(halted_at + 129, machine.elapsed_cycles);
+    try machine.stepTimed();
+    try std.testing.expectEqual(halted_at + 130, machine.elapsed_cycles);
     try std.testing.expectEqual(@as(u16, 0x11), machine.bus.irq_flags);
     try std.testing.expectEqual(bus_cycles, machine.bus.bus_cycles);
     try std.testing.expectEqual(@as(u32, 12), machine.cpu.instruction_address);
@@ -629,12 +635,12 @@ test "machine clock routes timer overflow IRQs while delivery is masked" {
     var machine: Machine = undefined;
     machine.initCartridge(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
     machine.bus.writeData(u32, 0x0400_0100, 0x00C0_FFFE);
-    machine.advanceClock(1);
+    machine.advanceClock(3);
     try std.testing.expectEqual(@as(u16, 0), machine.bus.irq_flags);
     machine.advanceClock(1);
     try std.testing.expectEqual(@as(u16, 8), machine.bus.irq_flags);
     try std.testing.expect(!machine.bus.irqLine());
-    try std.testing.expectEqual(@as(u16, 0xFFFE), machine.bus.readData(u16, 0x0400_0100));
+    try std.testing.expectEqual(@as(u16, 0xFFFF), machine.bus.readData(u16, 0x0400_0100));
 }
 
 test "a Thumb VCOUNT polling loop writes palette RAM once on each VBlank" {

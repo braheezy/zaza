@@ -844,6 +844,12 @@ pub fn irqMasked(self: *const Cpu) bool {
 
 pub fn enterIrq(self: *Cpu, bus: anytype) void {
     std.debug.assert(!self.irqMasked());
+    // The interrupted instruction still issues its pipeline fetch before vector refill.
+    if (self.cpsr & thumb_bit != 0) {
+        _ = bus.fetch16(self.instruction_address +% 4, .sequential);
+    } else {
+        _ = bus.fetch32(self.instruction_address +% 8, .sequential);
+    }
     // IRQ return subtracts four from LR to resume the first unexecuted instruction.
     self.enterException(bus, .irq, 0x18, self.instruction_address +% 4);
 }

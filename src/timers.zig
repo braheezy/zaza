@@ -10,6 +10,7 @@ pub const Timer = struct {
     counter: u16 = 0,
     control: u8 = 0,
     phase: u16 = 0,
+    startup: u1 = 0,
 };
 
 pub fn contains(address: u32) bool {
@@ -51,6 +52,7 @@ pub fn write(self: *Timers, comptime T: type, address: u32, value: T) void {
                 if (!was_enabled and timer.control & 0x80 != 0) {
                     timer.counter = timer.reload;
                     timer.phase = 0;
+                    timer.startup = 1;
                 }
             },
             3 => {},
@@ -66,13 +68,12 @@ pub fn cyclesUntilOverflow(self: *const Timers) u64 {
         if (timer.control & 0x80 == 0 or timer.control & 4 != 0) continue;
         const ticks = @as(u64, 0x10000) - timer.counter;
         const period = prescalers[timer.control & 3];
-        earliest = @min(earliest, @max(1, ticks * period -| timer.phase));
+        earliest = @min(earliest, @max(1, ticks * period -| timer.phase + timer.startup));
     }
     return earliest;
 }
 
-// Advances a batch of cycles. Sub-instruction enable delays and audio
-// FIFO clocks still need scheduler events when those devices are implemented.
+// The first clock after enable loads the counter. Subsequent clocks count.
 pub fn advance(self: *Timers, cycles: u64) u14 {
     var previous_overflows: u64 = 0;
     var interrupts: u14 = 0;
@@ -84,8 +85,10 @@ pub fn advance(self: *Timers, cycles: u64) u14 {
         var ticks = previous_overflows;
         if (timer.control & 4 == 0) {
             const period = prescalers[timer.control & 3];
-            ticks = cycles / period;
-            const remainder = cycles % period + timer.phase;
+            const counting = cycles -| timer.startup;
+            if (cycles != 0) timer.startup = 0;
+            ticks = counting / period;
+            const remainder = counting % period + timer.phase;
             ticks += remainder / period;
             timer.phase = @intCast(remainder % period);
         }
@@ -108,7 +111,7 @@ test "timer reload writes do not replace a running counter and overflow cascades
     var timers: Timers = .{};
     timers.write(u32, base, 0x00C0_FFFE);
     timers.write(u32, base + 4, 0x00C4_FFFF);
-    try std.testing.expectEqual(@as(u14, 0), timers.advance(1));
+    try std.testing.expectEqual(@as(u14, 0), timers.advance(2));
     timers.write(u16, base, 0xFFFD);
     try std.testing.expectEqual(@as(u16, 0xFFFF), timers.read(u16, base));
     try std.testing.expectEqual(@as(u14, 0x18), timers.advance(1));
@@ -120,7 +123,7 @@ test "all timer prescalers retain fractional cycles and disabled timers stop" {
     for ([_]u16{ 1, 64, 256, 1024 }, 0..) |period, select| {
         var timers: Timers = .{};
         timers.write(u8, base + 2, 0x80 | @as(u8, @intCast(select)));
-        _ = timers.advance(period - 1);
+        _ = timers.advance(period);
         try std.testing.expectEqual(@as(u16, 0), timers.read(u16, base));
         _ = timers.advance(1);
         try std.testing.expectEqual(@as(u16, 1), timers.read(u16, base));

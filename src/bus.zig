@@ -78,6 +78,14 @@ irq_flags: u16 = 0,
 ime_enabled: bool = false,
 waitcnt: u16 = 0,
 bus_cycles: u64 = 0,
+// During a timed instruction, synchronize the timer clock at MMIO bus beats.
+timer_bus_origin: ?u64 = null,
+timer_elapsed: u64 = 0,
+// An overflow reaches IF on the following clock and the CPU two clocks later.
+timer_irq_pending: u14 = 0,
+timer_irq_new: u14 = 0,
+timer_irq_sync: u14 = 0,
+pending_timer_write: ?struct { address: u32, value: u32, size: u8 } = null,
 rom_fetch_cycles: u64 = 0,
 next_rom_data_address: ?u32 = null,
 iwram_data_cycles: u64 = 0,
@@ -113,9 +121,49 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
     if (!previous_match and self.keypadIrqCondition()) self.requestInterrupt(keypad_irq);
 }
 
+fn syncTimerAccess(self: *Bus, address: u32) void {
+    const origin = self.timer_bus_origin orelse return;
+    if (!Timers.contains(address) and (address < ie_address or address > ime_address + 3)) return;
+    const elapsed = self.bus_cycles - origin;
+    self.advanceTimers(elapsed - self.timer_elapsed);
+    self.timer_elapsed = elapsed;
+}
+
+fn advanceTimers(self: *Bus, cycles: u64) void {
+    var remaining = cycles;
+    if (remaining != 0) {
+        if (self.pending_timer_write) |write| {
+            self.advanceTimerCounters(1);
+            switch (write.size) {
+                1 => self.timers.write(u8, write.address, @truncate(write.value)),
+                2 => self.timers.write(u16, write.address, @truncate(write.value)),
+                4 => self.timers.write(u32, write.address, write.value),
+                else => unreachable,
+            }
+            self.pending_timer_write = null;
+            remaining -= 1;
+        }
+    }
+    self.advanceTimerCounters(remaining);
+}
+
+fn advanceTimerCounters(self: *Bus, cycles: u64) void {
+    var remaining = cycles;
+    while (remaining != 0) {
+        const propagating = self.timer_irq_pending | self.timer_irq_new | self.timer_irq_sync != 0;
+        const batch = if (propagating) 1 else @min(remaining, self.timers.cyclesUntilOverflow());
+        self.timer_irq_sync = self.timer_irq_new;
+        self.timer_irq_new = self.timer_irq_pending & ~@as(u14, @truncate(self.irq_flags));
+        self.requestInterrupt(self.timer_irq_pending);
+        self.timer_irq_pending = self.timers.advance(batch);
+        remaining -= batch;
+    }
+}
+
 pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
     self.save.advance(cycles);
-    self.requestInterrupt(self.timers.advance(cycles));
+    self.advanceTimers(cycles - self.timer_elapsed);
+    self.timer_elapsed = 0;
     const phase = (old_phase + cycles) % timing.cycles_per_frame;
     self.vcount = @intCast(phase / timing.cycles_per_line);
     const compare = self.dispstat >> 8;
@@ -160,7 +208,8 @@ pub fn hasEnabledInterrupt(self: *const Bus) bool {
 }
 
 pub fn irqLine(self: *const Bus) bool {
-    return self.ime_enabled and self.hasEnabledInterrupt();
+    const synchronizing = self.timer_irq_new | self.timer_irq_sync;
+    return self.ime_enabled and self.irq_enable & self.irq_flags & ~@as(u16, synchronizing) != 0;
 }
 
 pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
@@ -283,6 +332,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
+    self.syncTimerAccess(aligned_address);
     if (self.debug_port.read(T, aligned_address)) |value| return value;
     // The no$gba identification probe sees open bus on a GBA without that extension.
     if (aligned_address >= 0x04FF_FA00 and aligned_address < 0x04FF_FA08) {
@@ -368,6 +418,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
     self.chargeDataAccess(T, aligned_address);
+    self.syncTimerAccess(aligned_address);
     if (self.debug_port.write(T, aligned_address, value)) return;
     if (SaveMemory.containsParallel(address)) {
         const shift: std.math.Log2Int(T) = @intCast((address - aligned_address) * 8);
@@ -463,7 +514,9 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
         return;
     }
     if (Timers.contains(aligned_address)) {
-        self.timers.write(T, aligned_address, value);
+        if (self.timer_bus_origin != null) {
+            self.pending_timer_write = .{ .address = aligned_address, .value = value, .size = @sizeOf(T) };
+        } else self.timers.write(T, aligned_address, value);
         return;
     }
     if (DMA.contains(aligned_address)) {
@@ -1031,4 +1084,26 @@ test "Game Pak mirrors use their own wait states and restart at a page boundary"
     try std.testing.expectEqual(@as(u64, 30), bus.bus_cycles);
     try std.testing.expectEqual(@as(u16, 0x2211), bus.fetch16(0x0C00_0000, .sequential));
     try std.testing.expectEqual(@as(u64, 35), bus.bus_cycles);
+}
+
+test "timer IRQ propagates through IF to the CPU while repeated overflows keep the line high" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u16, ie_address, 8);
+    bus.writeData(u16, ime_address, 1);
+    bus.writeData(u32, Timers.base, 0x00C0_FFFF);
+    bus.advanceDevices(0, 2); // Load, then overflow.
+    try std.testing.expect(!bus.hasEnabledInterrupt());
+    bus.advanceDevices(2, 1);
+    try std.testing.expect(bus.hasEnabledInterrupt());
+    try std.testing.expect(!bus.irqLine());
+    bus.advanceDevices(3, 1);
+    try std.testing.expect(!bus.irqLine());
+    bus.advanceDevices(4, 1);
+    try std.testing.expect(bus.irqLine());
+    bus.advanceDevices(5, 8);
+    try std.testing.expect(bus.irqLine());
+    bus.writeData(u16, if_address, 8);
+    try std.testing.expect(!bus.irqLine());
+    bus.advanceDevices(13, 3);
+    try std.testing.expect(bus.irqLine());
 }
