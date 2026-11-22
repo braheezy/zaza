@@ -49,8 +49,8 @@ pub fn write(self: *Registers, address: u32, value: u16) void {
     std.debug.assert(address & 1 == 0);
     const offset = address - base;
     const mask: u16 = switch (address) {
-        0x0400_0008, 0x0400_000A => 0xDFCF,
-        0x0400_000C, 0x0400_000E => 0xFFCF,
+        0x0400_0008, 0x0400_000A => 0xDFFF,
+        0x0400_000C, 0x0400_000E => 0xFFFF,
         0x0400_0010...0x0400_001E => 0x01FF,
         0x0400_002A, 0x0400_002E, 0x0400_003A, 0x0400_003E => 0x0FFF,
         0x0400_0048, 0x0400_004A => 0x3F3F,

@@ -114,8 +114,8 @@ pub fn stepTimed(self: *Machine) !void {
             timing.cycles_per_line - line_phase;
         // Timer and display events can wake the CPU. Line boundaries also
         // let runToVBlank stop exactly at its target while the CPU sleeps.
-        const timer_cycles = if (self.bus.timer_irq_pending != 0) 1 else self.bus.timers.cyclesUntilOverflow();
-        self.advanceClock(@min(display_cycles, timer_cycles));
+        const timer_cycles = if (self.bus.peripheral_irq_pending != 0) 1 else self.bus.timers.cyclesUntilOverflow();
+        self.advanceClock(@min(display_cycles, timer_cycles, self.bus.serial.cyclesUntilCompletion()));
         return;
     }
     const bus_cycles_before = self.bus.bus_cycles;

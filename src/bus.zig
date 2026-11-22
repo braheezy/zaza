@@ -86,9 +86,9 @@ dma_sequential: bool = false,
 timer_bus_origin: ?u64 = null,
 timer_elapsed: u64 = 0,
 // An overflow reaches IF on the following clock and the CPU two clocks later.
-timer_irq_pending: u14 = 0,
-timer_irq_new: u14 = 0,
-timer_irq_sync: u14 = 0,
+peripheral_irq_pending: u14 = 0,
+peripheral_irq_new: u14 = 0,
+peripheral_irq_sync: u14 = 0,
 pending_timer_write: ?struct { address: u32, value: u32, size: u8 } = null,
 rom_fetch_cycles: u64 = 0,
 cartridge_prefetch: timing.CartridgePrefetch = .{},
@@ -128,9 +128,9 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
     if (!previous_match and self.keypadIrqCondition()) self.requestInterrupt(keypad_irq);
 }
 
-fn syncTimerAccess(self: *Bus, address: u32) void {
+fn syncPeripheralAccess(self: *Bus, address: u32) void {
     const origin = self.timer_bus_origin orelse return;
-    if (!Timers.contains(address) and (address < ie_address or address > ime_address + 3)) return;
+    if (!Timers.contains(address) and !Serial.contains(address) and (address < ie_address or address > ime_address + 3)) return;
     const elapsed = self.bus_cycles - origin;
     self.advanceTimers(elapsed - self.timer_elapsed);
     self.timer_elapsed = elapsed;
@@ -140,7 +140,7 @@ fn advanceTimers(self: *Bus, cycles: u64) void {
     var remaining = cycles;
     if (remaining != 0) {
         if (self.pending_timer_write) |write| {
-            self.advanceTimerCounters(1);
+            self.advanceTimersAndSerial(1);
             switch (write.size) {
                 1 => self.timers.write(u8, write.address, @truncate(write.value)),
                 2 => self.timers.write(u16, write.address, @truncate(write.value)),
@@ -151,18 +151,18 @@ fn advanceTimers(self: *Bus, cycles: u64) void {
             remaining -= 1;
         }
     }
-    self.advanceTimerCounters(remaining);
+    self.advanceTimersAndSerial(remaining);
 }
 
-fn advanceTimerCounters(self: *Bus, cycles: u64) void {
+fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
     var remaining = cycles;
     while (remaining != 0) {
-        const propagating = self.timer_irq_pending | self.timer_irq_new | self.timer_irq_sync != 0;
-        const batch = if (propagating) 1 else @min(remaining, self.timers.cyclesUntilOverflow());
-        self.timer_irq_sync = self.timer_irq_new;
-        self.timer_irq_new = self.timer_irq_pending & ~@as(u14, @truncate(self.irq_flags));
-        self.requestInterrupt(self.timer_irq_pending);
-        self.timer_irq_pending = self.timers.advance(batch);
+        const propagating = self.peripheral_irq_pending | self.peripheral_irq_new | self.peripheral_irq_sync != 0;
+        const batch = if (propagating) 1 else @min(remaining, self.timers.cyclesUntilOverflow(), self.serial.cyclesUntilCompletion());
+        self.peripheral_irq_sync = self.peripheral_irq_new;
+        self.peripheral_irq_new = self.peripheral_irq_pending & ~@as(u14, @truncate(self.irq_flags));
+        self.requestInterrupt(self.peripheral_irq_pending);
+        self.peripheral_irq_pending = self.timers.advance(batch) | self.serial.advance(batch);
         remaining -= batch;
     }
 }
@@ -216,11 +216,11 @@ pub fn hasEnabledInterrupt(self: *const Bus) bool {
 
 pub fn haltWakeLine(self: *const Bus) bool {
     // A new timer IF bit reaches HALT wake one clock before it reaches the CPU IRQ line.
-    return self.irq_enable & self.irq_flags & ~@as(u16, self.timer_irq_new) != 0;
+    return self.irq_enable & self.irq_flags & ~@as(u16, self.peripheral_irq_new) != 0;
 }
 
 pub fn irqLine(self: *const Bus) bool {
-    const synchronizing = self.timer_irq_new | self.timer_irq_sync;
+    const synchronizing = self.peripheral_irq_new | self.peripheral_irq_sync;
     return self.ime_enabled and self.irq_enable & self.irq_flags & ~@as(u16, synchronizing) != 0;
 }
 
@@ -380,7 +380,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     const aligned_address = alignDataAddress(T, address);
     self.arbitrateDma();
     self.chargeDataAccess(T, aligned_address);
-    self.syncTimerAccess(aligned_address);
+    self.syncPeripheralAccess(aligned_address);
     if (self.debug_port.read(T, aligned_address)) |value| return value;
     // The no$gba identification probe sees open bus on a GBA without that extension.
     if (aligned_address >= 0x04FF_FA00 and aligned_address < 0x04FF_FA08) {
@@ -414,6 +414,11 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
             result |= @as(T, byte) << @intCast(index * 8);
         }
         return result;
+    }
+    switch (aligned_address) {
+        0x0400_0058...0x0400_005F, 0x0400_008C...0x0400_008F, 0x0400_00A0...0x0400_00AF, DMA.end...0x0400_00FF, 0x0400_1000...0x0400_1FFF => return wordLane(T, self.dma_bus_word orelse self.prefetch_word, aligned_address),
+        0x0400_0302...0x0400_0303 => return 0,
+        else => {},
     }
     if (Audio.contains(aligned_address)) return self.audio.read(T, aligned_address);
     if (Timers.contains(aligned_address)) return self.timers.read(T, aligned_address);
@@ -472,7 +477,7 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
     self.arbitrateDma();
     self.chargeDataAccess(T, aligned_address);
-    self.syncTimerAccess(aligned_address);
+    self.syncPeripheralAccess(aligned_address);
     if (self.debug_port.write(T, aligned_address, value)) return;
     if (SaveMemory.containsParallel(address)) {
         const shift: std.math.Log2Int(T) = @intCast((address - aligned_address) * 8);
@@ -490,6 +495,7 @@ fn hasEepromAt(self: *const Bus, address: u32) bool {
 }
 
 fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) void {
+    if (aligned_address >= 0x0400_1000 and aligned_address < 0x0400_2000 or aligned_address >= 0x0400_0302 and aligned_address < 0x0400_0304) return;
     if (T == u8 and aligned_address == postflg_address) {
         if (self.executing_bios) self.post_boot = value & 1 != 0;
         return;
@@ -881,6 +887,7 @@ test "writes to the unused timer to serial gap leave bus state unchanged" {
 test "bus routes serial registers across access widths" {
     // Verify dispatch and CPU alignment without involving a ROM or BIOS.
     var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u16, Serial.base + 8, 0x1000);
     bus.writeData(u32, Serial.base, 0x1234_5678);
     bus.writeData(u8, Serial.base + 1, 0xAB);
     try std.testing.expectEqual(@as(u16, 0xAB78), bus.readData(u16, Serial.base));

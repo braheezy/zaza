@@ -18,14 +18,16 @@ wave_ram: [2][16]u8 = @splat(@splat(0)),
 fifos: [2]Fifo = @splat(.{}),
 
 const Fifo = struct {
-    words: [8]u32 = @splat(0),
+    bytes: [32]u8 = @splat(0),
     count: u8 = 0,
 
-    fn push(self: *Fifo, word: u32) void {
+    fn push(self: *Fifo, comptime T: type, value: T) void {
         // Playback and the hardware's full-FIFO behavior need a clocked consumer.
-        if (self.count == self.words.len) return;
-        self.words[self.count] = word;
-        self.count += 1;
+        for (0..@sizeOf(T)) |lane| {
+            if (self.count == self.bytes.len) return;
+            self.bytes[self.count] = @truncate(value >> @intCast(lane * 8));
+            self.count += 1;
+        }
     }
 };
 
@@ -86,8 +88,7 @@ pub fn write(self: *Audio, comptime T: type, address: u32, value: T) void {
     std.debug.assert(address + @sizeOf(T) <= end);
     const start = address - base;
     if (start >= fifo_start and start < fifo_end) {
-        if (T != u32) @panic("narrow sound FIFO writes are not modeled");
-        self.fifos[(start - fifo_start) / 4].push(value);
+        self.fifos[(start - fifo_start) / 4].push(T, value);
         return;
     }
     for (0..@sizeOf(T)) |index| {
@@ -195,7 +196,7 @@ test "wave bank selection and FIFO reset affect only their own storage" {
     audio.write(u32, base + fifo_start + 4, 0x89AB_CDEF);
     audio.write(u8, base + 0x23, 0x08);
     try std.testing.expectEqual(@as(u8, 0), audio.fifos[0].count);
-    try std.testing.expectEqual(@as(u8, 1), audio.fifos[1].count);
-    try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), audio.fifos[1].words[0]);
+    try std.testing.expectEqual(@as(u8, 4), audio.fifos[1].count);
+    try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), std.mem.readInt(u32, audio.fifos[1].bytes[0..4], .little));
     try std.testing.expectEqual(@as(u8, 0), audio.read(u8, base + 0x23));
 }

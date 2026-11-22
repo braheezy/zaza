@@ -65,9 +65,7 @@ pub fn write(self: *DMA, comptime T: type, address: u32, value: T) void {
             target.* = ((target.* & ~(@as(u16, 0xFF) << shift)) |
                 (@as(u16, byte) << shift)) & mask;
             if (register_offset == 11 and !was_enabled and channel.control & enable != 0) {
-                if (channel.trigger() == .special or channel.control & (1 << 11) != 0) {
-                    @panic("Special DMA triggers are unsupported");
-                }
+                // Special-timing channels stay armed until their peripheral requests DMA.
                 channel.latched_count = channel.count;
                 channel.next_source = channel.source;
                 channel.next_destination = channel.destination;

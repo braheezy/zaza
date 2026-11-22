@@ -2,7 +2,8 @@ const std = @import("std");
 const Serial = @This();
 
 pub const base: u32 = 0x0400_0120;
-// Register storage only. Link transfers and pin behavior are not modeled yet.
+// A disconnected port receives high bits on its serial input.
+remaining: u32 = 0,
 registers: [0x16]u8 = @splat(0),
 joy_control: u8 = 0,
 joy_status: u8 = 0,
@@ -21,7 +22,7 @@ const joy_status_writable: u8 = 0x30;
 
 pub fn contains(address: u32) bool {
     return switch (address) {
-        base...base + 0xB, base + 0x14...base + 0x15 => true,
+        base...base + 0xB, base + 0x14...base + 0x17 => true,
         joycnt_address...joystat_address + 3 => true,
         else => false,
     };
@@ -45,23 +46,64 @@ pub fn read(self: *Serial, comptime T: type, address: u32) T {
 pub fn write(self: *Serial, comptime T: type, address: u32, value: T) void {
     comptime std.debug.assert(T == u8 or T == u16 or T == u32);
     std.debug.assert(contains(address));
+    const was_busy = self.registers[8] & 0x80 != 0;
     for (0..@sizeOf(T)) |index| {
         const byte_address = address + @as(u32, @intCast(index));
         if (contains(byte_address)) {
             const byte: u8 = @truncate(value >> @intCast(index * 8));
-            if (byte_address == base + 8 and byte & 0x80 != 0) {
-                @panic("serial transfers are not modeled");
-            }
             self.writeByte(byte_address, byte);
         }
     }
     // Reserved control bits do not retain writes (GBATEK SIO register map).
     self.registers[9] &= 0x7F;
     self.registers[0x15] &= 0xC1;
+    const control = self.registers[8];
+    if (control & 0x80 == 0 or !self.normalInternalClock()) {
+        self.remaining = 0;
+    } else if (!was_busy) {
+        const bits: u32 = if (self.mode() == 1) 32 else 8;
+        const period: u32 = if (control & 2 == 0) 64 else 8;
+        self.remaining = bits * period;
+    }
+}
+
+fn mode(self: *const Serial) u2 {
+    return @truncate(self.registers[9] >> 4);
+}
+
+fn normalInternalClock(self: *const Serial) bool {
+    return self.registers[0x15] & 0x80 == 0 and self.mode() < 2 and self.registers[8] & 1 != 0;
+}
+
+pub fn cyclesUntilCompletion(self: *const Serial) u64 {
+    return if (self.remaining == 0) std.math.maxInt(u64) else self.remaining;
+}
+
+pub fn advance(self: *Serial, cycles: u64) u14 {
+    if (self.remaining == 0) return 0;
+    self.remaining -= @intCast(@min(cycles, self.remaining));
+    if (self.remaining != 0) return 0;
+    self.registers[8] &= ~@as(u8, 0x80);
+    if (self.mode() == 1) @memset(self.registers[0..4], 0xFF) else self.registers[10] = 0xFF;
+    return if (self.registers[9] & 0x40 != 0) 1 << 7 else 0;
 }
 
 fn readByte(self: *Serial, address: u32) u8 {
-    if (address < joycnt_address) return self.registers[address - base];
+    if (address < joycnt_address) {
+        const offset = address - base;
+        return switch (offset) {
+            0...3 => if (self.mode() == 1 or self.mode() == 2) self.registers[offset] else 0,
+            4...7, 0x16, 0x17 => 0,
+            8 => (self.registers[8] & @as(u8, if (self.mode() == 3) 0xAF else 0x8B)) | 4,
+            10, 11 => if (self.mode() == 3) 0 else self.registers[offset],
+            0x14 => switch (self.registers[0x15] >> 6) {
+                3 => self.registers[offset] & 0xFC,
+                2 => self.registers[offset],
+                else => (self.registers[offset] & 0xF0) | @as(u8, if (self.mode() < 2) 5 else 15),
+            },
+            else => self.registers[offset],
+        };
+    }
     return switch (address) {
         joycnt_address => self.joy_control,
         joy_receive_address...joy_receive_address + 3 => result: {
@@ -77,7 +119,9 @@ fn readByte(self: *Serial, address: u32) u8 {
 
 fn writeByte(self: *Serial, address: u32, byte: u8) void {
     if (address < joycnt_address) {
-        self.registers[address - base] = byte;
+        const offset = address - base;
+        if (offset >= self.registers.len or (offset < 8 and (offset >= 4 or self.mode() != 1))) return;
+        self.registers[offset] = byte;
         return;
     }
     switch (address) {
@@ -101,12 +145,13 @@ fn writeByte(self: *Serial, address: u32, byte: u8) void {
 test "serial byte writes preserve adjacent data and word accesses are little endian" {
     // BIOS uses byte stores even for registers also accessible as halfwords.
     var serial: Serial = .{};
+    serial.write(u16, base + 8, 0x1000);
     serial.write(u32, base, 0x4433_2211);
     serial.write(u8, base + 1, 0xAA);
     try std.testing.expectEqual(@as(u32, 0x4433_AA11), serial.read(u32, base));
     serial.write(u16, base + 8, 0);
     serial.write(u32, base + 0x14, 0xFFFF_FFFF);
-    try std.testing.expectEqual(@as(u32, 0xC1FF), serial.read(u32, base + 0x14));
+    try std.testing.expectEqual(@as(u32, 0xC1FC), serial.read(u32, base + 0x14));
     try std.testing.expect(!contains(0x0400_0130));
     try std.testing.expect(!contains(base + 0xC));
 }
@@ -131,4 +176,19 @@ test "JoyBus data accesses update local status without creating link events" {
     try std.testing.expectEqual(@as(u16, 0x1234), serial.read(u16, joy_receive_address + 2));
     try std.testing.expectEqual(@as(u8, 0x32), serial.read(u8, joystat_address));
     try std.testing.expectEqual(@as(u32, 0), serial.read(u32, joycnt_address));
+}
+
+test "normal serial transfers need a clock and raise one IRQ at completion" {
+    var serial: Serial = .{};
+    serial.write(u16, base + 8, 0x4080); // External clock, no peer.
+    try std.testing.expectEqual(@as(u14, 0), serial.advance(4096));
+    try std.testing.expect(serial.read(u16, base + 8) & 0x80 != 0);
+
+    serial.write(u16, base + 8, 0);
+    serial.write(u16, base + 8, 0x4083); // Eight bits at eight CPU clocks per bit.
+    try std.testing.expectEqual(@as(u14, 0), serial.advance(63));
+    try std.testing.expectEqual(@as(u14, 1 << 7), serial.advance(1));
+    try std.testing.expect(serial.read(u16, base + 8) & 0x80 == 0);
+    try std.testing.expectEqual(@as(u8, 0xFF), serial.read(u8, base + 10));
+    try std.testing.expectEqual(@as(u14, 0), serial.advance(64));
 }
