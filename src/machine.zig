@@ -172,6 +172,7 @@ fn renderVisibleLines(self: *Machine, cycles: u64) void {
     var edge = self.elapsed_cycles + next_hblank;
     while (edge <= end) : (edge += timing.cycles_per_line) {
         const line = (edge % timing.cycles_per_frame) / timing.cycles_per_line;
+        const control = self.bus.scanlineDisplayControl();
         // OBJ evaluation for the next line precedes OAM writes during HBlank.
         if (line == timing.lines_per_frame - 1) self.line_oam = self.bus.oam;
         if (line >= video.height) continue;
@@ -181,6 +182,7 @@ fn renderVisibleLines(self: *Machine, cycles: u64) void {
 
         // Sample the visible line before the bus applies HBlank DMA writes.
         var display = self.currentDisplay();
+        display.control = control;
         display.oam = &self.line_oam;
         display.renderLine(@intCast(line), &self.rendered_frame[line]);
         self.rendered_lines += 1;

@@ -70,6 +70,8 @@ vram: [vram_size_bytes]u8 = @splat(0),
 oam: [oam_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
+bg_enable_previous: u4 = 0,
+bg_enable_ready: u4 = 0,
 greenswap: u16 = 0,
 display_phase: u64 = 0,
 dispstat: u16 = vcount_match_status,
@@ -99,6 +101,15 @@ next_fetch_nonsequential: bool = false,
 prefetch_word: u32 = 0,
 // The first instruction after DMA can sample the final transfer on open bus.
 dma_bus_word: ?u32 = null,
+
+/// Sample BG enables for this scanline, then advance their two-line startup delay.
+pub fn scanlineDisplayControl(self: *Bus) u16 {
+    const enabled: u4 = @truncate(self.dispcnt >> 8);
+    const visible = enabled & self.bg_enable_ready;
+    self.bg_enable_ready = self.bg_enable_previous;
+    self.bg_enable_previous = enabled;
+    return (self.dispcnt & ~@as(u16, 0x0F00)) | (@as(u16, visible) << 8);
+}
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
     // A device latches its request even while IRQ delivery is disabled.
@@ -631,6 +642,10 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
     }
     if (T == u16) {
         if (aligned_address == dispcnt_address) {
+            // Disabling a layer cancels even a partially completed startup.
+            const enabled: u4 = @truncate(value >> 8);
+            self.bg_enable_previous &= enabled;
+            self.bg_enable_ready &= enabled;
             self.dispcnt = value;
             return;
         }
