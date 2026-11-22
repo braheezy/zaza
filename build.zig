@@ -34,6 +34,11 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = audio_rom });
     test_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
+    const checkpoint_rom = b.option([]const u8, "checkpoint-rom", "Additional cartridge for the frame-360 checkpoint test");
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "external_checkpoint", checkpoint_rom != null);
+    test_module.addOptions("test_options", test_options);
+    if (checkpoint_rom) |path| test_module.addAnonymousImport("checkpoint_rom", .{ .root_source_file = b.path(path) });
     const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

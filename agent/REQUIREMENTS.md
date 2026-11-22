@@ -3,7 +3,7 @@
 
 **Status:** Playable macOS emulator, partial hardware conformance  
 **Language:** Zig  
-**Platforms:** macOS, Linux  
+**Target platforms:** macOS, Linux, web browsers  
 **Graphics:** Mach / native GPU  
 **Scope:** Full-featured, accuracy-focused GBA emulation
 
@@ -20,6 +20,8 @@ open box can mean partial support or an unverified acceptance criterion.
 - All four PSG channels and both Direct Sound FIFOs produce samples. Audio accuracy, device selection and synchronization across playback speeds remain open. The GPU presents the software framebuffer. Enhanced rendering, debugger UI, save states and linked multiplayer remain open.
 
 ## 1. Project Objectives
+
+Alongside hardware fidelity, Zaza has three product priorities. Agents should be able to operate the shipped emulator directly. Developers using ziggba should get a shorter path from a Zig source change to a verified result. Web applications should be able to embed the same emulation core efficiently. Section 15 defines the outcomes for each.
 
 - [ ] **REQ-001 — Competitive emulator**
 
@@ -578,3 +580,17 @@ Official builds shall identify their source revision, Zig toolchain version, dep
 - [ ] **REQ-133 — Feature parity**
 
 The completed product shall offer a competitive superset of the most useful established GBA emulator capabilities, combining hardware fidelity, gameplay enhancements, peripheral compatibility, developer tooling, and modern desktop usability in a single application.
+
+## 15. Agent, ziggba, and web integration
+
+- [ ] **REQ-134 — First-class agent operation**
+
+The released application shall expose a documented, stable interface for an agent to start a ROM, observe the screen, apply GBA buttons for an exact number of frames, and inspect the result in the same session. Emulated time shall wait while the agent decides. An evaluation harness shall be able to record the inputs and starting configuration so another user can reproduce the attempt. The existing `zaza session` and `zaza replay` commands provide the initial implementation.
+
+- [ ] **REQ-135 — First-class ziggba development workflow**
+
+Zaza shall integrate with ziggba so a developer can build a ROM, launch that build, and verify a gameplay change from the project's normal Zig workflow. The goal is a demonstrably better edit–run–debug cycle than opening the same ROM in a general-purpose emulator. Evaluate the integration on a representative ziggba project by comparing the steps to reproduce a bug and identify the responsible Zig code. Build-step integration and use of compiler debug information are candidate designs. SDK conveniences shall preserve the hardware behavior seen by the ROM.
+
+- [ ] **REQ-136 — Efficient web embedding**
+
+A web application shall be able to embed Zaza, load a user-supplied ROM, deliver controller input, and present video and audio using the same emulation core as the desktop player. Optimize against measurements from a representative embedded game, including download size, time to the first playable frame, frame pacing, and audio underruns. WebAssembly is the leading candidate. The packaging, browser APIs, and performance targets remain open design decisions.

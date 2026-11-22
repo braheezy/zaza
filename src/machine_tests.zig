@@ -226,3 +226,61 @@ test "Direct Sound cartridge produces a stereo ramp across repeated DMA refills"
     try std.testing.expect(first_left != null and first_right != null);
     try std.testing.expectEqual(first_left.? + 1, first_right.?);
 }
+
+test "machine checkpoint reproduces PCM, framebuffer and device state in a fresh machine" {
+    try checkReplay(@embedFile("direct_sound_rom"), 1, 8);
+    if (@import("test_options").external_checkpoint) {
+        try checkReplay(@embedFile("checkpoint_rom"), 360, 120);
+    }
+}
+
+fn checkReplay(rom: []const u8, warmup: usize, frames: usize) !void {
+    const allocator = std.testing.allocator;
+    const original = try allocator.create(Machine);
+    defer allocator.destroy(original);
+    const restored = try allocator.create(Machine);
+    defer allocator.destroy(restored);
+    const saved = try allocator.create(Machine.Checkpoint);
+    defer allocator.destroy(saved);
+
+    original.initCartridgeWithBios(rom, bundled_bios);
+    for (0..warmup) |_| try original.runFrame(0);
+
+    var first_pcm: std.Io.Writer.Allocating = .init(allocator);
+    defer first_pcm.deinit();
+    var second_pcm: std.Io.Writer.Allocating = .init(allocator);
+    defer second_pcm.deinit();
+    var first = Audio.Capture{ .writer = &first_pcm.writer };
+    var second = Audio.Capture{ .writer = &second_pcm.writer };
+    original.bus.audio.capture = &first;
+    original.checkpoint(saved);
+    try std.testing.expect(saved.state.bus.audio.capture == null);
+    try std.testing.expectEqual(@as(u9, @truncate(original.elapsed_cycles)), original.bus.audio.sample_phase);
+    try playCheckpointInputs(original, frames);
+    saved.restore(restored, &second);
+    try playCheckpointInputs(restored, frames);
+
+    try std.testing.expect(first.failure == null and second.failure == null);
+    try std.testing.expect(first_pcm.written().len > 0);
+    try std.testing.expectEqualSlices(u8, first_pcm.written(), second_pcm.written());
+    var expected: video.Frame = undefined;
+    var actual: video.Frame = undefined;
+    try original.snapshotFrame(&expected);
+    try restored.snapshotFrame(&actual);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&actual));
+
+    // Compare fields, including inactive devices and RAM, without comparing
+    // compiler padding or the addresses of the two host writers.
+    original.bus.audio.capture = null;
+    restored.bus.audio.capture = null;
+    try std.testing.expectEqual(original.*, restored.*);
+
+    saved.restore(restored, null);
+    try restored.runFrame(input.Button.right.mask());
+    try std.testing.expectEqual(input.Button.right.mask(), restored.bus.pressed_buttons);
+    try std.testing.expectEqual(@as(input.Buttons, 0), saved.state.bus.pressed_buttons);
+}
+
+fn playCheckpointInputs(machine: *Machine, frames: usize) !void {
+    for (0..frames) |i| try machine.runFrame(if (i < 4) input.Button.a.mask() else 0);
+}

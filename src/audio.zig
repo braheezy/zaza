@@ -15,13 +15,14 @@ bias: u16 = 0x0200,
 wave_ram: [2][16]u8 = @splat(@splat(0)),
 fifos: [2]Fifo = @splat(.{}),
 
+// Tracks the sample clock even when no host is collecting PCM.
+sample_phase: u9 = 0,
 capture: ?*Capture = null,
 pub const sample_period = 512;
 pub const sample_rate = (1 << 24) / sample_period;
 
 pub const Capture = struct {
     writer: *std.Io.Writer,
-    phase: u16 = 0,
     bytes: u32 = 0,
     failure: ?error{ WriteFailed, WavTooLarge } = null,
 

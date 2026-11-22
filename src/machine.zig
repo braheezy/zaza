@@ -1,5 +1,6 @@
 const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
+const Audio = @import("audio.zig");
 const Machine = @This();
 const video = @import("video.zig");
 const Display = @import("display.zig").Display;
@@ -12,13 +13,29 @@ cpu: Cpu,
 bus: Bus,
 elapsed_cycles: u64 = 0,
 dma_cycles_pending: u64 = 0,
-rendered_frame: video.Frame = undefined,
+rendered_frame: video.Frame = @splat(@splat(.{ .red = 0, .green = 0, .blue = 0 })),
 vertical_windows: VerticalWindows = .{},
 line_oam: [1024]u8 = @splat(0),
 rendered_lines: usize = 0,
 rendered_frame_number: ?u64 = null,
 
 const vblank_start = timing.vblank_start;
+
+/// In-process checkpoint taken between machine steps. All mutable state is
+/// copied. The caller must keep the immutable ROM and BIOS images alive.
+pub const Checkpoint = struct {
+    state: Machine,
+
+    pub fn restore(self: *const Checkpoint, destination: *Machine, capture: ?*Audio.Capture) void {
+        destination.* = self.state;
+        destination.bus.audio.capture = capture;
+    }
+};
+
+pub fn checkpoint(self: *const Machine, destination: *Checkpoint) void {
+    destination.state = self.*;
+    destination.state.bus.audio.capture = null;
+}
 
 // Start directly at the cartridge entry point without running the BIOS.
 pub fn initCartridge(self: *Machine, rom: []const u8) void {

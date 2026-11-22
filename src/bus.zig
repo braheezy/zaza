@@ -73,7 +73,7 @@ oam: [oam_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
 bg_at_latch: ?u4 = null,
-bg_pixel_mask: [video.width]u8 = undefined,
+bg_pixel_mask: [video.width]u8 = @splat(0),
 bg_pixels_changed: bool = false,
 bg_enable_previous: u4 = 0,
 bg_enable_ready: u4 = 0,
@@ -194,19 +194,16 @@ fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
     while (remaining != 0) {
         const propagating = self.peripheral_irq_pending | self.peripheral_irq_new | self.peripheral_irq_sync != 0;
         var batch: u64 = if (propagating) 1 else @min(remaining, self.timers.cyclesUntilOverflow(), self.serial.cyclesUntilCompletion());
-        if (self.audio.capture) |capture| batch = @min(batch, Audio.sample_period - capture.phase);
+        if (self.audio.capture != null) batch = @min(batch, @as(u64, Audio.sample_period) - self.audio.sample_phase);
         self.peripheral_irq_sync = self.peripheral_irq_new;
         self.peripheral_irq_new = self.peripheral_irq_pending & ~@as(u14, @truncate(self.irq_flags));
         self.requestInterrupt(self.peripheral_irq_pending);
         self.peripheral_irq_pending = self.timers.advance(batch) | self.serial.advance(batch);
         if (self.audio.master_enabled) self.audio.psg.advance(batch);
         if (self.timers.overflowed != 0) self.sound_dma_requests |= self.audio.clockFifos(self.timers.overflowed);
-        if (self.audio.capture) |capture| {
-            capture.phase += @intCast(batch);
-            if (capture.phase == Audio.sample_period) {
-                capture.phase = 0;
-                capture.sample(&self.audio);
-            }
+        self.audio.sample_phase +%= @truncate(batch);
+        if (self.audio.sample_phase == 0) {
+            if (self.audio.capture) |capture| capture.sample(&self.audio);
         }
         remaining -= batch;
     }
