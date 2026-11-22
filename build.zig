@@ -24,47 +24,36 @@ pub fn build(b: *std.Build) void {
     check.dependOn(&executable.step);
 
     const audio_rom = b.addWriteFiles().add("direct-sound.gba", &@import("test/direct_sound_rom.zig").rom);
-    module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = audio_rom });
     const install_rom = b.addInstallFile(audio_rom, "roms/direct-sound.gba");
     b.step("audio-test-rom", "Install the silent Direct Sound test cartridge").dependOn(&install_rom.step);
 
-    const tests = b.addTest(.{ .root_module = module });
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/machine_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = audio_rom });
+    test_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
+    const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
-    const window_step = b.step("window", "Run the Mach framebuffer viewer (-Ddesktop=true)");
-    const desktop_enabled = b.option(bool, "desktop", "Build the macOS Mach framebuffer viewer") orelse false;
-    if (desktop_enabled and target.result.os.tag != .macos) {
-        const unsupported = b.addFail("The Mach framebuffer viewer currently supports macOS.");
-        b.getInstallStep().dependOn(&unsupported.step);
-        check.dependOn(&unsupported.step);
-        window_step.dependOn(&unsupported.step);
-    } else if (desktop_enabled) {
-        if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
-            const desktop = b.addExecutable(.{
-                .name = "zaza-window",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/desktop.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
+    const desktop_enabled = b.option(bool, "desktop", "Include the macOS desktop player") orelse (target.result.os.tag == .macos);
+    const options = b.addOptions();
+    options.addOption(bool, "desktop", desktop_enabled);
+    module.addOptions("build_options", options);
+    const run = b.addRunArtifact(executable);
+    if (b.args) |args| run.addArgs(args);
+    b.step("run", "Run Zaza").dependOn(&run.step);
+    if (desktop_enabled) {
+        if (target.result.os.tag != .macos) {
+            executable.step.dependOn(&b.addFail("Desktop playback currently requires macOS. Use -Ddesktop=false for automation.").step);
+        } else if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
             const mach_module = mach.module("mach");
-            desktop.root_module.addImport("mach", mach_module);
-            // Share Mach's AppKit bindings for native window options Core does not expose.
-            if (mach_module.import_table.get("objc")) |objc_module| {
-                desktop.root_module.addImport("objc", objc_module);
-            }
-            desktop.root_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
-            b.installArtifact(desktop);
-            check.dependOn(&desktop.step);
-            const run = b.addRunArtifact(desktop);
-            if (b.args) |args| run.addArgs(args);
-            window_step.dependOn(&run.step);
+            module.addImport("mach", mach_module);
+            module.addImport("objc", mach_module.import_table.get("objc").?);
         }
-    } else {
-        window_step.dependOn(&b.addFail("Use zig build window -Ddesktop=true -- <rom.gba> <steps>").step);
     }
 
     const cputest_enabled = b.option(bool, "cputest-internal", "Configure CPU vector tests") orelse false;

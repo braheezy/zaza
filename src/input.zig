@@ -52,10 +52,14 @@ pub fn parseScript(allocator: std.mem.Allocator, source: []const u8) ![]Change {
 
 fn parseLine(frame_word: []const u8, words: *std.mem.TokenIterator(u8, .any)) !Change {
     const frame = std.fmt.parseInt(u32, frame_word, 10) catch return error.InvalidInputFrame;
+    return .{ .frame = frame, .buttons = try parseButtons(words) };
+}
+
+pub fn parseButtons(words: *std.mem.TokenIterator(u8, .any)) !Buttons {
     const first = words.next() orelse return error.MissingButtons;
     if (std.ascii.eqlIgnoreCase(first, "none")) {
         if (words.next() != null) return error.InvalidButtons;
-        return .{ .frame = frame, .buttons = 0 };
+        return 0;
     }
     var buttons = try buttonMask(first);
     while (words.next()) |word| {
@@ -63,7 +67,7 @@ fn parseLine(frame_word: []const u8, words: *std.mem.TokenIterator(u8, .any)) !C
         if (buttons & mask != 0) return error.DuplicateButton;
         buttons |= mask;
     }
-    return .{ .frame = frame, .buttons = buttons };
+    return buttons;
 }
 
 fn buttonMask(word: []const u8) !Buttons {

@@ -1,13 +1,14 @@
 # Playing and replaying input
 
-On macOS, run a ROM in the live Mach window with:
+On macOS, build the player and open a cartridge.
 
 ```sh
-zig build window -Ddesktop=true -- --live ../ziggba/zig-out/keydemo.gba
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zaza /path/to/game.gba
 ```
 
 Live mode plays through the default audio device at 30% volume. Put
-`--volume 5` before `--live` for a quiet sound test, or `--mute` for silence.
+`--volume 5` before the ROM path for a quiet sound test, or `--mute` for silence.
 
 | GBA button | Keyboard |
 | --- | --- |
@@ -17,10 +18,34 @@ Live mode plays through the default audio device at 30% volume. Put
 | Start, Select | Enter, left Shift |
 
 The window has a fixed 720 × 480 point content area (3× the GBA display).
-Escape closes the viewer. Losing focus releases all keys. The old window
-command with a ROM and an instruction count still shows a static snapshot.
+Escape closes the player. Losing focus releases all keys.
 
-For automated runs, use the headless executable. For example:
+## Operating a game from an agent
+
+Start `zaza session game.gba` as a subprocess and keep its stdin and stdout
+open. The game starts at frame zero and waits while the agent examines the
+screen or chooses an action. Send one newline-terminated command at a time.
+
+| Request | Effect |
+| --- | --- |
+| `step 60 none` | Advance 60 frames with all buttons released. |
+| `step 4 Right A` | Hold exactly Right and A for four frames. |
+| `screen /tmp/turn-1.bmp` | Write the current 240×160 framebuffer to a fresh path without advancing. |
+| `quit` or end of input | Flush any configured cartridge save and exit. |
+
+Each successful step or screen request replies on stdout with `ok <total frames>`.
+Invalid commands and capture errors reply with `error <reason>`; the session
+stays open. Quit closes stdout. Guest logs and fatal errors go to stderr.
+To reproduce a run, keep the initial ROM, BIOS, save, and sequence of step commands.
+
+## Headless execution
+
+The same executable can run a complete experiment in one command. Use
+`zaza snapshot game.gba 10000 frame.bmp` for an instruction-count snapshot,
+`zaza demo frame.bmp` for the built-in cartridge, or `zaza replay` for
+frame-indexed input and optional WAV capture. These commands and `session`
+work without opening a window or an audio device. Build with
+`zig build -Ddesktop=false` to omit Mach and retain the same CLI.
 
 ```sh
 zig build
@@ -69,7 +94,7 @@ data. Supply the save options before the command or ROM. Without a save path,
 the cartridge's save data stays in memory for the session.
 
 ```sh
-zig build window -Ddesktop=true -- --save /path/to/game.sav --live /path/to/game.gba
+./zig-out/bin/zaza --save /path/to/game.sav /path/to/game.gba
 ```
 
 Zaza writes changed data after a successful capture or on normal window

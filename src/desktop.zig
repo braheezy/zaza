@@ -2,13 +2,12 @@ const std = @import("std");
 const mach = @import("mach");
 const objc = @import("objc");
 const gpu = mach.gpu;
-const snapshot = @import("main.zig");
+const cartridge = @import("cartridge.zig");
 const video = @import("video.zig");
 const Playback = @import("desktop_audio.zig");
 const Machine = @import("machine.zig");
 const input = @import("input.zig");
 const timing = @import("timing.zig");
-const save_file = @import("save_file.zig");
 
 const frame_period_ns = timing.cycles_per_frame * std.time.ns_per_s / (1 << 24);
 const window_scale = 3;
@@ -18,65 +17,28 @@ const black: video.Rgb = .{ .red = 0, .green = 0, .blue = 0 };
 
 const Modules = mach.Modules(.{ mach.Core, App });
 
-// The launcher sets these before Mach starts its threads. Live frames are
-// published under Mach's snapshot lock (also held by the render callback).
-var frame: video.Frame = @splat(@splat(black));
-var live_machine: ?*Machine = null;
-var live_audio: ?*Playback = null;
-var live_error: ?anyerror = null;
-
-pub fn main(init: std.process.Init) !void {
+pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8, volume: u8) !void {
     const arena = init.arena.allocator();
-    var args = (try init.minimal.args.toSlice(arena))[1..];
-    var save_options: save_file.Options = .{};
-    var volume: u8 = 30;
-    while (args.len != 0) {
-        if (try save_options.take(&args)) continue;
-        if (std.mem.eql(u8, args[0], "--mute")) {
-            volume = 0;
-            args = args[1..];
-        } else if (std.mem.eql(u8, args[0], "--volume") and args.len >= 2) {
-            volume = try std.fmt.parseInt(u8, args[1], 10);
-            if (volume > 100) return error.InvalidVolume;
-            args = args[2..];
-        } else break;
-    }
-    if (args.len != 2) {
-        std.debug.print(
-            "Usage: zaza-window <input.gba> <steps>\n" ++
-                "       zaza-window [--mute | --volume 0..100] --live <input.gba>\n" ++
-                "       Cartridge options: --save <path>, --save-type <type>\n",
-            .{},
-        );
-        return error.InvalidArguments;
-    }
-    const live = std.mem.eql(u8, args[0], "--live");
-    const rom = try snapshot.loadRom(init.io, arena, if (live) args[1] else args[0]);
+    const rom = try cartridge.loadRom(init.io, arena, path);
     const machine = try arena.create(Machine);
-    machine.initCartridgeWithBios(rom, snapshot.bundled_bios);
-    var save = try save_options.open(init.io, arena, &machine.bus.save);
+    var save = try options.start(machine, init.io, arena, rom);
     defer if (save) |session| session.close(init.io);
     var playback: Playback = undefined;
+    var live_audio: ?*Playback = null;
     defer if (live_audio) |audio| audio.deinit();
-    if (live) {
-        if (volume != 0) {
-            if (playback.init(init.gpa, volume)) {
-                live_audio = &playback;
-                machine.bus.audio.capture = &playback.capture;
-            } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
-        }
-        live_machine = machine;
-    } else {
-        const steps = try std.fmt.parseInt(usize, args[1], 10);
-        if (steps == 0) return error.InvalidStepCount;
-        try snapshot.captureMachineBitmap(machine, steps, &frame);
+    if (volume != 0) {
+        if (playback.init(init.gpa, volume)) {
+            live_audio = &playback;
+            machine.bus.audio.capture = &playback.capture;
+        } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
     }
 
     var modules: Modules = undefined;
     try modules.init(init.gpa, init.io);
     defer modules.deinit(init.gpa);
+    modules.mods.app = .{ .machine = machine, .audio = live_audio };
     modules.get(.app).run(.main);
-    if (live_error) |err| return err;
+    if (modules.mods.app.failure) |err| return err;
     if (save) |*session| try session.flush(init.io, &machine.bus.save);
 }
 
@@ -96,7 +58,11 @@ const App = struct {
         .{ mach.Core, .snapshotEnd },
     });
 
-    app_thread: mach.Thread,
+    machine: *Machine,
+    audio: ?*Playback,
+    failure: ?anyerror = null,
+    frame: video.Frame = @splat(@splat(black)),
+    app_thread: mach.Thread = undefined,
     renderer: ?Renderer = null,
     keys: input.LiveKeys = .{},
     next_frame_ns: ?i96 = null,
@@ -127,7 +93,7 @@ const App = struct {
             break :blk native.window;
         };
         lockWindowSize(window);
-        app.* = .{ .app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app) };
+        app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
     }
 
     pub fn pollInput(app: *App, core: *mach.Core) void {
@@ -149,8 +115,8 @@ const App = struct {
     }
 
     pub fn emulate(app: *App, core: *mach.Core, io: std.Io) void {
-        const machine = live_machine orelse return;
-        if (live_error != null or core.state.load(.acquire) != .running) return;
+        const machine = app.machine;
+        if (app.failure != null or core.state.load(.acquire) != .running) return;
         const now_ns = std.Io.Clock.awake.now(io).nanoseconds;
         const deadline_ns = app.next_frame_ns orelse now_ns;
         if (now_ns < deadline_ns) return;
@@ -158,13 +124,13 @@ const App = struct {
         app.next_frame_ns = @max(now_ns, deadline_ns + frame_period_ns);
         machine.runFrame(app.keys.sample()) catch |err| {
             std.log.err("live emulation stopped at 0x{x:0>8}", .{machine.cpu.instruction_address});
-            live_error = err;
+            app.failure = err;
             core.exit();
             return;
         };
-        if (live_audio) |audio| {
+        if (app.audio) |audio| {
             if (audio.capture.failure) |err| {
-                live_error = err;
+                app.failure = err;
                 core.exit();
                 return;
             }
@@ -180,7 +146,7 @@ const App = struct {
 
     pub fn publish(app: *App) void {
         if (app.pending) |next_frame| {
-            frame = next_frame;
+            app.frame = next_frame;
             app.pending = null;
             app.frame_revision +%= 1;
         }
@@ -193,7 +159,7 @@ const App = struct {
         }
         const renderer = &app.renderer.?;
         if (renderer.uploaded_revision != app.frame_revision) {
-            renderer.upload(window.queue, &frame);
+            renderer.upload(window.queue, &app.frame);
             renderer.uploaded_revision = app.frame_revision;
         }
         const target = window.swap_chain.getCurrentTextureView() orelse return;
