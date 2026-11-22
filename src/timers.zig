@@ -5,6 +5,7 @@ pub const base: u32 = 0x0400_0100;
 const prescalers = [_]u16{ 1, 64, 256, 1024 };
 // All channels sample the same free-running ten-bit divider.
 divider: u10 = 0,
+overflowed: u4 = 0,
 channels: [4]Timer = @splat(.{}),
 
 pub const Timer = struct {
@@ -76,6 +77,7 @@ pub fn cyclesUntilOverflow(self: *const Timers) u64 {
 
 // The first clock after enable loads the counter. Subsequent clocks count.
 pub fn advance(self: *Timers, cycles: u64) u14 {
+    self.overflowed = 0;
     const start = self.divider;
     self.divider +%= @truncate(cycles);
     var previous_overflows: u64 = 0;
@@ -102,6 +104,7 @@ pub fn advance(self: *Timers, cycles: u64) u14 {
         } else {
             const period = @as(u64, 0x10000) - timer.reload;
             const remaining = ticks - until_overflow;
+            self.overflowed |= @as(u4, 1) << @intCast(index);
             previous_overflows = 1 + remaining / period;
             timer.counter = timer.reload + @as(u16, @intCast(remaining % period));
             if (timer.control & 0x40 != 0) interrupts |= @as(u14, 1) << @intCast(3 + index);

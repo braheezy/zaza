@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
     const check = b.step("check", "Check the executable without installing it");
     check.dependOn(&executable.step);
 
+    const audio_rom = b.addWriteFiles().add("direct-sound.gba", &@import("test/direct_sound_rom.zig").rom);
+    module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = audio_rom });
+    const install_rom = b.addInstallFile(audio_rom, "roms/direct-sound.gba");
+    b.step("audio-test-rom", "Install the silent Direct Sound test cartridge").dependOn(&install_rom.step);
+
     const tests = b.addTest(.{ .root_module = module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

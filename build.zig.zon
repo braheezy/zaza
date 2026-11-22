@@ -20,6 +20,6 @@
     },
     .minimum_zig_version = "0.16.0-dev.3142+5ccfeb926",
     .mach_zig_version = "2026.4.10-mach",
-    .paths = .{ "build.zig", "build.zig.zon", "src", "test/cputest.zig", "vendor" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "test/cputest.zig", "test/direct_sound_rom.zig", "vendor" },
     .fingerprint = 0x83b6fe416857f87a,
 }

@@ -17,15 +17,74 @@ bias: u16 = 0x0200,
 wave_ram: [2][16]u8 = @splat(@splat(0)),
 fifos: [2]Fifo = @splat(.{}),
 
+capture: ?*Capture = null,
+pub const sample_period = 512;
+pub const sample_rate = (1 << 24) / sample_period;
+
+pub const Capture = struct {
+    writer: *std.Io.Writer,
+    phase: u16 = 0,
+    bytes: u32 = 0,
+    failure: ?error{ WriteFailed, WavTooLarge } = null,
+
+    pub fn sample(self: *Capture, audio: *const Audio) void {
+        if (self.failure != null) return;
+        if (self.bytes > std.math.maxInt(u32) - 40) {
+            self.failure = error.WavTooLarge;
+            return;
+        }
+        var pcm: [4]u8 = undefined;
+        std.mem.writeInt(i16, pcm[0..2], audio.mix(true), .little);
+        std.mem.writeInt(i16, pcm[2..4], audio.mix(false), .little);
+        self.writer.writeAll(&pcm) catch {
+            self.failure = error.WriteFailed;
+            return;
+        };
+        self.bytes += 4;
+    }
+};
+
+fn mix(self: *const Audio, left: bool) i16 {
+    if (!self.master_enabled) return 0;
+    var level: i16 = @intCast(self.bias & 0x3FF);
+    for (self.fifos, 0..) |fifo, i| {
+        const route: u16 = if (left) 0x0200 else 0x0100;
+        if (self.direct_control & (route << @intCast(4 * i)) == 0) continue;
+        const full = self.direct_control & (@as(u16, 4) << @intCast(i)) != 0;
+        level += @as(i16, fifo.sample) * @as(i16, if (full) 2 else 1);
+    }
+    return (std.math.clamp(level, 0, 1023) - 512) * 64;
+}
+
+// Each selected timer clocks one signed PCM byte, independently of its IRQ enable.
+pub fn clockFifos(self: *Audio, overflowed: u4) u2 {
+    if (!self.master_enabled) return 0;
+    var requests: u2 = 0;
+    for (&self.fifos, 0..) |*fifo, i| {
+        const control = self.direct_control >> @intCast(8 + i * 4);
+        if (control & 3 == 0) continue;
+        const timer: u1 = @truncate(control >> 2);
+        if (overflowed & (@as(u4, 1) << timer) == 0) continue;
+        if (fifo.count != 0) {
+            fifo.sample = @bitCast(fifo.bytes[fifo.head]);
+            fifo.head +%= 1;
+            fifo.count -= 1;
+        }
+        if (fifo.count <= 16) requests |= @as(u2, 1) << @intCast(i);
+    }
+    return requests;
+}
+
 const Fifo = struct {
+    head: u5 = 0,
+    sample: i8 = 0,
     bytes: [32]u8 = @splat(0),
     count: u8 = 0,
 
     fn push(self: *Fifo, comptime T: type, value: T) void {
-        // Playback and the hardware's full-FIFO behavior need a clocked consumer.
         for (0..@sizeOf(T)) |lane| {
             if (self.count == self.bytes.len) return;
-            self.bytes[self.count] = @truncate(value >> @intCast(lane * 8));
+            self.bytes[self.head +% @as(u5, @truncate(self.count))] = @truncate(value >> @intCast(lane * 8));
             self.count += 1;
         }
     }

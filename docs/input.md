@@ -72,3 +72,23 @@ zig build window -Ddesktop=true -- --save /path/to/game.sav --live /path/to/game
 Zaza writes changed data after a successful capture or on normal window
 exit. It rejects a save whose size does not match the cartridge and uses
 an adjacent `.lock` file to prevent two Zaza sessions from writing the same save.
+
+## Silent audio testing
+
+Replay can capture Direct Sound A and B as stereo, signed 16-bit PCM at
+32,768 Hz. It writes the WAV on the emulated clock without opening an audio
+device. Input is optional. Use fresh output paths for each run.
+
+```sh
+zig build
+zig build audio-test-rom
+zig-out/bin/zaza replay zig-out/roms/direct-sound.gba 1 /tmp/direct-sound.bmp --wav /tmp/direct-sound.wav
+```
+
+The test cartridge sends an ascending ramp to the left channel on timer 0
+and a descending ramp at half the rate to the right channel on timer 1.
+DMA1 and DMA2 refill the respective FIFOs. `zig build test` checks every
+captured sample of the first frame, including signed wraparound and refills.
+The first frame runs from cartridge startup to VBlank. Later frames span
+a full display period. PSG synthesis and analog output filtering are outside
+the current capture path.

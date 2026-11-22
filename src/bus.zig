@@ -55,6 +55,7 @@ serial: Serial = .{},
 dma: DMA = .{},
 timers: Timers = .{},
 audio: Audio = .{},
+sound_dma_requests: u2 = 0,
 pressed_buttons: u10 = 0,
 keypad_control: u16 = 0,
 display_registers: DisplayRegisters = .{},
@@ -164,7 +165,7 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
 
 fn syncPeripheralAccess(self: *Bus, address: u32) void {
     const origin = self.instruction_bus_origin orelse return;
-    if (!Timers.contains(address) and !Serial.contains(address) and (address < ie_address or address > ime_address + 3)) return;
+    if (!Audio.contains(address) and !Timers.contains(address) and !Serial.contains(address) and (address < ie_address or address > ime_address + 3)) return;
     const elapsed = self.bus_cycles - origin;
     self.advanceTimers(elapsed - self.timer_elapsed);
     self.timer_elapsed = elapsed;
@@ -192,11 +193,20 @@ fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
     var remaining = cycles;
     while (remaining != 0) {
         const propagating = self.peripheral_irq_pending | self.peripheral_irq_new | self.peripheral_irq_sync != 0;
-        const batch = if (propagating) 1 else @min(remaining, self.timers.cyclesUntilOverflow(), self.serial.cyclesUntilCompletion());
+        var batch: u64 = if (propagating) 1 else @min(remaining, self.timers.cyclesUntilOverflow(), self.serial.cyclesUntilCompletion());
+        if (self.audio.capture) |capture| batch = @min(batch, Audio.sample_period - capture.phase);
         self.peripheral_irq_sync = self.peripheral_irq_new;
         self.peripheral_irq_new = self.peripheral_irq_pending & ~@as(u14, @truncate(self.irq_flags));
         self.requestInterrupt(self.peripheral_irq_pending);
         self.peripheral_irq_pending = self.timers.advance(batch) | self.serial.advance(batch);
+        if (self.timers.overflowed != 0) self.sound_dma_requests |= self.audio.clockFifos(self.timers.overflowed);
+        if (self.audio.capture) |capture| {
+            capture.phase += @intCast(batch);
+            if (capture.phase == Audio.sample_period) {
+                capture.phase = 0;
+                capture.sample(&self.audio);
+            }
+        }
         remaining -= batch;
     }
 }
@@ -205,6 +215,10 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
     self.save.advance(cycles);
     self.advanceTimers(cycles - self.timer_elapsed);
     self.timer_elapsed = 0;
+    if (self.sound_dma_requests != 0) {
+        self.runDma(.special);
+        self.sound_dma_requests = 0;
+    }
     const phase = (old_phase + cycles) % timing.cycles_per_frame;
     self.display_phase = phase;
     const status = self.displayStatusAt(phase);
@@ -281,8 +295,20 @@ pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
     self.dma_active = true;
     defer self.dma_active = false;
     for (0..self.dma.channels.len) |index| {
-        const channel = self.dma.channels[index];
+        var channel = self.dma.channels[index];
         if (channel.control & DMA.enable == 0 or channel.trigger() != trigger) continue;
+        if (trigger == .special) {
+            if (index != 1 and index != 2) continue;
+            const request: u2 = switch (channel.next_destination & ~@as(u32, 3)) {
+                Audio.base + 0x40 => 1,
+                Audio.base + 0x44 => 2,
+                else => continue,
+            };
+            if (self.sound_dma_requests & request == 0) continue;
+            // Sound DMA forces four words to a fixed destination.
+            channel.latched_count = 4;
+            channel.control = (channel.control & ~@as(u16, 0x60)) | 0x440;
+        }
         if (trigger == .immediate and channel.ready_at > self.bus_cycles + self.cpu_internal_cycles) {
             self.scheduleImmediateDma(channel.ready_at);
             continue;

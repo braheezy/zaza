@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
                     "       zaza [--bios <bios.bin>] [--boot] <input.gba> <steps> <output.bmp>\n" ++
                     "       zaza [--bios <bios.bin>] [--boot] replay <input.gba> " ++
                     "<frames> <output.bmp> " ++
-                    "(--input <script> | --input-file <path>)\n" ++
+                    "[--input <script> | --input-file <path>] [--wav <output.wav>]\n" ++
                     "       Cartridge options: --save <path>, --save-type <type>\n",
                 .{},
             );
@@ -84,16 +84,24 @@ fn replayInput(
     save_options: save_file.Options,
     args: []const [:0]const u8,
 ) !void {
-    if (args.len != 5) return error.InvalidReplayArguments;
+    if (args.len < 3 or (args.len - 3) % 2 != 0) return error.InvalidReplayArguments;
     const frames = try std.fmt.parseInt(u32, args[1], 10);
     if (frames == 0) return error.InvalidFrameCount;
-    const script = if (std.mem.eql(u8, args[3], "--input"))
-        args[4]
-    else if (std.mem.eql(u8, args[3], "--input-file"))
-        try std.Io.Dir.cwd().readFileAlloc(io, args[4], arena, .limited(1024 * 1024))
-    else
-        return error.InvalidReplayArguments;
-    const changes = try input.parseScript(arena, script);
+    var script: ?[]const u8 = null;
+    var wav_path: ?[]const u8 = null;
+    var option: usize = 3;
+    while (option < args.len) : (option += 2) {
+        const name = args[option];
+        const value = args[option + 1];
+        if (std.mem.eql(u8, name, "--wav") and wav_path == null) {
+            wav_path = value;
+        } else if (std.mem.eql(u8, name, "--input") and script == null) {
+            script = value;
+        } else if (std.mem.eql(u8, name, "--input-file") and script == null) {
+            script = try std.Io.Dir.cwd().readFileAlloc(io, value, arena, .limited(1024 * 1024));
+        } else return error.InvalidReplayArguments;
+    }
+    const changes = try input.parseScript(arena, script orelse "");
     if (changes.len != 0 and changes[changes.len - 1].frame >= frames) {
         return error.InputFrameOutsideReplay;
     }
@@ -103,6 +111,17 @@ fn replayInput(
     if (boot) machine.initBios(rom, bios) else machine.initCartridgeWithBios(rom, bios);
     var save = try save_options.open(io, arena, &machine.bus.save);
     defer if (save) |session| session.close(io);
+    var wav_file = if (wav_path) |path| try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = false }) else null;
+    defer if (wav_file) |*file| file.deinit(io);
+    var buffer: [8192]u8 = undefined;
+    var writer: std.Io.File.Writer = undefined;
+    var capture: Audio.Capture = undefined;
+    if (wav_file) |*file| {
+        writer = file.file.writer(io, &buffer);
+        try writer.interface.writeAll(&wav.header(0));
+        capture = .{ .writer = &writer.interface };
+        machine.bus.audio.capture = &capture;
+    }
     var replay: input.Replay = .{ .remaining = changes };
     for (0..frames) |index| {
         machine.runFrame(replay.buttonsForFrame(@intCast(index))) catch |err| {
@@ -111,10 +130,16 @@ fn replayInput(
             });
             return err;
         };
+        if (machine.bus.audio.capture) |sink| if (sink.failure) |err| return err;
     }
     var frame: video.Frame = undefined;
     try machine.snapshotFrame(&frame);
     try writeBitmap(io, args[2], &frame);
+    if (wav_file) |*file| {
+        try writer.interface.flush();
+        try file.file.writePositionalAll(io, &wav.header(capture.bytes), 0);
+        try file.link(io);
+    }
     if (save) |*session| try session.flush(io, &machine.bus.save);
 }
 
@@ -137,6 +162,8 @@ pub fn captureMachineBitmap(machine: *Machine, steps: usize, frame: *video.Frame
 }
 
 const std = @import("std");
+const Audio = @import("audio.zig");
+const wav = @import("wav.zig");
 const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @import("machine.zig");
@@ -351,4 +378,39 @@ test "bundled emibios clears OAM and returns to the cartridge" {
     try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[4]);
     const cleared: @TypeOf(machine.bus.oam) = @splat(0);
     try std.testing.expectEqualSlices(u8, &cleared, &machine.bus.oam);
+}
+
+test "Direct Sound cartridge produces a stereo ramp across repeated DMA refills" {
+    var machine: Machine = undefined;
+    machine.initCartridgeWithBios(@embedFile("direct_sound_rom"), bundled_bios);
+    var pcm: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&pcm);
+    var capture: Audio.Capture = .{ .writer = &writer };
+    machine.bus.audio.capture = &capture;
+    try machine.runFrame(0);
+    try std.testing.expect(capture.failure == null);
+    try std.testing.expectEqual(machine.elapsed_cycles / Audio.sample_period * 4, capture.bytes);
+
+    const data = writer.buffered();
+    var first_left: ?usize = null;
+    var first_right: ?usize = null;
+    for (0..data.len / 4) |i| {
+        const left = std.mem.readInt(i16, data[i * 4 ..][0..2], .little);
+        const right = std.mem.readInt(i16, data[i * 4 + 2 ..][0..2], .little);
+        if (left != 0 and first_left == null) first_left = i;
+        if (right != 0 and first_right == null) first_right = i;
+        if (first_left) |start| {
+            const byte: u8 = @truncate(i - start + 1);
+            const signed: i8 = @bitCast(byte);
+            try std.testing.expectEqual(@as(i16, signed) * 128, left);
+        }
+        if (first_right) |start| {
+            const n = (i - start) / 2;
+            const byte: u8 = 0 -% @as(u8, @truncate(n + 2));
+            const signed: i8 = @bitCast(byte);
+            try std.testing.expectEqual(@as(i16, signed) * 128, right);
+        }
+    }
+    try std.testing.expect(first_left != null and first_right != null);
+    try std.testing.expectEqual(first_left.? + 1, first_right.?);
 }
