@@ -750,7 +750,8 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
     const left = self.readRegister(left_register);
     const right = self.readRegister(right_register);
     const signed = !long or instruction & (1 << 22) != 0;
-    self.internal_cycles += multiplyCycles(right, signed);
+    const iterations = multiplyCycles(right, signed);
+    self.internal_cycles += iterations;
     self.internal_cycles += @intFromBool(accumulate);
     if (long) {
         self.internal_cycles += 1;
@@ -758,10 +759,13 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
             @bitCast(@as(i64, @as(i32, @bitCast(left))) * @as(i64, @as(i32, @bitCast(right))))
         else
             @as(u64, left) * right;
-        if (accumulate) {
-            const old = (@as(u64, self.readRegister(upper_register)) << 32) |
-                self.readRegister(lower_register);
-            result +%= old;
+        const accumulator = if (accumulate)
+            (@as(u64, self.readRegister(upper_register)) << 32) | self.readRegister(lower_register)
+        else
+            0;
+        result +%= accumulator;
+        if (instruction & (1 << 20) != 0) {
+            flags.carry = longMultiplyCarry(left, right, accumulator, signed, iterations);
         }
         self.writeGeneralRegister(lower_register, @truncate(result));
         self.writeGeneralRegister(upper_register, @truncate(result >> 32));
@@ -774,8 +778,41 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
         flags.negative = result >> 31 != 0;
         flags.zero = result == 0;
     }
-    // Preserve unspecified flags until hardware-specific multiply flags are modeled.
     if (instruction & (1 << 20) != 0) self.writeFlags(flags);
+}
+
+// ARM7TDMI exposes a bit of the carry-save adder through the barrel shifter.
+// Hardware model: https://bmchtech.github.io/post/multiply/
+fn longMultiplyCarry(rm: u32, rs: u32, accumulator: u64, signed: bool, iterations: u8) bool {
+    const multiplicand: u34 = if (signed) @bitCast(@as(i34, @as(i32, @bitCast(rm)))) else rm;
+    var digits: u34 = if (signed) @bitCast(@as(i34, @as(i32, @bitCast(rs)))) else rs;
+    var sum: u33 = @truncate(accumulator >> 1);
+    var carry: u33 = if (rs & 1 != 0) @truncate(~multiplicand >> 1) else 0;
+    var high_accumulator = accumulator >> 34;
+
+    // Four overlapping radix-4 Booth digits consume one multiplier byte.
+    for (0..@as(usize, iterations) * 4) |_| {
+        const addend: u34 = switch (@as(u3, @truncate(digits))) {
+            0, 7 => 0,
+            1, 2 => multiplicand,
+            3 => multiplicand << 1,
+            4 => ~(multiplicand << 1),
+            5, 6 => ~multiplicand,
+        };
+        const operand: u33 = @truncate(addend);
+        const majority = (sum & carry) | ((sum ^ carry) & operand);
+        // Feed the next accumulator and sign-extension bits into the top of
+        // the array as the two finished low bits leave each stage.
+        const extension = (high_accumulator & 1) + (~carry >> 32) + (~addend >> 33);
+        sum = ((sum ^ carry ^ operand) >> 2) | @as(u33, @truncate(extension << 31));
+        carry = (majority >> 1) | (@as(u33, @truncate(~high_accumulator >> 1)) << 32);
+        high_accumulator >>= 2;
+        digits >>= 2;
+    }
+
+    // Early termination aligns to the low word, a full multiply to the high word.
+    const bit: u5 = @intCast(if (iterations == 4) 30 else 30 - iterations * 8);
+    return (carry >> bit) & 1 != 0;
 }
 
 fn multiplyCycles(multiplier: u32, allow_ones: bool) u8 {
@@ -785,6 +822,20 @@ fn multiplyCycles(multiplier: u32, allow_ones: bool) u8 {
     if (signed_fill >> 16 == 0) return 2;
     if (signed_fill >> 24 == 0) return 3;
     return 4;
+}
+
+test "SMLALS includes the original high accumulator in the carry flag" {
+    var cpu: Cpu = .{};
+    cpu.registers[0] = 0x8000_0000;
+    cpu.registers[1] = 0x1234_5678;
+    for ([_]u32{ 0x4000_0000, 0 }, [_]bool{ true, false }) |high, expected_carry| {
+        cpu.registers[2] = 0;
+        cpu.registers[3] = high;
+        try cpu.executeArmMultiply(0xE0F3_2190); // SMLALS r2, r3, r0, r1
+        try std.testing.expectEqual(expected_carry, cpu.readFlags().carry);
+        try std.testing.expectEqual(high -% 0x091A_2B3C, cpu.registers[3]);
+        try std.testing.expectEqual(@as(u32, 0), cpu.registers[2]);
+    }
 }
 
 test "ARM multiply reads aliased source registers before writeback" {
