@@ -15,6 +15,7 @@ elapsed_cycles: u64 = 0,
 dma_cycles_pending: u64 = 0,
 rendered_frame: video.Frame = @splat(@splat(.{ .red = 0, .green = 0, .blue = 0 })),
 vertical_windows: VerticalWindows = .{},
+text_bg_latch: u16 = 0,
 line_oam: [1024]u8 = @splat(0),
 rendered_lines: usize = 0,
 rendered_frame_number: ?u64 = null,
@@ -218,7 +219,7 @@ fn renderAtHBlank(self: *Machine, edge: u64) void {
     display.control = control;
     if (self.bus.bg_pixels_changed) display.bg_pixel_mask = &self.bus.bg_pixel_mask;
     display.oam = &self.line_oam;
-    display.renderLine(@intCast(line), &self.rendered_frame[line]);
+    display.renderLine(@intCast(line), &self.rendered_frame[line], &self.text_bg_latch);
     self.rendered_lines += 1;
     if (self.rendered_lines == video.height) {
         self.rendered_frame_number = edge / timing.cycles_per_frame;
@@ -565,11 +566,12 @@ pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!
 pub fn snapshotBitmap(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
     if (!self.supportsDisplayMode()) return error.UnsupportedDisplayMode;
     var display = self.currentDisplay();
+    var latch = self.text_bg_latch;
     // For a static snapshot, settle the current limits through a complete VCOUNT cycle.
     for (0..timing.lines_per_frame) |line| display.vertical_windows.beginLine(line, display.registers);
     for (frame, 0..) |*row, y| {
         display.vertical_windows.beginLine(y, display.registers);
-        display.renderLine(y, row);
+        display.renderLine(y, row, &latch);
     }
 }
 
@@ -681,17 +683,17 @@ test "bitmap BG2 priority and transparency compose with upper OBJ VRAM" {
         bus.writeData(u16, Bus.dispcnt_address, 0x1400 | mode);
         bus.writeData(u16, Bus.vram_base, if (mode == 4) 1 else 0x001F);
         bus.writeData(u16, 0x0400_000C, 0);
-        machine.currentDisplay().renderLine(0, &row);
+        machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
         try std.testing.expectEqual(video.decodeColor(0x001F), row[0]);
         try std.testing.expectEqual(video.decodeColor(if (mode == 4) 0x7C00 else 0), row[1]);
         bus.writeData(u16, 0x0400_000C, 1);
-        machine.currentDisplay().renderLine(0, &row);
+        machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
         try std.testing.expectEqual(video.decodeColor(0x7C00), row[0]);
     }
     // Lower OBJ tiles overlap the bitmap pages and cannot supply sprite pixels.
     bus.writeData(u16, Bus.oam_base + 4, 0);
     bus.writeData(u16, Bus.vram_base + 0x10000, 0x1111);
-    machine.currentDisplay().renderLine(0, &row);
+    machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
     try std.testing.expectEqual(video.decodeColor(0x001F), row[0]);
 }
 
@@ -874,4 +876,30 @@ test "Mode 2 composes two affine tilemaps with signed coordinates, scaling and o
     bus.writeData(u16, 0x0400_000C, 0x2400); // Wrap x = -1 to 127.
     try machine.snapshotBitmap(&frame);
     try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][0]);
+}
+
+test "Mode 0 shares open bus between text layers and across invalid map reads" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const bus = &machine.bus;
+    var row: [video.width]video.Rgb = undefined;
+    bus.writeData(u16, Bus.palette_base + 6, 0x001F);
+    bus.writeData(u16, Bus.dispcnt_address, 0x0300);
+    bus.writeData(u16, 0x0400_0008, 0x010C); // BG0 tile 512 exceeds character block 3.
+    bus.writeData(u16, 0x0400_000A, 0x0200);
+    bus.writeData(u16, Bus.vram_base + 0x800, 512);
+    bus.writeData(u16, Bus.vram_base + 0x1000, 3);
+    machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
+    try std.testing.expectEqual(video.decodeColor(0x001F), row[0]);
+
+    // Start in the right half of a wide map beginning at screen block 31.
+    // The retained value selects tile 1. Both VRAM[0] and OBJ VRAM contain zero.
+    bus.writeData(u16, Bus.dispcnt_address, 0x0100);
+    bus.writeData(u16, 0x0400_0008, 0x5F00);
+    bus.writeData(u16, 0x0400_0010, 256);
+    bus.writeData(u16, Bus.vram_base + 32, 3);
+    machine.text_bg_latch = 1;
+    machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
+    try std.testing.expectEqual(video.decodeColor(0x001F), row[0]);
 }

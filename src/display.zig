@@ -33,7 +33,7 @@ pub const Display = struct {
     palette: *const [1024]u8,
     oam: *const [1024]u8,
 
-    pub fn renderLine(self: Display, y: usize, row: *[video.width]video.Rgb) void {
+    pub fn renderLine(self: Display, y: usize, row: *[video.width]video.Rgb, latch: *u16) void {
         if (self.control & (1 << 7) != 0) {
             row.* = @splat(video.decodeColor(0x7FFF));
             return;
@@ -51,6 +51,10 @@ pub const Display = struct {
             if (self.control & (@as(u16, 0x100) << @intCast(index)) != 0) {
                 background.* = self.backgroundForLine(index, y, mosaic);
             }
+        }
+        var text_pixels: [4][video.width]u8 = undefined;
+        if (text_count != 0 and self.control & 0x0F00 != 0) {
+            self.fetchTextLine(backgrounds[0..text_count], &text_pixels, latch);
         }
         var affine: [2]?AffineLine = @splat(null);
         for (&affine, 0..) |*layer, i| {
@@ -71,7 +75,9 @@ pub const Display = struct {
             for (backgrounds[0..text_count], 0..) |maybe_background, index| {
                 if (mask & (@as(u8, 1) << @intCast(index)) == 0) continue;
                 const bg = maybe_background orelse continue;
-                const color = self.backgroundPixel(bg, x) orelse continue;
+                const palette_index = text_pixels[index][x - x % bg.mosaic_width];
+                if (palette_index == 0) continue;
+                const color = readHalf(self.palette, @as(usize, palette_index) * 2);
                 layers.insert(.{ .color = color, .rank = bg.rank, .layer = @intCast(index) });
             }
             for (affine, 0..) |maybe_bg, i| {
@@ -109,27 +115,52 @@ pub const Display = struct {
         };
     }
 
-    fn backgroundPixel(self: Display, bg: Background, screen_x: usize) ?u16 {
-        const x = (screen_x - screen_x % bg.mosaic_width + bg.scroll_x) & bg.xMask();
-        const y = bg.sample_y & bg.yMask();
-        const block = (x >> 8) + (y >> 8) * @as(usize, if (bg.wide) 2 else 1);
-        const tile = ((y >> 3) & 31) * 32 + ((x >> 3) & 31);
-        const entry_offset = (bg.screen_base + block * 0x800 + tile * 2) % background_vram_size;
-        const entry = readHalf(self.vram, entry_offset);
-        const tile_x = if (entry & (1 << 10) != 0) 7 - (x & 7) else x & 7;
-        const tile_y = if (entry & (1 << 11) != 0) 7 - (y & 7) else y & 7;
-        const tile_size: usize = if (bg.eight_bit) 64 else 32;
-        const tile_base = bg.character_base + @as(usize, entry & 0x03FF) * tile_size;
-        // Use single-BG open-bus behavior when the character fetch exceeds BG VRAM.
-        const index: u8 = if (tile_base < background_vram_size)
-            tilePixel(self.vram, tile_base, tile_x, tile_y, bg.eight_bit)
-        else if (bg.eight_bit)
-            @truncate(entry >> @intCast((x & 1) * 8))
-        else
-            @intCast((entry >> @intCast((x & 3) * 4)) & 15);
-        if (index == 0) return null;
-        const bank: usize = if (bg.eight_bit) 0 else (entry >> 12) * 16;
-        return readHalf(self.palette, (bank + index) * 2);
+    fn fetchBackgroundHalf(self: Display, address: usize, latch: *u16) u16 {
+        if (address < background_vram_size) latch.* = readHalf(self.vram, address);
+        return latch.*;
+    }
+
+    fn fetchTextLine(self: Display, backgrounds: []const ?Background, pixels: *[4][video.width]u8, latch: *u16) void {
+        // Each dot grants the text layers one bus slot apiece, in BG number order.
+        // Fetch ahead of the visible pixels, even for layers hidden by the compositor.
+        var entries: [4]u16 = @splat(0);
+        var words: [4]u16 = @splat(0);
+        var fetching: [4]bool = @splat(false);
+        for (0..260) |dot| {
+            for (backgrounds, 0..) |maybe_bg, layer| {
+                const bg = maybe_bg orelse continue;
+                const step = dot + (bg.scroll_x & 7);
+                const phase = (step -% 1) & 7;
+                const entry = entries[layer];
+                const y = bg.sample_y & bg.yMask();
+                if (fetching[layer]) {
+                    const group: usize = if (bg.eight_bit) 2 else 4;
+                    const tx = if (entry & 0x400 != 0) 7 - phase else phase;
+                    if (phase % group == 0) {
+                        const ty = if (entry & 0x800 != 0) 7 - (y & 7) else y & 7;
+                        const tile_row = @as(usize, entry & 1023) * 8 + ty;
+                        const address = bg.character_base + (tile_row * 8 + tx) / group * 2;
+                        words[layer] = self.fetchBackgroundHalf(address, latch);
+                    }
+                    if (dot >= 9 and dot < 9 + video.width) {
+                        const bits: usize = 16 / group;
+                        const raw = words[layer] >> @intCast(tx % group * bits);
+                        const index: u8 = if (bg.eight_bit) @truncate(raw) else @intCast(raw & 15);
+                        const bank: u8 = if (bg.eight_bit or index == 0) 0 else @intCast((entry >> 12) * 16);
+                        pixels[layer][dot - 9] = bank + index;
+                    }
+                    if (phase == 7) fetching[layer] = false;
+                }
+                const cycle = dot * 4 + layer;
+                if (step >= 8 and step & 7 == 0 and cycle < 1007) {
+                    const x = ((bg.scroll_x & ~@as(usize, 7)) + step - 8) & bg.xMask();
+                    const block = (x >> 8) + (y >> 8) * @as(usize, if (bg.wide) 2 else 1);
+                    const tile = ((y >> 3) & 31) * 32 + ((x >> 3) & 31);
+                    entries[layer] = self.fetchBackgroundHalf(bg.screen_base + block * 0x800 + tile * 2, latch);
+                    fetching[layer] = cycle < 1004;
+                }
+            }
+        }
     }
 
     fn windowMask(self: Display, x: usize, object_window: bool) u8 {
