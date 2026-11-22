@@ -71,6 +71,7 @@ oam: [oam_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
 greenswap: u16 = 0,
+display_phase: u64 = 0,
 dispstat: u16 = vcount_match_status,
 vcount: u8 = 0,
 irq_enable: u16 = 0,
@@ -82,8 +83,8 @@ cpu_internal_cycles: u64 = 0,
 immediate_dma_at: ?u64 = null,
 dma_active: bool = false,
 dma_sequential: bool = false,
-// During a timed instruction, synchronize the timer clock at MMIO bus beats.
-timer_bus_origin: ?u64 = null,
+// Start of the timed instruction, used to sample peripherals on their MMIO bus beat.
+instruction_bus_origin: ?u64 = null,
 timer_elapsed: u64 = 0,
 // An overflow reaches IF on the following clock and the CPU two clocks later.
 peripheral_irq_pending: u14 = 0,
@@ -129,7 +130,7 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
 }
 
 fn syncPeripheralAccess(self: *Bus, address: u32) void {
-    const origin = self.timer_bus_origin orelse return;
+    const origin = self.instruction_bus_origin orelse return;
     if (!Timers.contains(address) and !Serial.contains(address) and (address < ie_address or address > ime_address + 3)) return;
     const elapsed = self.bus_cycles - origin;
     self.advanceTimers(elapsed - self.timer_elapsed);
@@ -172,13 +173,11 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
     self.advanceTimers(cycles - self.timer_elapsed);
     self.timer_elapsed = 0;
     const phase = (old_phase + cycles) % timing.cycles_per_frame;
-    self.vcount = @intCast(phase / timing.cycles_per_line);
+    self.display_phase = phase;
+    const status = self.displayStatusAt(phase);
+    self.dispstat = @truncate(status);
+    self.vcount = @truncate(status >> 16);
     const compare = self.dispstat >> 8;
-    const line_phase = phase % timing.cycles_per_line;
-    self.dispstat &= ~display_status_mask;
-    if (phase >= timing.vblank_start and phase < timing.vblank_end) self.dispstat |= vblank_status;
-    if (line_phase >= timing.hblank_start) self.dispstat |= hblank_status;
-    if (self.vcount == compare) self.dispstat |= vcount_match_status;
 
     // Detect crossed event boundaries even if the batch ends after the flag fell.
     var events: u14 = 0;
@@ -198,6 +197,16 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
         if (cycles >= timing.cyclesUntil(old_phase, edge, timing.cycles_per_frame)) events |= 4;
     }
     self.requestInterrupt(events & @as(u14, @truncate(self.dispstat >> 3)));
+}
+
+// DISPSTAT and VCOUNT share a word and must describe the same bus beat.
+fn displayStatusAt(self: *const Bus, phase: u64) u32 {
+    const line = phase / timing.cycles_per_line;
+    var status = self.dispstat & ~display_status_mask;
+    if (phase >= timing.vblank_start and phase < timing.vblank_end) status |= vblank_status;
+    if (phase % timing.cycles_per_line >= timing.hblank_start) status |= hblank_status;
+    if (line == status >> 8) status |= vcount_match_status;
+    return (@as(u32, @intCast(line)) << 16) | status;
 }
 
 fn writeDisplayStatus(self: *Bus, value: u16) void {
@@ -455,6 +464,8 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (aligned_address >= dispcnt_address and aligned_address < dispcnt_address + 8) {
         const word = if (aligned_address < dispstat_address)
             @as(u32, self.dispcnt) | (@as(u32, self.greenswap) << 16)
+        else if (self.instruction_bus_origin) |origin|
+            self.displayStatusAt((self.display_phase + (self.bus_cycles - origin)) % timing.cycles_per_frame)
         else
             @as(u32, self.dispstat) | (@as(u32, self.vcount) << 16);
         const shift: u5 = @intCast((aligned_address & 3) * 8);
@@ -575,7 +586,7 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
         return;
     }
     if (Timers.contains(aligned_address)) {
-        if (self.timer_bus_origin != null) {
+        if (self.instruction_bus_origin != null) {
             self.pending_timer_write = .{ .address = aligned_address, .value = value, .size = @sizeOf(T) };
         } else self.timers.write(T, aligned_address, value);
         return;
@@ -1139,6 +1150,19 @@ test "IWRAM loaded as data can execute through its mirrors" {
     try std.testing.expectEqual(@as(u32, 0xE1A0_0000), bus.fetch32(0x03FF_8004, .nonsequential));
     try std.testing.expectEqual(@as(u16, 0xE1A0), bus.fetch16(iwram_base + 6, .sequential));
     try std.testing.expectEqual(@as(u64, 0), bus.rom_fetch_cycles);
+}
+
+test "timed display reads sample both HBlank edges on the data beat" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.advanceDevices(0, timing.hblank_start - 2);
+    bus.instruction_bus_origin = bus.bus_cycles;
+    try std.testing.expectEqual(@as(u16, vcount_match_status), bus.readData(u16, dispstat_address));
+    try std.testing.expectEqual(@as(u16, vcount_match_status | hblank_status), bus.readData(u16, dispstat_address));
+
+    bus.instruction_bus_origin = null;
+    bus.advanceDevices(timing.hblank_start - 2, timing.cycles_per_line - timing.hblank_start + 1);
+    bus.instruction_bus_origin = bus.bus_cycles;
+    try std.testing.expectEqual(@as(u32, 1 << 16), bus.readData(u32, dispstat_address));
 }
 
 test "display timing updates scanline status and latches each enabled IRQ" {

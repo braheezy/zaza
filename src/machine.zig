@@ -120,10 +120,10 @@ pub fn stepTimed(self: *Machine) !void {
     }
     const bus_cycles_before = self.bus.bus_cycles;
     const internal_cycles_before = self.cpu.internal_cycles;
-    self.bus.timer_bus_origin = bus_cycles_before;
-    defer self.bus.timer_bus_origin = null;
+    self.bus.instruction_bus_origin = bus_cycles_before;
+    defer self.bus.instruction_bus_origin = null;
     try self.step();
-    self.bus.timer_bus_origin = null;
+    self.bus.instruction_bus_origin = null;
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
     const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
     if (internal_cycles != 0) {
