@@ -3,13 +3,14 @@ const Timers = @This();
 
 pub const base: u32 = 0x0400_0100;
 const prescalers = [_]u16{ 1, 64, 256, 1024 };
+// All channels sample the same free-running ten-bit divider.
+divider: u10 = 0,
 channels: [4]Timer = @splat(.{}),
 
 pub const Timer = struct {
     reload: u16 = 0,
     counter: u16 = 0,
     control: u8 = 0,
-    phase: u16 = 0,
     startup: u1 = 0,
 };
 
@@ -51,7 +52,6 @@ pub fn write(self: *Timers, comptime T: type, address: u32, value: T) void {
                 timer.control = byte & @as(u8, if (offset / 4 == 0) 0xC3 else 0xC7);
                 if (!was_enabled and timer.control & 0x80 != 0) {
                     timer.counter = timer.reload;
-                    timer.phase = 0;
                     timer.startup = 1;
                 }
             },
@@ -68,13 +68,16 @@ pub fn cyclesUntilOverflow(self: *const Timers) u64 {
         if (timer.control & 0x80 == 0 or timer.control & 4 != 0) continue;
         const ticks = @as(u64, 0x10000) - timer.counter;
         const period = prescalers[timer.control & 3];
-        earliest = @min(earliest, @max(1, ticks * period -| timer.phase + timer.startup));
+        const phase = (@as(u16, self.divider) + timer.startup) % period;
+        earliest = @min(earliest, timer.startup + ticks * period - phase);
     }
     return earliest;
 }
 
 // The first clock after enable loads the counter. Subsequent clocks count.
 pub fn advance(self: *Timers, cycles: u64) u14 {
+    const start = self.divider;
+    self.divider +%= @truncate(cycles);
     var previous_overflows: u64 = 0;
     var interrupts: u14 = 0;
     for (&self.channels, 0..) |*timer, index| {
@@ -85,12 +88,12 @@ pub fn advance(self: *Timers, cycles: u64) u14 {
         var ticks = previous_overflows;
         if (timer.control & 4 == 0) {
             const period = prescalers[timer.control & 3];
+            const phase = (@as(u16, start) + timer.startup) % period;
             const counting = cycles -| timer.startup;
             if (cycles != 0) timer.startup = 0;
             ticks = counting / period;
-            const remainder = counting % period + timer.phase;
+            const remainder = counting % period + phase;
             ticks += remainder / period;
-            timer.phase = @intCast(remainder % period);
         }
         const until_overflow = @as(u64, 0x10000) - timer.counter;
         previous_overflows = 0;
@@ -123,7 +126,7 @@ test "all timer prescalers retain fractional cycles and disabled timers stop" {
     for ([_]u16{ 1, 64, 256, 1024 }, 0..) |period, select| {
         var timers: Timers = .{};
         timers.write(u8, base + 2, 0x80 | @as(u8, @intCast(select)));
-        _ = timers.advance(period);
+        _ = timers.advance(if (period == 1) 1 else period - 1);
         try std.testing.expectEqual(@as(u16, 0), timers.read(u16, base));
         _ = timers.advance(1);
         try std.testing.expectEqual(@as(u16, 1), timers.read(u16, base));
@@ -131,6 +134,24 @@ test "all timer prescalers retain fractional cycles and disabled timers stop" {
         _ = timers.advance(1024);
         try std.testing.expectEqual(@as(u16, 1), timers.read(u16, base));
     }
+}
+
+test "staggered timer enables share a divider edge across wraparound" {
+    var timers: Timers = .{};
+    _ = timers.advance(1000);
+    timers.write(u32, base, 0x00C1_FFFF); // Divide by 64.
+    _ = timers.advance(20);
+    timers.write(u32, base + 4, 0x00C3_FFFF); // Divide by 1024.
+    try std.testing.expectEqual(@as(u64, 4), timers.cyclesUntilOverflow());
+    try std.testing.expectEqual(@as(u14, 0), timers.advance(3));
+    try std.testing.expectEqual(@as(u14, 0x18), timers.advance(1));
+
+    // Changing the rate of a running timer also selects an existing divider tap.
+    timers.write(u8, base + 2, 0);
+    _ = timers.advance(200);
+    timers.write(u8, base + 6, 0xC2);
+    try std.testing.expectEqual(@as(u64, 56), timers.cyclesUntilOverflow());
+    try std.testing.expectEqual(@as(u14, 0x10), timers.advance(56));
 }
 
 test "timer control byte masks and restart load the latest reload value" {

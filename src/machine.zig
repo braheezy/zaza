@@ -422,16 +422,16 @@ test "BIOS HALT wakes on a cascaded timer interrupt with IME disabled" {
     machine.bus.requestInterrupt(1); // A pending VBlank cannot wake without IE.
     machine.bus.writeData(u32, 0x0400_0100, 0x0081_FFFF); // Timer 0 ticks every 64 cycles.
     machine.bus.writeData(u32, 0x0400_0104, 0x00C4_FFFE); // Timer 1 overflows on the second cascade tick.
-    const halted_at = machine.elapsed_cycles;
+    // Timer 0 samples the free-running divider at cycles 64 and 128.
     const bus_cycles = machine.bus.bus_cycles;
 
     try machine.stepTimed();
-    try std.testing.expectEqual(halted_at + 65, machine.elapsed_cycles);
+    try std.testing.expectEqual(@as(u64, 64), machine.elapsed_cycles);
     try std.testing.expect(!machine.bus.hasEnabledInterrupt());
     try machine.stepTimed();
-    try std.testing.expectEqual(halted_at + 129, machine.elapsed_cycles);
+    try std.testing.expectEqual(@as(u64, 128), machine.elapsed_cycles);
     try machine.stepTimed();
-    try std.testing.expectEqual(halted_at + 130, machine.elapsed_cycles);
+    try std.testing.expectEqual(@as(u64, 129), machine.elapsed_cycles);
     try std.testing.expectEqual(@as(u16, 0x11), machine.bus.irq_flags);
     try std.testing.expectEqual(bus_cycles, machine.bus.bus_cycles);
     try std.testing.expectEqual(@as(u32, 12), machine.cpu.instruction_address);
