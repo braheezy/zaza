@@ -91,6 +91,8 @@ next_rom_data_address: ?u32 = null,
 iwram_data_cycles: u64 = 0,
 next_fetch_nonsequential: bool = false,
 prefetch_word: u32 = 0,
+// The first instruction after DMA can sample the final transfer on open bus.
+dma_bus_word: ?u32 = null,
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
     // A device latches its request even while IRQ delivery is disabled.
@@ -207,6 +209,11 @@ pub fn hasEnabledInterrupt(self: *const Bus) bool {
     return self.irq_enable & self.irq_flags != 0;
 }
 
+pub fn haltWakeLine(self: *const Bus) bool {
+    // A new timer IF bit reaches HALT wake one clock before it reaches the CPU IRQ line.
+    return self.irq_enable & self.irq_flags & ~@as(u16, self.timer_irq_new) != 0;
+}
+
 pub fn irqLine(self: *const Bus) bool {
     const synchronizing = self.timer_irq_new | self.timer_irq_sync;
     return self.ime_enabled and self.irq_enable & self.irq_flags & ~@as(u16, synchronizing) != 0;
@@ -231,7 +238,7 @@ pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
 }
 
 fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel) void {
-    const count: u32 = if (channel.count != 0) channel.count else if (index == 3) 0x10000 else 0x4000;
+    const count: u32 = if (channel.latched_count != 0) channel.latched_count else if (index == 3) 0x10000 else 0x4000;
     const source_step = switch ((channel.control >> 7) & 3) {
         0 => @sizeOf(T),
         1 => -%@as(u32, @sizeOf(T)),
@@ -251,21 +258,28 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
     // Charge the transfers on the shared bus. Arbitration and startup delays are approximate.
     self.bus_cycles += 2;
     for (0..count) |_| {
-        if (source < ewram_base) @panic("DMA reads below EWRAM are unsupported");
-        const value: T = if (eeprom_output) blk: {
+        const value: T = if (source < ewram_base) blk: {
+            self.chargeDataAccess(T, source);
+            break :blk wordLane(T, self.dma.channels[index].data_latch, destination);
+        } else if (eeprom_output) blk: {
             self.chargeDataAccess(T, source);
             break :blk self.save.readEepromBit();
         } else self.readData(T, source);
+        if (source >= ewram_base) {
+            self.dma.channels[index].data_latch = if (T == u16) @as(u32, value) * 0x10001 else value;
+        }
         if (eeprom_input) {
             self.chargeDataAccess(T, destination);
             self.save.shiftEepromCommand(value);
         } else {
             self.writeData(T, destination, value);
         }
-        source = (source +% source_step) & DMA.sourceMask(index);
+        source = (source +% (if (romWindow(source) != null) @sizeOf(T) else source_step)) & DMA.sourceMask(index);
         destination = (destination +% destination_step) & DMA.destinationMask(index);
     }
     if (eeprom_input) self.save.finishEepromCommand(count);
+    self.dma_bus_word = self.dma.channels[index].data_latch;
+    self.dma.channels[index].latched_count = self.dma.channels[index].count;
     self.dma.channels[index].next_source = source;
     self.dma.channels[index].next_destination =
         if ((channel.control >> 5) & 3 == 3) channel.destination else destination;
@@ -336,7 +350,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     if (self.debug_port.read(T, aligned_address)) |value| return value;
     // The no$gba identification probe sees open bus on a GBA without that extension.
     if (aligned_address >= 0x04FF_FA00 and aligned_address < 0x04FF_FA08) {
-        return wordLane(T, self.prefetch_word, aligned_address);
+        return wordLane(T, self.dma_bus_word orelse self.prefetch_word, aligned_address);
     }
     if (SaveMemory.containsParallel(address)) {
         const repeats = std.math.maxInt(T) / 0xFF;
@@ -348,7 +362,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         return wordLane(T, self.bios_fetch_word, aligned_address);
     }
     if (aligned_address < ewram_base or aligned_address >= 0x1000_0000) {
-        return wordLane(T, self.prefetch_word, aligned_address);
+        return wordLane(T, self.dma_bus_word orelse self.prefetch_word, aligned_address);
     }
     if (aligned_address == postflg_address) return @intFromBool(self.post_boot);
     if (aligned_address >= ie_address and aligned_address + @sizeOf(T) <= 0x0400_020C) {
@@ -369,7 +383,12 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     }
     if (Audio.contains(aligned_address)) return self.audio.read(T, aligned_address);
     if (Timers.contains(aligned_address)) return self.timers.read(T, aligned_address);
-    if (DMA.contains(aligned_address)) return self.dma.read(T, aligned_address);
+    if (DMA.contains(aligned_address)) {
+        if ((aligned_address - DMA.base) % 12 < 8) {
+            return wordLane(T, self.dma_bus_word orelse self.prefetch_word, aligned_address);
+        }
+        return self.dma.read(T, aligned_address);
+    }
     if (aligned_address >= keyinput_address and aligned_address < keyinput_address + 4) {
         const input: u16 = @as(u10, ~self.pressed_buttons);
         const registers = @as(u32, input) | (@as(u32, self.keypad_control) << 16);
@@ -407,7 +426,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         const low = self.display_registers.readable(word_address);
         const high = self.display_registers.readable(word_address + 2);
         const word = if (low == null and high == null)
-            self.prefetch_word
+            self.dma_bus_word orelse self.prefetch_word
         else
             @as(u32, low orelse 0) | (@as(u32, high orelse 0) << 16);
         return wordLane(T, word, aligned_address);
@@ -426,8 +445,8 @@ pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
         return;
     }
     if (self.hasEepromAt(address)) return; // Commands arrive as a DMA3 bitstream.
-    // ROM stores occupy the bus, including DMA to Game Pak ROM.
-    if (aligned_address < bios_size_bytes or romWindow(aligned_address) != null) return;
+    // BIOS, the unbacked area below EWRAM, and Game Pak ROM accept no stores.
+    if (aligned_address < ewram_base or romWindow(aligned_address) != null) return;
     self.writeAligned(T, aligned_address, value);
 }
 

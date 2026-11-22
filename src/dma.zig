@@ -12,6 +12,8 @@ pub const Channel = struct {
     destination: u32 = 0,
     count: u16 = 0,
     control: u16 = 0,
+    latched_count: u16 = 0,
+    data_latch: u32 = 0,
     next_source: u32 = 0,
     next_destination: u32 = 0,
 
@@ -65,6 +67,7 @@ pub fn write(self: *DMA, comptime T: type, address: u32, value: T) void {
                 if (channel.trigger() == .special or channel.control & (1 << 11) != 0) {
                     @panic("Special DMA triggers are unsupported");
                 }
+                channel.latched_count = channel.count;
                 channel.next_source = channel.source;
                 channel.next_destination = channel.destination;
             }

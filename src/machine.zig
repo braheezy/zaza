@@ -62,6 +62,7 @@ pub fn step(self: *Machine) !void {
     // Sample IRQ before executing the next queued instruction.
     if (self.bus.irqLine() and !self.cpu.irqMasked()) {
         if (self.bus.bios == null) return error.IrqNeedsBios;
+        self.bus.dma_bus_word = null;
         self.cpu.enterIrq(&self.bus);
         return;
     }
@@ -70,6 +71,7 @@ pub fn step(self: *Machine) !void {
     const result = self.cpu.step(&self.bus);
     self.bus.executing_bios = false;
     try result;
+    self.bus.dma_bus_word = null;
     self.bus.runDma(.immediate);
 }
 
@@ -83,7 +85,13 @@ pub fn stepTimed(self: *Machine) !void {
         self.advanceClock(cycles);
         return;
     }
-    if (self.bus.halted and !self.bus.hasEnabledInterrupt()) {
+    if (self.bus.halted) {
+        if (self.bus.hasEnabledInterrupt()) {
+            // Synchronization and CPU restart both leave the instruction pipeline idle.
+            if (self.bus.haltWakeLine()) self.bus.halted = false;
+            self.advanceClock(1);
+            return;
+        }
         const line_phase = self.elapsed_cycles % timing.cycles_per_line;
         const display_cycles = if (line_phase < timing.hblank_start)
             timing.hblank_start - line_phase
@@ -437,7 +445,14 @@ test "BIOS HALT wakes on a cascaded timer interrupt with IME disabled" {
     try std.testing.expectEqual(@as(u32, 12), machine.cpu.instruction_address);
 
     try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 130), machine.elapsed_cycles);
+    try std.testing.expect(machine.bus.halted);
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u64, 131), machine.elapsed_cycles);
     try std.testing.expect(!machine.bus.halted);
+    try std.testing.expectEqual(bus_cycles, machine.bus.bus_cycles);
+    try std.testing.expectEqual(@as(u32, 12), machine.cpu.instruction_address);
+    try machine.stepTimed();
     try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[2]);
     try std.testing.expectEqual(@as(u16, 0x11), machine.bus.irq_flags);
 }
