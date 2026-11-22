@@ -23,11 +23,13 @@ pub const Display = struct {
 
         const mosaic = self.registers.stored(0x0400_004C);
         var backgrounds: [4]?Background = @splat(null);
-        for (&backgrounds, 0..) |*background, index| {
+        const mode = self.control & 7;
+        if (mode == 0) for (&backgrounds, 0..) |*background, index| {
             if (self.control & (@as(u16, 0x100) << @intCast(index)) != 0) {
                 background.* = self.backgroundForLine(index, y, mosaic);
             }
-        }
+        };
+        const bitmap = if (mode >= 3 and self.control & (1 << 10) != 0) BitmapLine.init(self, y, mosaic) else null;
 
         var objects: [video.width]ObjectPixel = @splat(.{});
         if (self.control & (1 << 12) != 0) self.drawObjects(y, mosaic, &objects);
@@ -41,6 +43,11 @@ pub const Display = struct {
                 const bg = maybe_background orelse continue;
                 const color = self.backgroundPixel(bg, x) orelse continue;
                 layers.insert(.{ .color = color, .rank = bg.rank, .layer = @intCast(index) });
+            }
+            if (bitmap) |bg| {
+                if (mask & (1 << 2) != 0) {
+                    if (bg.pixel(self, x)) |color| layers.insert(.{ .color = color, .layer = 2, .rank = bg.rank });
+                }
             }
             if (mask & (1 << object_layer) != 0) {
                 if (object.pixel) |pixel| layers.insert(pixel);
@@ -154,11 +161,59 @@ pub const Display = struct {
         var tile: usize = object.third & 0x03FF;
         if (object.eight_bit and !one_dimensional) tile &= ~@as(usize, 1);
         tile += texel.y / 8 * stride + texel.x / 8 * tile_units;
-        const tile_base = background_vram_size + (tile * 32) % object_vram_size;
-        const index = tilePixel(self.vram, tile_base, texel.x & 7, texel.y & 7, object.eight_bit);
+        // A 256-color tile spans two 32-byte character units, including at wraparound.
+        const tile_y = texel.y & 7;
+        if (object.eight_bit) tile += tile_y / 4;
+        tile &= 0x3FF;
+        if (self.control & 7 >= 3 and tile < 512) return null;
+        const tile_base = background_vram_size + tile * 32;
+        const index = tilePixel(self.vram, tile_base, texel.x & 7, if (object.eight_bit) tile_y & 3 else tile_y, object.eight_bit);
         if (index == 0) return null;
         const bank: usize = if (object.eight_bit) 0 else (object.third >> 12) * 16;
         return bank + index;
+    }
+};
+
+const BitmapLine = struct {
+    start_x: i32,
+    start_y: i32,
+    dx: i16,
+    dy: i16,
+    mosaic_width: usize,
+    rank: u5,
+
+    fn init(display: Display, y: usize, mosaic: u16) BitmapLine {
+        const regs = display.registers;
+        const control = regs.stored(0x0400_000C);
+        const use_mosaic = control & (1 << 6) != 0;
+        const line: i32 = @intCast(if (use_mosaic) y - y % mosaicSize(mosaic, 4) else y);
+        const pb: i16 = @bitCast(regs.stored(0x0400_0022));
+        const pd: i16 = @bitCast(regs.stored(0x0400_0026));
+        return .{
+            .start_x = regs.affineReference(0x0400_0028) + pb * line,
+            .start_y = regs.affineReference(0x0400_002C) + pd * line,
+            .dx = @bitCast(regs.stored(0x0400_0020)),
+            .dy = @bitCast(regs.stored(0x0400_0024)),
+            .mosaic_width = if (use_mosaic) mosaicSize(mosaic, 0) else 1,
+            .rank = @intCast((control & 3) * 5 + 3),
+        };
+    }
+
+    fn pixel(self: BitmapLine, display: Display, x: usize) ?u16 {
+        const screen_x: i32 = @intCast(x - x % self.mosaic_width);
+        const sx = (self.start_x + self.dx * screen_x) >> 8;
+        const sy = (self.start_y + self.dy * screen_x) >> 8;
+        const mode = display.control & 7;
+        const width: usize = if (mode == 5) 160 else video.width;
+        const height: usize = if (mode == 5) 128 else video.height;
+        if (sx < 0 or sy < 0 or sx >= width or sy >= height) return null;
+        const offset = @as(usize, @intCast(sy)) * width + @as(usize, @intCast(sx));
+        const page: usize = if (mode != 3 and display.control & (1 << 4) != 0) 0xA000 else 0;
+        if (mode == 4) {
+            const index = display.vram[page + offset];
+            return if (index == 0) null else readHalf(display.palette, @as(usize, index) * 2);
+        }
+        return readHalf(display.vram, page + offset * 2);
     }
 };
 

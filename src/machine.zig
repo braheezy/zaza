@@ -2,7 +2,7 @@ const Cpu = @import("cpu.zig");
 const Bus = @import("bus.zig");
 const Machine = @This();
 const video = @import("video.zig");
-const mode0 = @import("mode0.zig");
+const Display = @import("display.zig").Display;
 const timing = @import("timing.zig");
 const input = @import("input.zig");
 const SaveMemory = @import("save_memory.zig");
@@ -11,9 +11,10 @@ cpu: Cpu,
 bus: Bus,
 elapsed_cycles: u64 = 0,
 dma_cycles_pending: u64 = 0,
-mode0_frame: video.Frame = undefined,
-mode0_lines: usize = 0,
-mode0_frame_number: ?u64 = null,
+rendered_frame: video.Frame = undefined,
+line_oam: [1024]u8 = @splat(0),
+rendered_lines: usize = 0,
+rendered_frame_number: ?u64 = null,
 
 const vblank_start = timing.vblank_start;
 
@@ -171,15 +172,20 @@ fn renderVisibleLines(self: *Machine, cycles: u64) void {
     var edge = self.elapsed_cycles + next_hblank;
     while (edge <= end) : (edge += timing.cycles_per_line) {
         const line = (edge % timing.cycles_per_frame) / timing.cycles_per_line;
+        // OBJ evaluation for the next line precedes OAM writes during HBlank.
+        if (line == timing.lines_per_frame - 1) self.line_oam = self.bus.oam;
         if (line >= video.height) continue;
-        if (line == 0) self.mode0_lines = 0;
-        if (self.bus.dispcnt & 7 != 0 or self.mode0_lines != line) continue;
+        defer self.line_oam = self.bus.oam;
+        if (line == 0) self.rendered_lines = 0;
+        if (!self.supportsDisplayMode() or self.rendered_lines != line) continue;
 
         // Sample the visible line before the bus applies HBlank DMA writes.
-        self.mode0Display().renderLine(@intCast(line), &self.mode0_frame[line]);
-        self.mode0_lines += 1;
-        if (self.mode0_lines == video.height) {
-            self.mode0_frame_number = edge / timing.cycles_per_frame;
+        var display = self.currentDisplay();
+        display.oam = &self.line_oam;
+        display.renderLine(@intCast(line), &self.rendered_frame[line]);
+        self.rendered_lines += 1;
+        if (self.rendered_lines == video.height) {
+            self.rendered_frame_number = edge / timing.cycles_per_frame;
         }
     }
 }
@@ -522,27 +528,28 @@ pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!
 
 /// Capture the current display configuration for instruction stepping and inspection.
 pub fn snapshotBitmap(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
-    switch (self.bus.dispcnt & 7) {
-        0 => {
-            const display = self.mode0Display();
-            for (frame, 0..) |*row, y| display.renderLine(y, row);
-        },
-        3 => video.decodeMode3(self.bus.vram[0..video.bitmap_size_bytes], frame),
-        4 => self.snapshotMode4(frame),
-        else => return error.UnsupportedDisplayMode,
-    }
+    if (!self.supportsDisplayMode()) return error.UnsupportedDisplayMode;
+    const display = self.currentDisplay();
+    for (frame, 0..) |*row, y| display.renderLine(y, row);
 }
 
-/// Return the completed Mode 0 scanlines when called at the end of runFrame.
+fn supportsDisplayMode(self: *const Machine) bool {
+    return switch (self.bus.dispcnt & 7) {
+        0, 3, 4, 5 => true,
+        else => false,
+    };
+}
+
+/// Return the completed scanlines when called at the end of runFrame.
 pub fn snapshotFrame(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
-    if (self.mode0_frame_number == self.elapsed_cycles / timing.cycles_per_frame) {
-        frame.* = self.mode0_frame;
+    if (self.rendered_frame_number == self.elapsed_cycles / timing.cycles_per_frame) {
+        frame.* = self.rendered_frame;
         return;
     }
     try self.snapshotBitmap(frame);
 }
 
-fn mode0Display(self: *const Machine) mode0.Display {
+fn currentDisplay(self: *const Machine) Display {
     return .{
         .control = self.bus.dispcnt,
         .green_swap = self.bus.greenswap != 0,
@@ -619,6 +626,34 @@ test "Mode 0 composites sprites through window masks, alpha and affine sampling"
     try std.testing.expectEqual(video.decodeColor(0x7C00), frame[4][4]);
 }
 
+test "bitmap BG2 priority and transparency compose with upper OBJ VRAM" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const bus = &machine.bus;
+    bus.writeData(u16, Bus.palette_base + 0x202, 0x7C00);
+    bus.writeData(u16, Bus.palette_base + 2, 0x001F);
+    bus.writeData(u16, Bus.vram_base + 0x14000, 0x1111);
+    bus.writeData(u16, Bus.oam_base + 4, 0x600); // Tile 512, priority 1.
+    var row: [video.width]video.Rgb = undefined;
+    for ([_]u16{ 3, 4, 5 }) |mode| {
+        bus.writeData(u16, Bus.dispcnt_address, 0x1400 | mode);
+        bus.writeData(u16, Bus.vram_base, if (mode == 4) 1 else 0x001F);
+        bus.writeData(u16, 0x0400_000C, 0);
+        machine.currentDisplay().renderLine(0, &row);
+        try std.testing.expectEqual(video.decodeColor(0x001F), row[0]);
+        try std.testing.expectEqual(video.decodeColor(if (mode == 4) 0x7C00 else 0), row[1]);
+        bus.writeData(u16, 0x0400_000C, 1);
+        machine.currentDisplay().renderLine(0, &row);
+        try std.testing.expectEqual(video.decodeColor(0x7C00), row[0]);
+    }
+    // Lower OBJ tiles overlap the bitmap pages and cannot supply sprite pixels.
+    bus.writeData(u16, Bus.oam_base + 4, 0);
+    bus.writeData(u16, Bus.vram_base + 0x10000, 0x1111);
+    machine.currentDisplay().renderLine(0, &row);
+    try std.testing.expectEqual(video.decodeColor(0x001F), row[0]);
+}
+
 test "Mode 0 replay samples visible lines before HBlank DMA updates the backdrop" {
     const std = @import("std");
     var machine: Machine = undefined;
@@ -635,32 +670,6 @@ test "Mode 0 replay samples visible lines before HBlank DMA updates the backdrop
     try std.testing.expectEqual(video.decodeColor(0), frame[0][0]);
     try std.testing.expectEqual(video.decodeColor(0x001F), frame[1][0]);
     try std.testing.expectEqual(video.decodeColor(0x03E0), frame[2][0]);
-}
-
-fn snapshotMode4(self: *const Machine, frame: *video.Frame) void {
-    const registers = &self.bus.display_registers;
-    const page = self.bus.dispcnt & (1 << 4) != 0;
-    const offset: usize = if (page) video.mode4_page_stride_bytes else 0;
-    const mosaic_enabled = registers.stored(0x0400_000C) & (1 << 6) != 0;
-    const mosaic = registers.stored(0x0400_004C);
-    video.renderMode4(
-        self.bus.vram[offset..][0..video.mode4_bitmap_size_bytes],
-        self.bus.palette[0..video.background_palette_size_bytes],
-        .{
-            .enabled = self.bus.dispcnt & (1 << 10) != 0,
-            .forced_blank = self.bus.dispcnt & (1 << 7) != 0,
-            .green_swap = self.bus.greenswap != 0,
-            .dx = @bitCast(registers.stored(0x0400_0020)),
-            .dmx = @bitCast(registers.stored(0x0400_0022)),
-            .dy = @bitCast(registers.stored(0x0400_0024)),
-            .dmy = @bitCast(registers.stored(0x0400_0026)),
-            .origin_x = registers.affineReference(0x0400_0028),
-            .origin_y = registers.affineReference(0x0400_002C),
-            .mosaic_width = if (mosaic_enabled) 1 + @as(u5, @as(u4, @truncate(mosaic))) else 1,
-            .mosaic_height = if (mosaic_enabled) 1 + @as(u5, @as(u4, @truncate(mosaic >> 4))) else 1,
-        },
-        frame,
-    );
 }
 
 test "machine clock routes timer overflow IRQs while delivery is masked" {
