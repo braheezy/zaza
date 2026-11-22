@@ -56,6 +56,19 @@ pub fn build(b: *std.Build) void {
             executable.step.dependOn(&b.addFail("Desktop playback currently requires macOS. Use -Ddesktop=false for automation.").step);
         } else if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
             const mach_module = mach.module("mach");
+            const parser = b.lazyDependency("ini", .{ .target = target, .optimize = optimize }) orelse return;
+            module.addImport("ini", parser.module("ini"));
+            b.getInstallStep().dependOn(&b.addInstallFile(parser.path("LICENCE"), "share/licenses/ini/LICENCE").step);
+            const desktop_tests = b.addTest(.{ .root_module = b.createModule(.{
+                .root_source_file = b.path("src/desktop_config.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) });
+            desktop_tests.root_module.addImport("ini", parser.module("ini"));
+            desktop_tests.root_module.addImport("mach", mach_module);
+            const run_desktop_tests = b.addRunArtifact(desktop_tests);
+            test_step.dependOn(&run_desktop_tests.step);
+            b.step("test-desktop", "Test desktop configuration and overlay").dependOn(&run_desktop_tests.step);
             module.addImport("mach", mach_module);
             module.addImport("objc", mach_module.import_table.get("objc").?);
         }

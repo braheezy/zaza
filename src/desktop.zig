@@ -7,6 +7,8 @@ const video = @import("video.zig");
 const Playback = @import("desktop_audio.zig");
 const Machine = @import("machine.zig");
 const input = @import("input.zig");
+const Config = @import("desktop_config.zig");
+const Fps = @import("fps.zig");
 const timing = @import("timing.zig");
 
 const frame_period_ns = timing.cycles_per_frame * std.time.ns_per_s / (1 << 24);
@@ -19,6 +21,10 @@ const Modules = mach.Modules(.{ mach.Core, App });
 
 pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8, volume: u8) !void {
     const arena = init.arena.allocator();
+    const config = Config.load(init.io, arena) catch |err| {
+        std.log.err("loading zaza.ini: {s}", .{@errorName(err)});
+        return err;
+    };
     const rom = try cartridge.loadRom(init.io, arena, path);
     const machine = try arena.create(Machine);
     var save = try options.start(machine, init.io, arena, rom);
@@ -36,7 +42,7 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8
     var modules: Modules = undefined;
     try modules.init(init.gpa, init.io);
     defer modules.deinit(init.gpa);
-    modules.mods.app = .{ .machine = machine, .audio = live_audio };
+    modules.mods.app = .{ .machine = machine, .audio = live_audio, .config = config };
     modules.get(.app).run(.main);
     if (modules.mods.app.failure) |err| return err;
     if (save) |*session| try session.flush(init.io, &machine.bus.save);
@@ -58,6 +64,8 @@ const App = struct {
         .{ mach.Core, .snapshotEnd },
     });
 
+    config: Config,
+    display_fps: bool = false,
     machine: *Machine,
     audio: ?*Playback,
     failure: ?anyerror = null,
@@ -102,8 +110,11 @@ const App = struct {
             switch (event) {
                 .close => core.exit(),
                 .focus_lost => app.keys = .{},
-                .key_press => |key| if (key.key == .escape) {
-                    core.exit();
+                .key_press => |key| if (app.config.action(key.key, key.mods)) |action| {
+                    switch (action) {
+                        .quit => core.exit(),
+                        .showFps => app.config.show_fps = !app.config.show_fps,
+                    }
                 } else if (mappedButton(key.key)) |button| {
                     app.keys.press(button);
                 },
@@ -145,6 +156,7 @@ const App = struct {
     }
 
     pub fn publish(app: *App) void {
+        app.display_fps = app.config.show_fps;
         if (app.pending) |next_frame| {
             app.frame = next_frame;
             app.pending = null;
@@ -152,18 +164,24 @@ const App = struct {
         }
     }
 
-    pub fn render(app: *App, core: *mach.Core) void {
+    pub fn render(app: *App, core: *mach.Core, io: std.Io) void {
         const window = core.windows.getValue(core.window);
         if (app.renderer == null) {
             app.renderer = Renderer.init(window.device, window.framebuffer_format);
         }
         const renderer = &app.renderer.?;
-        if (renderer.uploaded_revision != app.frame_revision) {
-            renderer.upload(window.queue, &app.frame);
-            renderer.uploaded_revision = app.frame_revision;
-        }
         const target = window.swap_chain.getCurrentTextureView() orelse return;
         defer target.release();
+        const new_frame = renderer.uploaded_revision != app.frame_revision;
+        renderer.fps.tick(std.Io.Clock.awake.now(io).nanoseconds, new_frame and app.frame_revision != 0);
+        if (new_frame or renderer.overlay_enabled != app.display_fps or
+            (app.display_fps and renderer.uploaded_fps != renderer.fps.tenths))
+        {
+            renderer.upload(window.queue, &app.frame, app.display_fps);
+            renderer.uploaded_revision = app.frame_revision;
+            renderer.overlay_enabled = app.display_fps;
+            renderer.uploaded_fps = renderer.fps.tenths;
+        }
         const encoder = window.device.createCommandEncoder(&.{});
         defer encoder.release();
         const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
@@ -242,6 +260,9 @@ const Renderer = struct {
     pipeline: *gpu.RenderPipeline,
     bind_group: *gpu.BindGroup,
     texture: *gpu.Texture,
+    fps: Fps = .{},
+    overlay_enabled: bool = false,
+    uploaded_fps: ?u16 = null,
     uploaded_revision: ?u64 = null,
 
     const size = gpu.Extent3D{ .width = video.width, .height = video.height };
@@ -287,13 +308,14 @@ const Renderer = struct {
         return .{ .pipeline = pipeline, .bind_group = bind_group, .texture = texture };
     }
 
-    fn upload(self: *const Renderer, queue: *gpu.Queue, pixels_rgb: *const video.Frame) void {
+    fn upload(self: *const Renderer, queue: *gpu.Queue, pixels_rgb: *const video.Frame, show_fps: bool) void {
         var pixels: [video.height][video.width][4]u8 = undefined;
         for (&pixels, pixels_rgb) |*target_row, *source_row| {
             for (target_row, source_row) |*target, source| {
                 target.* = .{ source.red, source.green, source.blue, 255 };
             }
         }
+        if (show_fps) self.fps.draw(&pixels);
         queue.writeTexture(&.{ .texture = self.texture }, &.{
             .bytes_per_row = video.width * 4,
             .rows_per_image = video.height,

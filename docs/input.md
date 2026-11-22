@@ -18,7 +18,32 @@ Live mode plays through the default audio device at 30% volume. Put
 | Start, Select | Enter, left Shift |
 
 The window has a fixed 720 × 480 point content area (3× the GBA display).
-Escape closes the player. Losing focus releases all keys.
+Escape closes the player by default. Losing focus releases all keys.
+
+## FPS and emulator hotkeys
+
+Press **F3** to toggle FPS in the upper-right corner. The counter measures distinct
+game frames submitted for display over the last second. It updates in tenths of
+a frame per second. Headless screenshots contain only the GBA image.
+
+The desktop player reads `zaza.ini` from its working directory at launch.
+For example, place this in the project root when running Zaza from there:
+
+```ini
+[ports.qt]
+showFps=1
+
+[shortcutKey]
+showFps=Ctrl+F
+quit=Esc
+```
+
+`showFps=1` starts with the counter visible. The default is `0`. The setting
+and section names follow mGBA’s INI conventions. Zaza keeps them in one file.
+Shortcuts use physical key names such as `F3`, `X`, and `Left`, with optional
+`Ctrl`, `Shift`, `Alt`, and `Meta` (`Cmd` on macOS). An empty shortcut
+disables that action’s binding. A matching emulator shortcut takes precedence
+over a GBA button on the same key. Toggling affects the current session.
 
 ## Operating a game from an agent
 
