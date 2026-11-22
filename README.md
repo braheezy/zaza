@@ -1,6 +1,26 @@
 # zaza
 
-`zaza` is a Game Boy Advance emulator.
+`zaza` is a Game Boy Advance emulator. It hopes to be:
+
+- **performant**: Run many instances of `zqza` on the same machine, and fast
+- **accurate**: Strict timing adherence and cycle tracking
+- **embeddable**: `libzaza` holds all emulation logic and thin clients can be created in hundreds of lines of code.
+
+## running
+
+If you wanna run it, you have to build it yourself. Start by getting the project:
+
+```
+git clone https://github.com/braheezy/zaza
+cd zaza
+```
+
+Only requirement is Zig and this project uses [Mach](https://machengine.org/) so you'll need the proper nominated Zig version. [`anyzig`](https://marler8997.github.io/anyzig/) will handle this for you.
+
+```
+zig build
+./zig-out/bin/zaza <path to rom>
+```
 
 ## External tests
 
