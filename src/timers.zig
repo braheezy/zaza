@@ -2,9 +2,13 @@ const std = @import("std");
 const Timers = @This();
 
 pub const base: u32 = 0x0400_0100;
+const no_deadline = std.math.maxInt(u64);
 const prescalers = [_]u16{ 1, 64, 256, 1024 };
 // All channels sample the same free-running ten-bit divider.
 divider: u10 = 0,
+// Counter values lag by pending_cycles; the deadline is relative to the current cycle.
+pending_cycles: u64 = 0,
+until_overflow: u64 = no_deadline,
 overflowed: u4 = 0,
 channels: [4]Timer = @splat(.{}),
 
@@ -19,9 +23,10 @@ pub fn contains(address: u32) bool {
     return address >= base and address < base + 16;
 }
 
-pub fn read(self: *const Timers, comptime T: type, address: u32) T {
+pub fn read(self: *Timers, comptime T: type, address: u32) T {
     std.debug.assert(contains(address));
     std.debug.assert(address + @sizeOf(T) <= base + 16);
+    self.syncCounters();
     var result: T = 0;
     for (0..@sizeOf(T)) |index| {
         const offset = address - base + @as(u32, @intCast(index));
@@ -41,6 +46,7 @@ pub fn read(self: *const Timers, comptime T: type, address: u32) T {
 pub fn write(self: *Timers, comptime T: type, address: u32, value: T) void {
     std.debug.assert(contains(address));
     std.debug.assert(address + @sizeOf(T) <= base + 16);
+    self.syncCounters();
     for (0..@sizeOf(T)) |index| {
         const offset = address - base + @as(u32, @intCast(index));
         const timer = &self.channels[offset / 4];
@@ -60,10 +66,15 @@ pub fn write(self: *Timers, comptime T: type, address: u32, value: T) void {
             else => unreachable,
         }
     }
+    self.until_overflow = self.nextOverflow();
+}
+
+pub fn cyclesUntilOverflow(self: *const Timers) u64 {
+    return self.until_overflow;
 }
 
 // Cascade timers only tick when a clock-driven timer overflows.
-pub fn cyclesUntilOverflow(self: *const Timers) u64 {
+fn nextOverflow(self: *const Timers) u64 {
     var earliest: u64 = std.math.maxInt(u64);
     for (self.channels) |timer| {
         if (timer.control & 0x80 == 0 or timer.control & 4 != 0) continue;
@@ -78,6 +89,29 @@ pub fn cyclesUntilOverflow(self: *const Timers) u64 {
 // The first clock after enable loads the counter. Subsequent clocks count.
 pub fn advance(self: *Timers, cycles: u64) u14 {
     self.overflowed = 0;
+    if (self.until_overflow == no_deadline) {
+        self.divider +%= @truncate(cycles);
+        return 0;
+    }
+    if (cycles < self.until_overflow) {
+        self.pending_cycles += cycles;
+        self.until_overflow -= cycles;
+        return 0;
+    }
+    self.syncCounters();
+    const interrupts = self.advanceCounters(cycles);
+    self.until_overflow = self.nextOverflow();
+    return interrupts;
+}
+
+fn syncCounters(self: *Timers) void {
+    if (self.pending_cycles == 0) return;
+    const interrupts = self.advanceCounters(self.pending_cycles);
+    std.debug.assert(interrupts == 0);
+    self.pending_cycles = 0;
+}
+
+fn advanceCounters(self: *Timers, cycles: u64) u14 {
     const start = self.divider;
     self.divider +%= @truncate(cycles);
     var previous_overflows: u64 = 0;
