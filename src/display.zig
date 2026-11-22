@@ -9,6 +9,7 @@ const backdrop_layer = 5;
 
 pub const Display = struct {
     control: u16,
+    bg_pixel_mask: ?*const [video.width]u8 = null,
     green_swap: bool,
     registers: *const DisplayRegisters,
     vram: *const [background_vram_size + object_vram_size]u8,
@@ -36,7 +37,8 @@ pub const Display = struct {
         const effect = Effects.init(self.registers);
         const backdrop: Pixel = .{ .color = readHalf(self.palette, 0), .rank = 20, .layer = backdrop_layer };
         for (row, objects, 0..) |*output, object, x| {
-            const mask = self.windowMask(x, y, object.window);
+            var mask = self.windowMask(x, y, object.window);
+            if (self.bg_pixel_mask) |pixels| mask &= 0xF0 | pixels[x];
             var layers: Layers = .{ .front = backdrop, .behind = backdrop };
             for (backgrounds, 0..) |maybe_background, index| {
                 if (mask & (@as(u8, 1) << @intCast(index)) == 0) continue;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Bus = @This();
+const video = @import("video.zig");
 const timing = @import("timing.zig");
 const DisplayRegisters = @import("display_registers.zig");
 const Audio = @import("audio.zig");
@@ -70,6 +71,9 @@ vram: [vram_size_bytes]u8 = @splat(0),
 oam: [oam_size_bytes]u8 = @splat(0),
 // Display control storage; rendering currently uses only the mode bits.
 dispcnt: u16 = 0,
+bg_at_latch: ?u4 = null,
+bg_pixel_mask: [video.width]u8 = undefined,
+bg_pixels_changed: bool = false,
 bg_enable_previous: u4 = 0,
 bg_enable_ready: u4 = 0,
 greenswap: u16 = 0,
@@ -105,10 +109,28 @@ dma_bus_word: ?u32 = null,
 /// Sample BG enables for this scanline, then advance their two-line startup delay.
 pub fn scanlineDisplayControl(self: *Bus) u16 {
     const enabled: u4 = @truncate(self.dispcnt >> 8);
-    const visible = enabled & self.bg_enable_ready;
+    const visible = if (self.bg_pixels_changed) self.bg_enable_ready else self.bg_enable_ready & enabled;
     self.bg_enable_ready = self.bg_enable_previous;
-    self.bg_enable_previous = enabled;
+    self.bg_enable_previous = self.bg_at_latch orelse enabled;
+    self.bg_at_latch = null;
     return (self.dispcnt & ~@as(u16, 0x0F00)) | (@as(u16, visible) << 8);
+}
+
+fn recordBackgroundWrite(self: *Bus, value: u16) void {
+    const before: u4 = @truncate(self.dispcnt >> 8);
+    const after: u4 = @truncate(value >> 8);
+    if (before == after) return;
+    const elapsed = if (self.instruction_bus_origin) |origin| self.bus_cycles - origin else 0;
+    const phase = (self.display_phase + elapsed) % timing.cycles_per_line;
+    // Once the line is rendered, HBlank writes feed the next line.
+    if (phase >= timing.hblank_start and self.display_phase % timing.cycles_per_line >= timing.hblank_start) return;
+    if (phase > timing.bg_enable_latch and self.bg_at_latch == null) self.bg_at_latch = before;
+    // The compositor samples the live enable bits once per four clocks.
+    const drawn_cycles = phase -| timing.first_pixel_merge;
+    const x = @min(video.width, std.math.divCeil(u64, drawn_cycles, timing.cycles_per_pixel) catch unreachable);
+    if (!self.bg_pixels_changed) @memset(&self.bg_pixel_mask, before);
+    @memset(self.bg_pixel_mask[x..], after);
+    self.bg_pixels_changed = true;
 }
 
 pub fn requestInterrupt(self: *Bus, sources: u14) void {
@@ -642,10 +664,7 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
     }
     if (T == u16) {
         if (aligned_address == dispcnt_address) {
-            // Disabling a layer cancels even a partially completed startup.
-            const enabled: u4 = @truncate(value >> 8);
-            self.bg_enable_previous &= enabled;
-            self.bg_enable_ready &= enabled;
+            self.recordBackgroundWrite(value);
             self.dispcnt = value;
             return;
         }
