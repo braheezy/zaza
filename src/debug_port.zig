@@ -50,7 +50,9 @@ fn send(self: *DebugPort) void {
     const message = std.mem.sliceTo(&self.buffer, 0);
     switch (self.flags & 7) {
         // Guest errors are diagnostic output.
-        0...2 => log.warn("{s}", .{message}),
+        0 => std.log.scoped(.gba_fatal).err("{s}", .{message}),
+        1 => log.err("{s}", .{message}),
+        2 => log.warn("{s}", .{message}),
         3 => log.info("{s}", .{message}),
         4 => log.debug("{s}", .{message}),
         else => {},

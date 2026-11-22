@@ -1,4 +1,3 @@
-pub const log_options: std.Options = .{ .log_scope_levels = &.{.{ .scope = .gba, .level = .debug }} };
 const std = @import("std");
 const zaza = @import("libzaza");
 const wav = @import("wav.zig");

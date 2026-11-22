@@ -152,3 +152,29 @@ The first frame runs from cartridge startup to VBlank. Later frames span
 a full display period. The WAV contains the digital mix before analog output filtering.
 The PSG oscillators, length counters, sweep, and envelopes also advance when
 a WAV is not being recorded.
+
+## Filtering log output
+
+The CLI and desktop player read log settings from the working directory's
+`zaza.ini` at startup. Messages go to stderr, so session stdout remains
+available for the agent protocol. For example, keep host warnings and errors,
+show guest messages through info, and silence audio backend diagnostics:
+
+```ini
+[ports.qt]
+logLevel=7
+logLevel.gba.debug=15
+logLevel.sysaudio=0
+```
+
+Values are mGBA-style bit masks. Add 1 for fatal, 2 for error, 4 for warning,
+8 for info, and 16 for debug. Zero silences a category. A category setting
+replaces the global mask. The mGBA stub (32) and game-error (64) bits are
+accepted for config compatibility; Zaza currently emits neither level.
+
+`gba.debug` selects guest messages from the mGBA debug port. Guest fatal
+messages are diagnostics and execution continues. Other names match Zig log
+scopes, including `mach`, `sysaudio`, and `default` for unscoped messages.
+With no settings, guest messages at every level and the host's normal
+build-mode diagnostics are visible. Embedders retain their own root
+`std_options` and logging policy.

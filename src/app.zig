@@ -1,8 +1,9 @@
 const std = @import("std");
 const cartridge = @import("cartridge.zig");
-pub const std_options = @import("replay.zig").log_options;
+pub const std_options = @import("logging.zig").options;
 
 pub fn main(init: std.process.Init) !void {
+    try @import("logging.zig").load(init.io, init.arena.allocator());
     var args = (try init.minimal.args.toSlice(init.arena.allocator()))[1..];
     var options: cartridge.Options = .{};
     var volume: u8 = 30;

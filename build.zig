@@ -19,6 +19,9 @@ pub fn build(b: *std.Build) void {
     lib.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
     b.installFile("vendor/emibios/LICENSE", "share/licenses/emibios/LICENSE");
     b.installFile("vendor/emibios/NOTICE", "share/licenses/emibios/NOTICE");
+    const parser = b.lazyDependency("ini", .{ .target = target, .optimize = optimize }) orelse return;
+    module.addImport("ini", parser.module("ini"));
+    b.getInstallStep().dependOn(&b.addInstallFile(parser.path("LICENCE"), "share/licenses/ini/LICENCE").step);
     const executable = b.addExecutable(.{ .name = "zaza", .root_module = module });
     b.installArtifact(executable);
 
@@ -57,7 +60,6 @@ pub fn build(b: *std.Build) void {
             executable.step.dependOn(&b.addFail("Desktop playback currently requires macOS. Use -Ddesktop=false for automation.").step);
         } else if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
             const mach_module = mach.module("mach");
-            const parser = b.lazyDependency("ini", .{ .target = target, .optimize = optimize }) orelse return;
             const app_module = b.createModule(.{ .root_source_file = b.path("src/app.zig"), .target = target, .optimize = optimize });
             app_module.addImport("libzaza", lib);
             const app = b.addExecutable(.{ .name = "zaza-app", .root_module = app_module });
@@ -67,7 +69,6 @@ pub fn build(b: *std.Build) void {
             if (b.args) |args| play.addArgs(args);
             b.step("play", "Play a cartridge in the desktop app").dependOn(&play.step);
             app_module.addImport("ini", parser.module("ini"));
-            b.getInstallStep().dependOn(&b.addInstallFile(parser.path("LICENCE"), "share/licenses/ini/LICENCE").step);
             const desktop_tests = b.addTest(.{ .root_module = b.createModule(.{
                 .root_source_file = b.path("src/desktop_config.zig"),
                 .target = target,

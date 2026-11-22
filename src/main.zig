@@ -1,4 +1,4 @@
-pub const std_options: std.Options = replay.log_options;
+pub const std_options = @import("logging.zig").options;
 const std = @import("std");
 const replay = @import("replay.zig");
 const Machine = @import("libzaza").Emulator;
@@ -16,6 +16,7 @@ const usage =
     "Options: --bios <file>, --boot, --save <file>, --save-type <type>\n";
 
 pub fn main(init: std.process.Init) !void {
+    try @import("logging.zig").load(init.io, init.arena.allocator());
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
     var args = argv[1..];
