@@ -3,6 +3,7 @@ const Bus = @import("bus.zig");
 const Machine = @This();
 const video = @import("video.zig");
 const Display = @import("display.zig").Display;
+const VerticalWindows = @import("display.zig").VerticalWindows;
 const timing = @import("timing.zig");
 const input = @import("input.zig");
 const SaveMemory = @import("save_memory.zig");
@@ -12,6 +13,7 @@ bus: Bus,
 elapsed_cycles: u64 = 0,
 dma_cycles_pending: u64 = 0,
 rendered_frame: video.Frame = undefined,
+vertical_windows: VerticalWindows = .{},
 line_oam: [1024]u8 = @splat(0),
 rendered_lines: usize = 0,
 rendered_frame_number: ?u64 = null,
@@ -170,27 +172,39 @@ fn renderVisibleLines(self: *Machine, cycles: u64) void {
     const next_hblank = timing.cyclesUntil(line_phase, timing.hblank_start, timing.cycles_per_line);
     const end = self.elapsed_cycles + cycles;
     var edge = self.elapsed_cycles + next_hblank;
-    while (edge <= end) : (edge += timing.cycles_per_line) {
-        const line = (edge % timing.cycles_per_frame) / timing.cycles_per_line;
-        const control = self.bus.scanlineDisplayControl();
-        defer self.bus.bg_pixels_changed = false;
-        // OBJ evaluation for the next line precedes OAM writes during HBlank.
-        if (line == timing.lines_per_frame - 1) self.line_oam = self.bus.oam;
-        if (line >= video.height) continue;
-        defer self.line_oam = self.bus.oam;
-        if (line == 0) self.rendered_lines = 0;
-        if (!self.supportsDisplayMode() or self.rendered_lines != line) continue;
-
-        // Sample the visible line before the bus applies HBlank DMA writes.
-        var display = self.currentDisplay();
-        display.control = control;
-        if (self.bus.bg_pixels_changed) display.bg_pixel_mask = &self.bus.bg_pixel_mask;
-        display.oam = &self.line_oam;
-        display.renderLine(@intCast(line), &self.rendered_frame[line]);
-        self.rendered_lines += 1;
-        if (self.rendered_lines == video.height) {
-            self.rendered_frame_number = edge / timing.cycles_per_frame;
+    var line_start = self.elapsed_cycles + timing.cycles_per_line - line_phase;
+    while (@min(line_start, edge) <= end) {
+        if (line_start < edge) {
+            const line = (line_start % timing.cycles_per_frame) / timing.cycles_per_line;
+            self.vertical_windows.beginLine(line, &self.bus.display_registers);
+            line_start += timing.cycles_per_line;
+        } else {
+            self.renderAtHBlank(edge);
+            edge += timing.cycles_per_line;
         }
+    }
+}
+
+fn renderAtHBlank(self: *Machine, edge: u64) void {
+    const line = (edge % timing.cycles_per_frame) / timing.cycles_per_line;
+    const control = self.bus.scanlineDisplayControl();
+    defer self.bus.bg_pixels_changed = false;
+    // OBJ evaluation for the next line precedes OAM writes during HBlank.
+    if (line == timing.lines_per_frame - 1) self.line_oam = self.bus.oam;
+    if (line >= video.height) return;
+    defer self.line_oam = self.bus.oam;
+    if (line == 0) self.rendered_lines = 0;
+    if (!self.supportsDisplayMode() or self.rendered_lines != line) return;
+
+    // Sample the visible line before the bus applies HBlank DMA writes.
+    var display = self.currentDisplay();
+    display.control = control;
+    if (self.bus.bg_pixels_changed) display.bg_pixel_mask = &self.bus.bg_pixel_mask;
+    display.oam = &self.line_oam;
+    display.renderLine(@intCast(line), &self.rendered_frame[line]);
+    self.rendered_lines += 1;
+    if (self.rendered_lines == video.height) {
+        self.rendered_frame_number = edge / timing.cycles_per_frame;
     }
 }
 
@@ -533,8 +547,13 @@ pub fn snapshotMode3(self: *const Machine, frame: *video.Frame) error{NotMode3}!
 /// Capture the current display configuration for instruction stepping and inspection.
 pub fn snapshotBitmap(self: *const Machine, frame: *video.Frame) error{UnsupportedDisplayMode}!void {
     if (!self.supportsDisplayMode()) return error.UnsupportedDisplayMode;
-    const display = self.currentDisplay();
-    for (frame, 0..) |*row, y| display.renderLine(y, row);
+    var display = self.currentDisplay();
+    // For a static snapshot, settle the current limits through a complete VCOUNT cycle.
+    for (0..timing.lines_per_frame) |line| display.vertical_windows.beginLine(line, display.registers);
+    for (frame, 0..) |*row, y| {
+        display.vertical_windows.beginLine(y, display.registers);
+        display.renderLine(y, row);
+    }
 }
 
 fn supportsDisplayMode(self: *const Machine) bool {
@@ -556,6 +575,7 @@ pub fn snapshotFrame(self: *const Machine, frame: *video.Frame) error{Unsupporte
 fn currentDisplay(self: *const Machine) Display {
     return .{
         .control = self.bus.dispcnt,
+        .vertical_windows = self.vertical_windows,
         .green_swap = self.bus.greenswap != 0,
         .registers = &self.bus.display_registers,
         .vram = &self.bus.vram,

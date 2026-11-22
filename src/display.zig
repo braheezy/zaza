@@ -7,10 +7,27 @@ const object_vram_size = 32 * 1024;
 const object_layer = 4;
 const backdrop_layer = 5;
 
+pub const VerticalWindows = struct {
+    active: [2]bool = @splat(false),
+
+    pub fn beginLine(self: *VerticalWindows, line: usize, registers: *const DisplayRegisters) void {
+        for (&self.active, 0..) |*active, index| {
+            const limits = registers.stored(0x0400_0044 + @as(u32, @intCast(index * 2)));
+            // VCOUNT visits 0..227. An unreachable end leaves the window open across frames.
+            if (line == limits & 0xFF) {
+                active.* = false;
+            } else if (line == limits >> 8) {
+                active.* = true;
+            }
+        }
+    }
+};
+
 pub const Display = struct {
     control: u16,
     bg_pixel_mask: ?*const [video.width]u8 = null,
     green_swap: bool,
+    vertical_windows: VerticalWindows,
     registers: *const DisplayRegisters,
     vram: *const [background_vram_size + object_vram_size]u8,
     palette: *const [1024]u8,
@@ -37,7 +54,7 @@ pub const Display = struct {
         const effect = Effects.init(self.registers);
         const backdrop: Pixel = .{ .color = readHalf(self.palette, 0), .rank = 20, .layer = backdrop_layer };
         for (row, objects, 0..) |*output, object, x| {
-            var mask = self.windowMask(x, y, object.window);
+            var mask = self.windowMask(x, object.window);
             if (self.bg_pixel_mask) |pixels| mask &= 0xF0 | pixels[x];
             var layers: Layers = .{ .front = backdrop, .behind = backdrop };
             for (backgrounds, 0..) |maybe_background, index| {
@@ -103,14 +120,13 @@ pub const Display = struct {
         return readHalf(self.palette, (bank + index) * 2);
     }
 
-    fn windowMask(self: Display, x: usize, y: usize, object_window: bool) u8 {
+    fn windowMask(self: Display, x: usize, object_window: bool) u8 {
         if (self.control & 0xE000 == 0) return 0x3F;
         for (0..2) |index| {
             if (self.control & (@as(u16, 0x2000) << @intCast(index)) == 0) continue;
             const offset: u32 = @intCast(index * 2);
             const horizontal = self.registers.stored(0x0400_0040 + offset);
-            const vertical = self.registers.stored(0x0400_0044 + offset);
-            if (insideWindow(x, horizontal) and insideWindow(y, vertical)) {
+            if (self.vertical_windows.active[index] and insideWindow(x, horizontal)) {
                 return @truncate(self.registers.stored(0x0400_0048) >> @intCast(index * 8));
             }
         }
