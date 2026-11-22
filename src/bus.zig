@@ -209,7 +209,7 @@ fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
     }
 }
 
-pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
+fn advancePeripherals(self: *Bus, cycles: u64) void {
     self.save.advance(cycles);
     self.advanceTimers(cycles - self.timer_elapsed);
     self.timer_elapsed = 0;
@@ -217,6 +217,16 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
         self.runDma(.special);
         self.sound_dma_requests = 0;
     }
+}
+
+// Before the next display edge, VCOUNT and DISPSTAT stay valid.
+pub fn advanceWithinDisplayInterval(self: *Bus, cycles: u64) void {
+    self.advancePeripherals(cycles);
+    self.display_phase += cycles;
+}
+
+pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
+    self.advancePeripherals(cycles);
     const phase = (old_phase + cycles) % timing.cycles_per_frame;
     self.display_phase = phase;
     const status = self.displayStatusAt(phase);

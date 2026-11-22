@@ -12,6 +12,7 @@ const SaveMemory = @import("save_memory.zig");
 cpu: Cpu,
 bus: Bus,
 elapsed_cycles: u64 = 0,
+next_display_edge: u64 = timing.hblank_start,
 dma_cycles_pending: u64 = 0,
 rendered_frame: video.Frame = @splat(@splat(.{ .red = 0, .green = 0, .blue = 0 })),
 vertical_windows: VerticalWindows = .{},
@@ -128,11 +129,7 @@ pub fn stepTimed(self: *Machine) !void {
             self.advanceClock(1);
             return;
         }
-        const line_phase = self.elapsed_cycles % timing.cycles_per_line;
-        const display_cycles = if (line_phase < timing.hblank_start)
-            timing.hblank_start - line_phase
-        else
-            timing.cycles_per_line - line_phase;
+        const display_cycles = self.next_display_edge - self.elapsed_cycles;
         // Timer and display events can wake the CPU. Line boundaries also
         // let runToVBlank stop exactly at its target while the CPU sleeps.
         const timer_cycles = if (self.bus.peripheral_irq_pending != 0) 1 else self.bus.timers.cyclesUntilOverflow();
@@ -177,18 +174,22 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
 }
 
 fn advanceClock(self: *Machine, cycles: u64) void {
-    const old_phase = self.elapsed_cycles % timing.cycles_per_frame;
-    self.renderVisibleLines(cycles);
-    self.elapsed_cycles += cycles;
+    const end = self.elapsed_cycles + cycles;
     const before_dma = self.bus.bus_cycles;
-    self.bus.advanceDevices(old_phase, cycles);
+    if (end < self.next_display_edge) {
+        self.bus.advanceWithinDisplayInterval(cycles);
+    } else {
+        const old_phase = self.bus.display_phase;
+        self.next_display_edge = self.renderVisibleLines(end);
+        self.bus.advanceDevices(old_phase, cycles);
+    }
+    self.elapsed_cycles = end;
     self.dma_cycles_pending += self.bus.bus_cycles - before_dma;
 }
 
-fn renderVisibleLines(self: *Machine, cycles: u64) void {
+fn renderVisibleLines(self: *Machine, end: u64) u64 {
     const line_phase = self.elapsed_cycles % timing.cycles_per_line;
     const next_hblank = timing.cyclesUntil(line_phase, timing.hblank_start, timing.cycles_per_line);
-    const end = self.elapsed_cycles + cycles;
     var edge = self.elapsed_cycles + next_hblank;
     var line_start = self.elapsed_cycles + timing.cycles_per_line - line_phase;
     while (@min(line_start, edge) <= end) {
@@ -201,6 +202,7 @@ fn renderVisibleLines(self: *Machine, cycles: u64) void {
             edge += timing.cycles_per_line;
         }
     }
+    return @min(line_start, edge);
 }
 
 fn renderAtHBlank(self: *Machine, edge: u64) void {
