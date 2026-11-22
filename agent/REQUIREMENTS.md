@@ -467,7 +467,7 @@ The emulator shall sustain the GBA's native operating speed and approximately 59
 
 - [ ] **REQ-106 — Performance headroom**
 
-The emulation core shall support substantially faster-than-real-time execution when uncapped, targeting at least 10× native speed in headless benchmarks on representative supported desktop hardware.
+The emulation core shall support substantially faster-than-real-time execution when uncapped, targeting at least 10× native speed in headless benchmarks on representative supported desktop hardware. For agents exploring a game at uncapped speed, the goal is to beat PyBoy in emulated seconds per wall-clock second on the same host. Compare representative workloads for each console with matched input and observation intervals, and record the ROMs, emulator versions, and audio and video settings.
 
 - [ ] **REQ-107 — Frame pacing**
 
@@ -479,7 +479,7 @@ The application shall minimize host-side input-to-display latency and offer conf
 
 - [ ] **REQ-109 — Resource efficiency**
 
-Normal gameplay shall avoid excessive memory allocation, redundant frame copies, unnecessary GPU synchronization, and avoidable background CPU usage.
+Normal gameplay shall avoid excessive memory allocation, redundant frame copies, unnecessary GPU synchronization, and avoidable background CPU usage. An agent shall be able to branch from a checkpoint and run many independent instances on one machine. Keep CPU time per emulated frame and incremental memory per instance low so more branches can advance within a fixed CPU and memory budget.
 
 - [ ] **REQ-110 — Memory safety**
 
@@ -541,7 +541,7 @@ ROM parsing, save-state loading, instruction decoding, memory access, cartridge 
 
 - [ ] **REQ-124 — Performance regression testing**
 
-CPU performance, rendering throughput, startup time, memory consumption, and frame pacing shall be benchmarked against reproducible baselines.
+CPU performance, rendering throughput, startup time, memory consumption, and frame pacing shall be benchmarked against reproducible baselines. For branching workloads, report aggregate emulated seconds per wall-clock second and peak resident memory as the number of concurrent instances increases on a fixed host.
 
 ## 14. Distribution and Project Quality
 
