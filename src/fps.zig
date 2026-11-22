@@ -1,5 +1,5 @@
 const std = @import("std");
-const video = @import("video.zig");
+const video = @import("libzaza").video;
 const Counter = @This();
 
 start_ns: ?i96 = null,

@@ -6,7 +6,7 @@ const Machine = @import("machine.zig");
 const video = @import("video.zig");
 const bmp = @import("bmp.zig");
 const input = @import("input.zig");
-const bundled_bios = @import("cartridge.zig").bundled_bios;
+const bundled_bios = @import("libzaza").bundled_bios;
 const demo = @import("mode3_demo.zig");
 
 test {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const SaveMemory = @import("save_memory.zig");
+const SaveMemory = @import("libzaza").SaveMemory;
 
 pub const Options = struct {
     path: ?[]const u8 = null,

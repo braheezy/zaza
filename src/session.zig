@@ -1,8 +1,8 @@
 const std = @import("std");
 const cartridge = @import("cartridge.zig");
-const input = @import("input.zig");
-const Machine = @import("machine.zig");
-const video = @import("video.zig");
+const input = @import("libzaza").input;
+const Machine = @import("libzaza").Emulator;
+const video = @import("libzaza").video;
 const replay = @import("replay.zig");
 
 // stdin drives the emulated clock. stdout carries exactly one reply per request.
@@ -39,7 +39,7 @@ pub fn run(init: std.process.Init, options: cartridge.Options, path: []const u8)
                     try writer.interface.flush();
                     continue;
                 };
-                slot.machine.restore(machine, null);
+                machine.restore(&slot.machine);
                 frame = slot.frame;
             },
             .step => |step| for (0..step.frames) |_| {
@@ -63,7 +63,7 @@ pub fn run(init: std.process.Init, options: cartridge.Options, path: []const u8)
         try writer.interface.print("ok {d}\n", .{frame});
         try writer.interface.flush();
     }
-    if (save) |*s| try s.flush(init.io, &machine.bus.save);
+    if (save) |*s| try s.flush(init.io, machine.saveMemory());
 }
 
 const Command = union(enum) {

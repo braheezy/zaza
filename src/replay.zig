@@ -1,11 +1,11 @@
 pub const log_options: std.Options = .{ .log_scope_levels = &.{.{ .scope = .gba, .level = .debug }} };
 const std = @import("std");
-const Audio = @import("audio.zig");
+const zaza = @import("libzaza");
 const wav = @import("wav.zig");
-const Machine = @import("machine.zig");
-const video = @import("video.zig");
+const Machine = @import("libzaza").Emulator;
+const video = @import("libzaza").video;
 const bmp = @import("bmp.zig");
-const input = @import("input.zig");
+const input = @import("libzaza").input;
 const cartridge = @import("cartridge.zig");
 
 pub fn writeBitmap(io: std.Io, path: []const u8, frame: *const video.Frame) !void {
@@ -53,22 +53,21 @@ pub fn replayInput(
     defer if (wav_file) |*file| file.deinit(io);
     var buffer: [8192]u8 = undefined;
     var writer: std.Io.File.Writer = undefined;
-    var capture: Audio.Capture = undefined;
+    var capture: zaza.AudioCapture = undefined;
     if (wav_file) |*file| {
         writer = file.file.writer(io, &buffer);
         try writer.interface.writeAll(&wav.header(0));
         capture = .{ .writer = &writer.interface };
-        machine.bus.audio.capture = &capture;
+        machine.setAudioCapture(&capture);
     }
     var replay: input.Replay = .{ .remaining = changes };
     for (0..frames) |index| {
         machine.runFrame(replay.buttonsForFrame(@intCast(index))) catch |err| {
             std.log.err("replay stopped in frame {d} at 0x{x:0>8}", .{
-                index, machine.cpu.instruction_address,
+                index, machine.instructionAddress(),
             });
             return err;
         };
-        if (machine.bus.audio.capture) |sink| if (sink.failure) |err| return err;
     }
     var frame: video.Frame = undefined;
     try machine.snapshotFrame(&frame);
@@ -78,5 +77,5 @@ pub fn replayInput(
         try file.file.writePositionalAll(io, &wav.header(capture.bytes), 0);
         try file.link(io);
     }
-    if (save) |*session| try session.flush(io, &machine.bus.save);
+    if (save) |*session| try session.flush(io, machine.saveMemory());
 }

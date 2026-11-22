@@ -14,14 +14,14 @@
 Checked requirements have working implementations on the current macOS build. An
 open box can mean partial support or an unverified acceptance criterion.
 
-- One native executable supports desktop play, scripted replay and persistent agent sessions. Sessions accept button inputs and return framebuffer observations on demand. All modes share the machine, ROM loader, BIOS selection and save handling. The player adds keyboard input, integer-scaled Mach presentation and stereo playback. The runner adds frame-indexed input and BMP/WAV capture.
+- The Mach desktop player and the CLI for scripted replay and persistent agent sessions both consume the public Zig module `libzaza`. Sessions accept button inputs and return framebuffer observations on demand. All modes share the machine, ROM loader, BIOS selection and save handling. The player adds keyboard input, integer-scaled Mach presentation and stereo playback. The runner adds frame-indexed input and BMP/WAV capture.
 - Zeleste reaches gameplay and has been played on macOS. This is one homebrew compatibility result. Commercial coverage, Linux desktop support and prolonged stability remain open.
 - The recorded fresh-boot mGBA suite runs passed memory (1552/1552), timing (2020/2020), DMA (1244/1244), timer IRQ (90/90) and timer count-up (936/936). Miscellaneous edge cases scored 8/12 in that run. Visual tests were inspected manually. These are historical results, not a per-build certification.
 - All four PSG channels and both Direct Sound FIFOs produce samples. Audio accuracy, device selection and synchronization across playback speeds remain open. The GPU presents the software framebuffer. Enhanced rendering, debugger UI, save states and linked multiplayer remain open.
 
 ## 1. Project Objectives
 
-Alongside hardware fidelity, Zaza has three product priorities. Agents should be able to operate the shipped emulator directly. Developers using ziggba should get a shorter path from a Zig source change to a verified result. Web applications should be able to embed the same emulation core efficiently. Section 15 defines the outcomes for each.
+Alongside hardware fidelity, Zaza has four product priorities. Agents should be able to operate the shipped emulator directly. Developers using ziggba should get a shorter path from a Zig source change to a verified result. Web applications should be able to embed the same emulation core efficiently. Native hosts should be able to embed the core and own their event loop. Section 15 defines the outcomes for each.
 
 - [ ] **REQ-001 — Competitive emulator**
 
@@ -594,3 +594,7 @@ Zaza shall integrate with ziggba so a developer can build a ROM, launch that bui
 - [ ] **REQ-136 — Efficient web embedding**
 
 A web application shall be able to embed Zaza, load a user-supplied ROM, deliver controller input, and present video and audio using the same emulation core as the desktop player. Optimize against measurements from a representative embedded game, including download size, time to the first playable frame, frame pacing, and audio underruns. WebAssembly is the leading candidate. The packaging, browser APIs, and performance targets remain open design decisions.
+
+- [x] **REQ-137 — Native Zig embedding**
+
+A Zig host can import libzaza, supply in-memory cartridge and BIOS images, advance frames from button state, consume RGB frames and PCM, and manage saves and in-process checkpoints. The CLI and desktop player use that interface. The host owns presentation, storage and pacing. See [Embedding libzaza](../docs/embedding.md).

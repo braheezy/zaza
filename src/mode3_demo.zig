@@ -1,4 +1,4 @@
-const video = @import("video.zig");
+const video = @import("libzaza").video;
 
 pub const rom = [_]u8{
     0x03, 0x00, 0xA0, 0xE3, // MOV r0, #3

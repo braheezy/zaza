@@ -1,36 +1,26 @@
 pub const std_options: std.Options = replay.log_options;
 const std = @import("std");
 const replay = @import("replay.zig");
-const Machine = @import("machine.zig");
-const video = @import("video.zig");
+const Machine = @import("libzaza").Emulator;
+const video = @import("libzaza").video;
 const cartridge = @import("cartridge.zig");
 
 const demo = @import("mode3_demo.zig");
 
-const desktop = @import("build_options").desktop;
-const usage = "Usage: zaza [options] <game.gba> (desktop build)\n" ++
+const usage =
+    "Usage: zaza [playback options] <game.gba> (launch zaza-app)\n" ++
     "       zaza [options] session <game.gba>\n" ++
     "       zaza [options] replay <game.gba> <frames> <output.bmp> [--input <script> | --input-file <path>] [--wav <output.wav>]\n" ++
     "       zaza [options] snapshot <game.gba> <steps> <output.bmp>\n" ++
     "       zaza demo <output.bmp>\n" ++
-    "Options: --bios <file>, --boot, --save <file>, --save-type <type>; playback: --mute, --volume 0..100\n";
+    "Options: --bios <file>, --boot, --save <file>, --save-type <type>\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    var args = (try init.minimal.args.toSlice(arena))[1..];
+    const argv = try init.minimal.args.toSlice(arena);
+    var args = argv[1..];
     var options: cartridge.Options = .{};
-    var volume: u8 = 30;
-    while (args.len != 0) {
-        if (try options.take(&args)) continue;
-        if (std.mem.eql(u8, args[0], "--mute")) {
-            volume = 0;
-            args = args[1..];
-        } else if (std.mem.eql(u8, args[0], "--volume") and args.len >= 2) {
-            volume = try std.fmt.parseInt(u8, args[1], 10);
-            if (volume > 100) return error.InvalidVolume;
-            args = args[2..];
-        } else break;
-    }
+    while (try options.take(&args)) {}
     if (args.len == 1 and std.mem.eql(u8, args[0], "--help")) {
         std.debug.print(usage, .{});
         return;
@@ -48,9 +38,16 @@ pub fn main(init: std.process.Init) !void {
             if (options.boot) return error.BootNeedsCartridge;
             return snapshot(init, options, &demo.rom, demo.steps, args[1]);
         }
-        if (args.len == 1 and !std.mem.startsWith(u8, command, "-")) {
-            if (desktop) return @import("desktop.zig").play(init, options, command, volume);
-            return error.DesktopPlaybackUnavailable;
+        if ((args.len == 1 and !std.mem.startsWith(u8, command, "-")) or
+            std.mem.eql(u8, command, "--mute") or std.mem.eql(u8, command, "--volume"))
+        {
+            const dir = try std.process.executableDirPathAlloc(init.io, arena);
+            const forwarded = try arena.alloc([]const u8, argv.len);
+            forwarded[0] = try std.fs.path.join(arena, &.{ dir, "zaza-app" });
+            @memcpy(forwarded[1..], argv[1..]);
+            const err = std.process.replace(init.io, .{ .argv = forwarded });
+            if (err == error.FileNotFound) return error.DesktopPlaybackUnavailable;
+            return err;
         }
     }
     std.debug.print(usage, .{});
@@ -66,12 +63,12 @@ fn snapshot(init: std.process.Init, options: cartridge.Options, rom: []const u8,
     try captureMachineBitmap(&machine, steps, &frame);
 
     try replay.writeBitmap(init.io, output, &frame);
-    if (save) |*session| try session.flush(init.io, &machine.bus.save);
+    if (save) |*session| try session.flush(init.io, machine.saveMemory());
 }
 
 fn captureMachineBitmap(machine: *Machine, steps: usize, frame: *video.Frame) !void {
     for (0..steps) |step| {
-        const address = machine.cpu.instruction_address;
+        const address = machine.instructionAddress();
         machine.stepTimed() catch |err| {
             std.debug.print("CPU stopped after {d} steps at 0x{x:0>8}\n", .{ step, address });
             return err;

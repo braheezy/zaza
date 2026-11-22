@@ -4,8 +4,10 @@ On macOS, build the player and open a cartridge.
 
 ```sh
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/zaza /path/to/game.gba
+./zig-out/bin/zaza-app /path/to/game.gba
 ```
+
+With both executables installed together, `zaza game.gba` also launches the player.
 
 Live mode plays through the default audio device at 30% volume. Put
 `--volume 5` before the ROM path for a quiet sound test, or `--mute` for silence.

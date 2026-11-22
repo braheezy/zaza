@@ -1,5 +1,5 @@
 const std = @import("std");
-const Audio = @import("audio.zig");
+const zaza = @import("libzaza");
 
 pub fn header(data_bytes: u32) [44]u8 {
     var bytes: [44]u8 = undefined;
@@ -9,8 +9,8 @@ pub fn header(data_bytes: u32) [44]u8 {
     std.mem.writeInt(u32, bytes[16..20], 16, .little);
     std.mem.writeInt(u16, bytes[20..22], 1, .little); // Linear PCM.
     std.mem.writeInt(u16, bytes[22..24], 2, .little);
-    std.mem.writeInt(u32, bytes[24..28], Audio.sample_rate, .little);
-    std.mem.writeInt(u32, bytes[28..32], Audio.sample_rate * 4, .little);
+    std.mem.writeInt(u32, bytes[24..28], zaza.sample_rate, .little);
+    std.mem.writeInt(u32, bytes[28..32], zaza.sample_rate * 4, .little);
     std.mem.writeInt(u16, bytes[32..34], 4, .little);
     std.mem.writeInt(u16, bytes[34..36], 16, .little);
     bytes[36..40].* = "data".*;

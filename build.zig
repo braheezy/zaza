@@ -14,7 +14,9 @@ pub fn build(b: *std.Build) void {
         "https://github.com/coolbho3k/emibios/releases/download/0.2.1/gba_bios.bin", "--output",
     });
     const bios_image = bios_download.addOutputFileArg("gba_bios.bin");
-    module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
+    const lib = b.addModule("libzaza", .{ .root_source_file = b.path("src/lib.zig"), .target = target, .optimize = optimize });
+    module.addImport("libzaza", lib);
+    lib.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
     b.installFile("vendor/emibios/LICENSE", "share/licenses/emibios/LICENSE");
     b.installFile("vendor/emibios/NOTICE", "share/licenses/emibios/NOTICE");
     const executable = b.addExecutable(.{ .name = "zaza", .root_module = module });
@@ -28,10 +30,11 @@ pub fn build(b: *std.Build) void {
     b.step("audio-test-rom", "Install the silent Direct Sound test cartridge").dependOn(&install_rom.step);
 
     const test_module = b.createModule(.{
-        .root_source_file = b.path("src/machine_tests.zig"),
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
     });
+    test_module.addImport("libzaza", test_module);
     test_module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = audio_rom });
     test_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
     const checkpoint_rom = b.option([]const u8, "checkpoint-rom", "Additional cartridge for the frame-360 checkpoint test");
@@ -44,11 +47,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
-    const desktop_enabled = b.option(bool, "desktop", "Include the macOS desktop player") orelse (target.result.os.tag == .macos);
-    const options = b.addOptions();
-    options.addOption(bool, "desktop", desktop_enabled);
-    module.addOptions("build_options", options);
-    const run = b.addRunArtifact(executable);
+    const desktop_enabled = b.option(bool, "desktop", "Include the macOS desktop player") orelse (target.result.os.tag == .macos and b.dep_prefix.len == 0);
+    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, "zaza")});
+    run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Zaza").dependOn(&run.step);
     if (desktop_enabled) {
@@ -57,7 +58,15 @@ pub fn build(b: *std.Build) void {
         } else if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
             const mach_module = mach.module("mach");
             const parser = b.lazyDependency("ini", .{ .target = target, .optimize = optimize }) orelse return;
-            module.addImport("ini", parser.module("ini"));
+            const app_module = b.createModule(.{ .root_source_file = b.path("src/app.zig"), .target = target, .optimize = optimize });
+            app_module.addImport("libzaza", lib);
+            const app = b.addExecutable(.{ .name = "zaza-app", .root_module = app_module });
+            b.installArtifact(app);
+            check.dependOn(&app.step);
+            const play = b.addRunArtifact(app);
+            if (b.args) |args| play.addArgs(args);
+            b.step("play", "Play a cartridge in the desktop app").dependOn(&play.step);
+            app_module.addImport("ini", parser.module("ini"));
             b.getInstallStep().dependOn(&b.addInstallFile(parser.path("LICENCE"), "share/licenses/ini/LICENCE").step);
             const desktop_tests = b.addTest(.{ .root_module = b.createModule(.{
                 .root_source_file = b.path("src/desktop_config.zig"),
@@ -69,8 +78,9 @@ pub fn build(b: *std.Build) void {
             const run_desktop_tests = b.addRunArtifact(desktop_tests);
             test_step.dependOn(&run_desktop_tests.step);
             b.step("test-desktop", "Test desktop configuration and overlay").dependOn(&run_desktop_tests.step);
-            module.addImport("mach", mach_module);
-            module.addImport("objc", mach_module.import_table.get("objc").?);
+            desktop_tests.root_module.addImport("libzaza", lib);
+            app_module.addImport("mach", mach_module);
+            app_module.addImport("objc", mach_module.import_table.get("objc").?);
         }
     }
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const video = @import("video.zig");
+const video = @import("libzaza").video;
 
 const header_size = 54;
 const row_size = video.width * 3;

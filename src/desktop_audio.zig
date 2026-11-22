@@ -1,6 +1,6 @@
 // Single producer (emulation thread), single consumer (Mach audio callback).
 const std = @import("std");
-const Audio = @import("audio.zig");
+const zaza = @import("libzaza");
 const sysaudio = @import("mach").sysaudio;
 const Playback = @This();
 
@@ -11,7 +11,7 @@ const Cursor = std.atomic.Value(u32);
 context: sysaudio.Context,
 player: sysaudio.Player,
 pcm: std.Io.Writer.Allocating,
-capture: Audio.Capture,
+capture: zaza.AudioCapture,
 frames: [capacity]Stereo = undefined,
 published: Cursor = Cursor.init(0),
 consumed: Cursor = Cursor.init(0),
@@ -78,7 +78,7 @@ fn render(user_data: ?*anyopaque, output: []u8) void {
     self.primed = true;
     const frame_size = self.channels * 2;
     for (0..output.len / frame_size) |i| {
-        const advance = (self.fraction + Audio.sample_rate) / self.rate;
+        const advance = (self.fraction + zaza.sample_rate) / self.rate;
         if (head -% tail < @max(2, advance)) {
             self.primed = false;
             break;
@@ -100,7 +100,7 @@ fn render(user_data: ?*anyopaque, output: []u8) void {
             std.mem.writeInt(i16, output[offset + 2 ..][0..2], pair[1], .little);
         }
         tail +%= advance;
-        self.fraction = (self.fraction + Audio.sample_rate) % self.rate;
+        self.fraction = (self.fraction + zaza.sample_rate) % self.rate;
     }
     self.consumed.store(tail, .release);
 }

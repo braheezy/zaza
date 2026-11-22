@@ -1,6 +1,6 @@
 const std = @import("std");
-const Bus = @import("bus.zig");
-const Machine = @import("machine.zig");
+const zaza = @import("libzaza");
+const Machine = @import("libzaza").Emulator;
 const save_file = @import("save_file.zig");
 
 pub const Options = struct {
@@ -23,36 +23,25 @@ pub const Options = struct {
     }
 
     pub fn start(self: Options, machine: *Machine, io: std.Io, allocator: std.mem.Allocator, rom: []const u8) !?save_file.Session {
-        const bios = if (self.bios_path) |path| try loadBios(io, allocator, path) else bundled_bios;
-        if (self.boot) machine.initBios(rom, bios) else machine.initCartridgeWithBios(rom, bios);
-        return self.save.open(io, allocator, &machine.bus.save);
+        const bios = if (self.bios_path) |path| try loadBios(io, allocator, path) else zaza.bundled_bios;
+        try machine.init(rom, .{ .bios = bios, .boot = if (self.boot) .bios else .cartridge });
+        return self.save.open(io, allocator, machine.saveMemory());
     }
 };
-fn loadBios(io: std.Io, arena: std.mem.Allocator, path: []const u8) !*const [Bus.bios_size_bytes]u8 {
+fn loadBios(io: std.Io, arena: std.mem.Allocator, path: []const u8) !*const [@sizeOf(zaza.Bios)]u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         arena,
-        .limited(Bus.bios_size_bytes + 1),
+        .limited(@sizeOf(zaza.Bios) + 1),
     );
-    if (bytes.len != Bus.bios_size_bytes) return error.InvalidBiosSize;
-    return bytes[0..Bus.bios_size_bytes];
+    if (bytes.len != @sizeOf(zaza.Bios)) return error.InvalidBiosSize;
+    return bytes[0..@sizeOf(zaza.Bios)];
 }
 
 pub fn loadRom(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const rom = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(32 * 1024 * 1024 + 1));
+    const rom = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(zaza.max_rom_size + 1));
     if (rom.len < 8) return error.RomTooShort;
-    if (rom.len > 32 * 1024 * 1024) return error.RomTooLarge;
+    if (rom.len > zaza.max_rom_size) return error.RomTooLarge;
     return rom;
-}
-
-pub const bundled_bios = @embedFile("emibios");
-comptime {
-    @setEvalBranchQuota(2_000_000);
-    if (bundled_bios.len != Bus.bios_size_bytes) @compileError("Invalid bundled BIOS size");
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bundled_bios, &digest, .{});
-    var expected_buffer: [32]u8 = undefined;
-    const expected = std.fmt.hexToBytes(&expected_buffer, "95e6c8a6c236ed8e2629bdb60bc75791434c4f08ca69ad2305e30ca3f3c29d1b") catch unreachable;
-    if (!std.mem.eql(u8, &digest, expected)) @compileError("Bundled BIOS checksum mismatch");
 }

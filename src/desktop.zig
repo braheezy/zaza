@@ -3,15 +3,14 @@ const mach = @import("mach");
 const objc = @import("objc");
 const gpu = mach.gpu;
 const cartridge = @import("cartridge.zig");
-const video = @import("video.zig");
+const video = @import("libzaza").video;
 const Playback = @import("desktop_audio.zig");
-const Machine = @import("machine.zig");
-const input = @import("input.zig");
+const Machine = @import("libzaza").Emulator;
+const input = @import("libzaza").input;
 const Config = @import("desktop_config.zig");
 const Fps = @import("fps.zig");
-const timing = @import("timing.zig");
 
-const frame_period_ns = timing.cycles_per_frame * std.time.ns_per_s / (1 << 24);
+const frame_period_ns = @import("libzaza").frame_period_ns;
 const window_scale = 3;
 const window_width = video.width * window_scale;
 const window_height = video.height * window_scale;
@@ -35,7 +34,7 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8
     if (volume != 0) {
         if (playback.init(init.gpa, volume)) {
             live_audio = &playback;
-            machine.bus.audio.capture = &playback.capture;
+            machine.setAudioCapture(&playback.capture);
         } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
     }
 
@@ -45,7 +44,7 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8
     modules.mods.app = .{ .machine = machine, .audio = live_audio, .config = config };
     modules.get(.app).run(.main);
     if (modules.mods.app.failure) |err| return err;
-    if (save) |*session| try session.flush(init.io, &machine.bus.save);
+    if (save) |*session| try session.flush(init.io, machine.saveMemory());
 }
 
 const App = struct {
@@ -134,7 +133,7 @@ const App = struct {
         // Keep the cadence despite polling jitter, but avoid an unbounded backlog.
         app.next_frame_ns = @max(now_ns, deadline_ns + frame_period_ns);
         machine.runFrame(app.keys.sample()) catch |err| {
-            std.log.err("live emulation stopped at 0x{x:0>8}", .{machine.cpu.instruction_address});
+            std.log.err("live emulation stopped at 0x{x:0>8}", .{machine.instructionAddress()});
             app.failure = err;
             core.exit();
             return;
