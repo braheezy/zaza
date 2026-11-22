@@ -12,6 +12,7 @@ pub const Channel = struct {
     destination: u32 = 0,
     count: u16 = 0,
     control: u16 = 0,
+    ready_at: u64 = 0,
     latched_count: u16 = 0,
     data_latch: u32 = 0,
     next_source: u32 = 0,

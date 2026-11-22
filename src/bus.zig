@@ -78,6 +78,10 @@ irq_flags: u16 = 0,
 ime_enabled: bool = false,
 waitcnt: u16 = 0,
 bus_cycles: u64 = 0,
+cpu_internal_cycles: u64 = 0,
+immediate_dma_at: ?u64 = null,
+dma_active: bool = false,
+dma_sequential: bool = false,
 // During a timed instruction, synchronize the timer clock at MMIO bus beats.
 timer_bus_origin: ?u64 = null,
 timer_elapsed: u64 = 0,
@@ -220,10 +224,27 @@ pub fn irqLine(self: *const Bus) bool {
     return self.ime_enabled and self.irq_enable & self.irq_flags & ~@as(u16, synchronizing) != 0;
 }
 
+pub fn arbitrateDma(self: *Bus) void {
+    const ready = self.immediate_dma_at orelse return;
+    if (self.dma_active or self.bus_cycles + self.cpu_internal_cycles < ready) return;
+    self.immediate_dma_at = null;
+    self.runDma(.immediate);
+}
+
+fn scheduleImmediateDma(self: *Bus, ready: u64) void {
+    self.immediate_dma_at = @min(self.immediate_dma_at orelse ready, ready);
+}
+
 pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
+    self.dma_active = true;
+    defer self.dma_active = false;
     for (0..self.dma.channels.len) |index| {
         const channel = self.dma.channels[index];
         if (channel.control & DMA.enable == 0 or channel.trigger() != trigger) continue;
+        if (trigger == .immediate and channel.ready_at > self.bus_cycles + self.cpu_internal_cycles) {
+            self.scheduleImmediateDma(channel.ready_at);
+            continue;
+        }
         if (trigger == .immediate or channel.control & (1 << 9) == 0) {
             self.dma.channels[index].control &= ~DMA.enable;
         }
@@ -256,9 +277,11 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
     const eeprom_input = T == u16 and index == 3 and self.hasEepromAt(destination);
     const eeprom_output = T == u16 and index == 3 and self.hasEepromAt(source);
     if (eeprom_input) self.save.beginEepromCommand();
-    // Charge the transfers on the shared bus. Arbitration and startup delays are approximate.
-    self.bus_cycles += 2;
-    for (0..count) |_| {
+    // The cartridge can continue prefetching during the DMA entry and exit clocks.
+    self.bus_cycles += 1;
+    self.cartridge_prefetch.advance(1);
+    for (0..count) |beat| {
+        self.dma_sequential = beat != 0;
         const value: T = if (source < ewram_base) blk: {
             self.chargeDataAccess(T, source);
             break :blk wordLane(T, self.dma.channels[index].data_latch, destination);
@@ -269,6 +292,7 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
         if (source >= ewram_base) {
             self.dma.channels[index].data_latch = if (T == u16) @as(u32, value) * 0x10001 else value;
         }
+        self.dma_sequential = beat != 0 or romWindow(source) != null;
         if (eeprom_input) {
             self.chargeDataAccess(T, destination);
             self.save.shiftEepromCommand(value);
@@ -278,6 +302,8 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
         source = (source +% (if (romWindow(source) != null) @sizeOf(T) else source_step)) & DMA.sourceMask(index);
         destination = (destination +% destination_step) & DMA.destinationMask(index);
     }
+    self.bus_cycles += 1;
+    self.cartridge_prefetch.advance(1);
     if (eeprom_input) self.save.finishEepromCommand(count);
     self.dma_bus_word = self.dma.channels[index].data_latch;
     self.dma.channels[index].latched_count = self.dma.channels[index].count;
@@ -312,6 +338,7 @@ pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
 }
 
 fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
+    self.arbitrateDma();
     const interrupted = self.next_fetch_nonsequential;
     self.next_fetch_nonsequential = false;
     self.next_rom_data_address = null;
@@ -351,6 +378,7 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
 pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
+    self.arbitrateDma();
     self.chargeDataAccess(T, aligned_address);
     self.syncTimerAccess(aligned_address);
     if (self.debug_port.read(T, aligned_address)) |value| return value;
@@ -442,6 +470,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
+    self.arbitrateDma();
     self.chargeDataAccess(T, aligned_address);
     self.syncTimerAccess(aligned_address);
     if (self.debug_port.write(T, aligned_address, value)) return;
@@ -546,7 +575,16 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
         return;
     }
     if (DMA.contains(aligned_address)) {
+        const index = (aligned_address - DMA.base) / 12;
+        const enabled = self.dma.channels[index].control & DMA.enable != 0;
         self.dma.write(T, aligned_address, value);
+        const channel = self.dma.channels[index];
+        if (!enabled and channel.control & DMA.enable != 0 and channel.trigger() == .immediate) {
+            // DMA may take ownership at a bus boundary two clocks after enable.
+            const ready = self.bus_cycles + self.cpu_internal_cycles + 2;
+            self.dma.channels[index].ready_at = ready;
+            self.scheduleImmediateDma(ready);
+        }
         return;
     }
     // The BIOS clears the unused word between serial registers and KEYINPUT.
@@ -635,7 +673,7 @@ fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
     }
     if (romWindow(address)) |window| {
         self.bus_cycles += self.cartridge_prefetch.stop();
-        const sequential = self.next_rom_data_address == address and address & 0x1_FFFF != 0;
+        const sequential = (if (self.dma_active) self.dma_sequential else self.next_rom_data_address == address) and address & 0x1_FFFF != 0;
         const access: timing.Access = if (sequential) .sequential else .nonsequential;
         self.bus_cycles += timing.gamePakAccessCycles(T, access, self.waitcnt, window);
         self.next_rom_data_address = (address & ~@as(u32, 1)) + @max(2, @sizeOf(T));
@@ -905,6 +943,20 @@ test "BIOS DMA reset stores reach every channel and the unused trailing gap" {
     }
 }
 
+test "immediate DMA waits for two clocks and lets an in-flight CPU read finish" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u16, iwram_base, 0x1234);
+    bus.writeData(u32, DMA.base, iwram_base);
+    bus.writeData(u32, DMA.base + 4, ewram_base);
+    bus.writeData(u32, DMA.base + 8, 0x8000_0001);
+
+    // The one-clock IWRAM read leaves one startup clock outstanding. The
+    // following three-clock EWRAM read owns the bus until it completes.
+    _ = bus.readData(u16, iwram_base);
+    try std.testing.expectEqual(@as(u16, 0), bus.readData(u16, ewram_base));
+    try std.testing.expectEqual(@as(u16, 0x1234), bus.readData(u16, ewram_base));
+}
+
 test "HBlank DMA repeats with a running source and a reloaded destination" {
     var bus: Bus = .{ .rom = &.{} };
     const channel = DMA.end - 12;
@@ -934,7 +986,8 @@ test "DMA3 writes and reads both EEPROM capacities over the Game Pak bus" {
             bus.writeData(u32, channel, source);
             bus.writeData(u32, channel + 4, destination);
             bus.writeData(u32, channel + 8, 0x8000_0000 | count);
-            bus.runDma(.immediate);
+            _ = bus.readData(u32, ewram_base); // DMA becomes ready during this CPU access.
+            bus.arbitrateDma();
         }
 
         fn encode(bus: *Bus, value: u128, count: u32) void {

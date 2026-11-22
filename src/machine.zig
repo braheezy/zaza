@@ -68,11 +68,12 @@ pub fn step(self: *Machine) !void {
     }
     // BIOS data visibility depends on the executing instruction, not lookahead fetches.
     self.bus.executing_bios = self.cpu.instruction_address < Bus.bios_size_bytes;
+    const internal_before = self.cpu.internal_cycles;
     const result = self.cpu.step(&self.bus);
     self.bus.executing_bios = false;
     try result;
     self.bus.dma_bus_word = null;
-    self.bus.runDma(.immediate);
+    self.bus.cpu_internal_cycles += self.cpu.internal_cycles - internal_before;
 }
 
 /// Advance the clock for one CPU instruction, IRQ entry, or halted interval.
@@ -86,6 +87,20 @@ pub fn stepTimed(self: *Machine) !void {
         return;
     }
     if (self.bus.halted) {
+        if (self.bus.immediate_dma_at) |ready| {
+            const remaining = ready -| (self.bus.bus_cycles + self.bus.cpu_internal_cycles);
+            if (remaining != 0) {
+                self.bus.cpu_internal_cycles += remaining;
+                self.advanceClock(remaining);
+                return;
+            }
+            const before = self.bus.bus_cycles;
+            self.bus.arbitrateDma();
+            if (self.bus.bus_cycles != before) {
+                self.advanceClock(self.bus.bus_cycles - before);
+                return;
+            }
+        }
         if (self.bus.hasEnabledInterrupt()) {
             // Synchronization and CPU restart both leave the instruction pipeline idle.
             if (self.bus.haltWakeLine()) self.bus.halted = false;
