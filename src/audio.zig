@@ -8,10 +8,8 @@ const fifo_start = 0x40;
 const fifo_end = 0x48;
 const master_enable = 0x80;
 
-// The PSG registers include write-only frequency and length fields.
-psg: [0x22 / 2]u16 = @splat(0),
+psg: @import("psg.zig") = .{},
 master_enabled: bool = false,
-active_channels: u4 = 0,
 direct_control: u16 = 0,
 bias: u16 = 0x0200,
 wave_ram: [2][16]u8 = @splat(@splat(0)),
@@ -47,6 +45,7 @@ pub const Capture = struct {
 fn mix(self: *const Audio, left: bool) i16 {
     if (!self.master_enabled) return 0;
     var level: i16 = @intCast(self.bias & 0x3FF);
+    level += self.psg.mix(left, @truncate(self.direct_control), &self.wave_ram);
     for (self.fifos, 0..) |fifo, i| {
         const route: u16 = if (left) 0x0200 else 0x0100;
         if (self.direct_control & (route << @intCast(4 * i)) == 0) continue;
@@ -90,29 +89,6 @@ const Fifo = struct {
     }
 };
 
-const Register = struct { writable: u16, readable: u16 };
-
-// Trigger bits are commands and are handled separately from stored configuration.
-const psg_registers = [_]Register{
-    .{ .writable = 0x007F, .readable = 0x007F }, // SOUND1CNT_L
-    .{ .writable = 0xFFFF, .readable = 0xFFC0 }, // SOUND1CNT_H
-    .{ .writable = 0x47FF, .readable = 0x4000 }, // SOUND1CNT_X
-    .{ .writable = 0, .readable = 0 }, // unused
-    .{ .writable = 0xFFFF, .readable = 0xFFC0 }, // SOUND2CNT_L
-    .{ .writable = 0, .readable = 0 }, // unused
-    .{ .writable = 0x47FF, .readable = 0x4000 }, // SOUND2CNT_H
-    .{ .writable = 0, .readable = 0 }, // unused
-    .{ .writable = 0x00E0, .readable = 0x00E0 }, // SOUND3CNT_L
-    .{ .writable = 0xE0FF, .readable = 0xE000 }, // SOUND3CNT_H
-    .{ .writable = 0x47FF, .readable = 0x4000 }, // SOUND3CNT_X
-    .{ .writable = 0, .readable = 0 }, // unused
-    .{ .writable = 0xFF3F, .readable = 0xFF00 }, // SOUND4CNT_L
-    .{ .writable = 0, .readable = 0 }, // unused
-    .{ .writable = 0x40FF, .readable = 0x40FF }, // SOUND4CNT_H
-    .{ .writable = 0, .readable = 0 }, // unused
-    .{ .writable = 0xFF77, .readable = 0xFF77 }, // SOUNDCNT_L
-};
-
 pub fn contains(address: u32) bool {
     return address >= base and address < end;
 }
@@ -131,9 +107,9 @@ pub fn read(self: *const Audio, comptime T: type, address: u32) T {
 
 fn readByte(self: *const Audio, offset: u32) u8 {
     const halfword: u16 = switch (offset) {
-        0...0x21 => self.psg[offset / 2] & psg_registers[offset / 2].readable,
+        0...0x21 => self.psg.read(offset),
         0x22...0x23 => self.direct_control,
-        0x24...0x25 => if (self.master_enabled) master_enable | @as(u16, self.active_channels) else 0,
+        0x24...0x25 => if (self.master_enabled) master_enable | @as(u16, self.psg.active) else 0,
         0x28...0x29 => self.bias,
         wave_start...fifo_start - 1 => return self.wave_ram[self.cpuWaveBank()][offset - wave_start],
         fifo_start...fifo_end - 1 => @panic("sound FIFO read needs open bus"),
@@ -158,7 +134,7 @@ pub fn write(self: *Audio, comptime T: type, address: u32, value: T) void {
 
 fn writeByte(self: *Audio, offset: u32, byte: u8) void {
     switch (offset) {
-        0...0x21 => self.writePsg(offset, byte),
+        0...0x21 => if (self.master_enabled) self.psg.write(offset, byte),
         0x22...0x23 => {
             if (offset == 0x23) {
                 if (byte & 0x08 != 0) self.fifos[0] = .{};
@@ -169,8 +145,7 @@ fn writeByte(self: *Audio, offset: u32, byte: u8) void {
         0x24 => {
             self.master_enabled = byte & master_enable != 0;
             if (!self.master_enabled) {
-                self.psg = @splat(0);
-                self.active_channels = 0;
+                self.psg = .{};
             }
         },
         0x28...0x29 => self.bias = mergeByte(self.bias, offset, byte) & 0xC3FE,
@@ -179,41 +154,9 @@ fn writeByte(self: *Audio, offset: u32, byte: u8) void {
     }
 }
 
-fn writePsg(self: *Audio, offset: u32, byte: u8) void {
-    if (!self.master_enabled) return;
-    const index = offset / 2;
-    self.psg[index] = mergeByte(self.psg[index], offset, byte) & psg_registers[index].writable;
-
-    // Status tracks triggers and DAC shutdown. Natural expiry needs the PSG clock.
-    const channel: u2 = switch (offset) {
-        0x03, 0x05 => 0,
-        0x09, 0x0D => 1,
-        0x10, 0x15 => 2,
-        0x19, 0x1D => 3,
-        else => return,
-    };
-    const dac_enabled = switch (channel) {
-        0 => self.psg[1] & 0xF800 != 0,
-        1 => self.psg[4] & 0xF800 != 0,
-        2 => self.psg[8] & 0x0080 != 0,
-        3 => self.psg[12] & 0xF800 != 0,
-    };
-    const flag = @as(u4, 1) << channel;
-    if (!dac_enabled) {
-        self.active_channels &= ~flag;
-    } else {
-        switch (offset) {
-            0x05, 0x0D, 0x15, 0x1D => if (byte & 0x80 != 0) {
-                self.active_channels |= flag;
-            },
-            else => {},
-        }
-    }
-}
-
 fn cpuWaveBank(self: *const Audio) usize {
     // The CPU accesses the bank opposite the one selected for playback.
-    return @intFromBool(self.psg[8] & 0x0040 == 0);
+    return self.psg.waveBank() ^ 1;
 }
 
 fn mergeByte(previous: u16, offset: u32, byte: u8) u16 {
@@ -258,4 +201,96 @@ test "wave bank selection and FIFO reset affect only their own storage" {
     try std.testing.expectEqual(@as(u8, 4), audio.fifos[1].count);
     try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), std.mem.readInt(u32, audio.fifos[1].bytes[0..4], .little));
     try std.testing.expectEqual(@as(u8, 0), audio.read(u8, base + 0x23));
+}
+
+test "square duty cycles and PSG stereo gains are independent" {
+    for ([_]u8{ 1, 2, 4, 6 }, 0..) |high_steps, duty| {
+        var audio: Audio = .{};
+        audio.write(u8, base + 0x24, 0x80);
+        audio.write(u16, base + 0x20, 0x1273); // Square 1 left, square 2 right.
+        audio.write(u16, base + 0x22, 2);
+        audio.write(u16, base + 2, 0xF000 | @as(u16, @intCast(duty << 6)));
+        audio.write(u16, base + 4, 0x87FF);
+        audio.write(u16, base + 8, 0x7080);
+        audio.write(u16, base + 12, 0x87FF);
+        var left_high: u8 = 0;
+        var right_high: u8 = 0;
+        for (0..8) |_| {
+            const left = audio.mix(true);
+            const right = audio.mix(false);
+            try std.testing.expect(left == 0 or left == 15 * 8 * 64);
+            try std.testing.expect(right == 0 or right == 7 * 4 * 64);
+            left_high += @intFromBool(left != 0);
+            right_high += @intFromBool(right != 0);
+            audio.psg.advance(16);
+        }
+        try std.testing.expectEqual(high_steps, left_high);
+        try std.testing.expectEqual(@as(u8, 4), right_high);
+    }
+}
+
+test "PSG frame sequencer clocks length, sweep overflow and envelopes" {
+    var audio: Audio = .{};
+    audio.write(u8, base + 0x24, 0x80);
+    audio.write(u16, base, 0x11); // Add half the shadow frequency every sweep tick.
+    audio.write(u16, base + 2, 0xF080);
+    audio.write(u16, base + 4, 0x8400); // 1024 -> 1536 -> next calculation overflows.
+    audio.write(u16, base + 8, 0xF13F); // One length tick.
+    audio.write(u16, base + 12, 0xC000);
+    audio.write(u16, base + 24, 0x2900); // Noise envelope starts at 2 and rises.
+    audio.write(u16, base + 28, 0x8000);
+
+    audio.psg.advance(32767);
+    try std.testing.expectEqual(@as(u8, 0x8B), audio.read(u8, base + 0x24));
+    audio.psg.advance(1);
+    try std.testing.expectEqual(@as(u8, 0x89), audio.read(u8, base + 0x24));
+    audio.psg.advance(2 * 32768);
+    try std.testing.expectEqual(@as(u16, 1536), audio.psg.sweep_shadow);
+    try std.testing.expectEqual(@as(u8, 0x88), audio.read(u8, base + 0x24));
+    audio.psg.advance(5 * 32768 - 1);
+    try std.testing.expectEqual(@as(u4, 2), audio.psg.volume[3]);
+    audio.psg.advance(1);
+    try std.testing.expectEqual(@as(u4, 3), audio.psg.volume[3]);
+}
+
+test "wave RAM plays high nibble first and exchanges CPU and playback banks in 64-sample mode" {
+    var audio: Audio = .{};
+    audio.write(u8, base + 0x24, 0x80);
+    audio.write(u8, base + 0x30, 0x62); // Bank 1
+    audio.write(u8, base + 0x10, 0x40);
+    audio.write(u8, base + 0x30, 0xC4); // Bank 0
+    audio.write(u8, base + 0x10, 0xA0);
+    audio.write(u16, base + 0x12, 0x2000);
+    audio.write(u16, base + 0x14, 0x87FF);
+    audio.write(u16, base + 0x20, 0x4000);
+    audio.write(u8, base + 0x22, 2);
+    try std.testing.expectEqual(@as(i16, 12 * 64), audio.mix(true));
+    audio.psg.advance(8);
+    try std.testing.expectEqual(@as(i16, 4 * 64), audio.mix(true));
+    audio.psg.advance(31 * 8);
+    try std.testing.expectEqual(@as(u8, 0xC4), audio.read(u8, base + 0x30));
+    try std.testing.expectEqual(@as(i16, 6 * 64), audio.mix(true));
+    audio.write(u8, base + 0x13, 0x80); // Forced 75% volume.
+    try std.testing.expectEqual(@as(i16, 4 * 64), audio.mix(true));
+    audio.write(u8, base + 0x10, 0);
+    try std.testing.expectEqual(@as(i16, 0), audio.mix(true));
+}
+
+test "noise feedback repeats at 127 or 32767 clocks and retrigger reseeds it" {
+    for ([_]u8{ 0, 8 }, [_]usize{ 32767, 127 }) |width, period| {
+        var audio: Audio = .{};
+        audio.write(u8, base + 0x24, 0x80);
+        audio.write(u16, base + 24, 0xF000);
+        audio.write(u16, base + 28, 0x8000 | @as(u16, width));
+        const mask: u15 = if (width == 0) 0x7FFF else 0x7F;
+        for (1..period) |_| {
+            audio.psg.advance(32);
+            try std.testing.expect(audio.psg.lfsr & mask != mask);
+        }
+        audio.psg.advance(32);
+        try std.testing.expectEqual(mask, audio.psg.lfsr & mask);
+        audio.psg.advance(96);
+        audio.write(u8, base + 29, 0x80);
+        try std.testing.expectEqual(@as(u15, 0x7FFF), audio.psg.lfsr);
+    }
 }

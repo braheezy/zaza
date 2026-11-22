@@ -75,7 +75,8 @@ an adjacent `.lock` file to prevent two Zaza sessions from writing the same save
 
 ## Silent audio testing
 
-Replay can capture Direct Sound A and B as stereo, signed 16-bit PCM at
+Replay captures both square channels, wave RAM, noise, and Direct Sound A and B
+as stereo, signed 16-bit PCM at
 32,768 Hz. It writes the WAV on the emulated clock without opening an audio
 device. Input is optional. Use fresh output paths for each run.
 
@@ -90,5 +91,6 @@ and a descending ramp at half the rate to the right channel on timer 1.
 DMA1 and DMA2 refill the respective FIFOs. `zig build test` checks every
 captured sample of the first frame, including signed wraparound and refills.
 The first frame runs from cartridge startup to VBlank. Later frames span
-a full display period. PSG synthesis and analog output filtering are outside
-the current capture path.
+a full display period. The WAV contains the digital mix before analog output filtering.
+The PSG oscillators, length counters, sweep, and envelopes also advance when
+a WAV is not being recorded.

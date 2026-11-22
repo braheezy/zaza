@@ -199,6 +199,7 @@ fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
         self.peripheral_irq_new = self.peripheral_irq_pending & ~@as(u14, @truncate(self.irq_flags));
         self.requestInterrupt(self.peripheral_irq_pending);
         self.peripheral_irq_pending = self.timers.advance(batch) | self.serial.advance(batch);
+        if (self.audio.master_enabled) self.audio.psg.advance(batch);
         if (self.timers.overflowed != 0) self.sound_dma_requests |= self.audio.clockFifos(self.timers.overflowed);
         if (self.audio.capture) |capture| {
             capture.phase += @intCast(batch);
