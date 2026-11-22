@@ -13,4 +13,5 @@ pub const bundled_bios = api.bundled_bios;
 
 test {
     _ = @import("machine_tests.zig");
+    _ = @import("desktop_config.zig");
 }

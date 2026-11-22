@@ -18,9 +18,12 @@ cd zaza
 Only requirement is Zig and this project uses [Mach](https://machengine.org/) so you'll need the proper nominated Zig version. [`anyzig`](https://marler8997.github.io/anyzig/) will handle this for you.
 
 ```
-zig build
+zig build desktop
 ./zig-out/bin/zaza <path to rom>
 ```
+
+For servers and agents, build with `zig build cli` and run
+`./zig-out/bin/zaza-cli session <rom>`. See [headless commands](docs/input.md).
 
 ## External tests
 

@@ -1,121 +1,138 @@
 const std = @import("std");
+const Build = std.Build;
+const Module = Build.Module;
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+
+    // TODO: If this is accepted, then we can depend on zig build graph to fetch the bios
+    // https://github.com/coolbho3k/emibios/issues/18
+    const bios = bundledBios(b);
+
+    const lib = b.addModule("libzaza", .{
+        .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    // Declared output files make Run cache this download until its inputs change.
-    const bios_download = b.addSystemCommand(&.{
-        "curl",                                                                      "--fail",   "--location", "--silent", "--show-error",
-        "https://github.com/coolbho3k/emibios/releases/download/0.2.1/gba_bios.bin", "--output",
-    });
-    const bios_image = bios_download.addOutputFileArg("gba_bios.bin");
-    const lib = b.addModule("libzaza", .{ .root_source_file = b.path("src/lib.zig"), .target = target, .optimize = optimize });
-    module.addImport("libzaza", lib);
-    lib.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
-    b.installFile("vendor/emibios/LICENSE", "share/licenses/emibios/LICENSE");
-    b.installFile("vendor/emibios/NOTICE", "share/licenses/emibios/NOTICE");
+    lib.addAnonymousImport("emibios", .{ .root_source_file = bios });
+
+    // Load dependencies
     const parser = b.lazyDependency("ini", .{ .target = target, .optimize = optimize }) orelse return;
-    module.addImport("ini", parser.module("ini"));
-    b.getInstallStep().dependOn(&b.addInstallFile(parser.path("LICENCE"), "share/licenses/ini/LICENCE").step);
-    const executable = b.addExecutable(.{ .name = "zaza", .root_module = module });
-    b.installArtifact(executable);
 
-    const check = b.step("check", "Check the executable without installing it");
-    check.dependOn(&executable.step);
+    // Ensure dependencies are attributed
+    const notices = installNotices(b, parser);
 
-    const audio_rom = b.addWriteFiles().add("direct-sound.gba", &@import("test/direct_sound_rom.zig").rom);
-    const install_rom = b.addInstallFile(audio_rom, "roms/direct-sound.gba");
-    b.step("audio-test-rom", "Install the silent Direct Sound test cartridge").dependOn(&install_rom.step);
+    const imports = &[_]Module.Import{
+        .{ .name = "libzaza", .module = lib },
+        .{ .name = "ini", .module = parser.module("ini") },
+    };
+    // For lsp feedback
+    const check = b.step("check", "Compile the frontends without installing them");
+    // Headless usage
+    const cli_step = b.step("cli", "Install the headless CLI");
+    cli_step.dependOn(notices);
+    const cli = installFrontend(b, cli_step, "zaza-cli", frontendModule(b, target, optimize, "src/main.zig", imports), check);
+    runStep(b, "run-cli", "Run the headless CLI", b.addRunArtifact(cli));
 
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
+    // Tests
+    const desktop_supported = target.result.os.tag == .macos and b.dep_prefix.len == 0;
+    addTests(b, target, optimize, bios, parser.module("ini"));
+    addCpuTests(b, optimize);
+
+    // Desktop app
+    const desktop = b.step("desktop", "Install the macOS desktop player");
+    if (desktop_supported) {
+        desktop.dependOn(notices);
+        addDesktop(b, target, optimize, imports, check, desktop);
+    } else if (target.result.os.tag != .macos) {
+        desktop.dependOn(&b.addFail("Desktop playback currently requires macOS.").step);
+    }
+}
+
+fn bundledBios(b: *Build) Build.LazyPath {
+    // A declared output lets Zig reuse the downloaded image across builds.
+    const download = b.addSystemCommand(&.{ "curl", "--fail", "--location", "--silent", "--show-error" });
+    download.addArgs(&.{ "https://github.com/coolbho3k/emibios/releases/download/0.2.1/gba_bios.bin", "--output" });
+    return download.addOutputFileArg("gba_bios.bin");
+}
+
+fn installNotices(b: *Build, parser: *Build.Dependency) *Build.Step {
+    const notices = b.step("notices", "Install dependency license notices");
+    notices.dependOn(&b.addInstallFile(b.path("vendor/emibios/LICENSE"), "share/licenses/emibios/LICENSE").step);
+    notices.dependOn(&b.addInstallFile(b.path("vendor/emibios/NOTICE"), "share/licenses/emibios/NOTICE").step);
+    const licence = b.addInstallFile(parser.path("LICENCE"), "share/licenses/ini/LICENCE");
+    notices.dependOn(&licence.step);
+    return notices;
+}
+
+fn frontendModule(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, path: []const u8, imports: []const Module.Import) *Module {
+    return b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize, .imports = imports });
+}
+
+fn installFrontend(b: *Build, step: *Build.Step, name: []const u8, module: *Module, check: *Build.Step) *Build.Step.Compile {
+    const exe = b.addExecutable(.{ .name = name, .root_module = module });
+    check.dependOn(&exe.step);
+    step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    b.getInstallStep().dependOn(step);
+    return exe;
+}
+
+fn addDesktop(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, imports: []const Module.Import, check: *Build.Step, desktop: *Build.Step) void {
+    const dep = b.lazyDependency("mach", .{
         .target = target,
         .optimize = optimize,
-    });
-    test_module.addImport("libzaza", test_module);
-    test_module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = audio_rom });
-    test_module.addAnonymousImport("emibios", .{ .root_source_file = bios_image });
-    const checkpoint_rom = b.option([]const u8, "checkpoint-rom", "Additional cartridge for the frame-360 checkpoint test");
-    const test_options = b.addOptions();
-    test_options.addOption(bool, "external_checkpoint", checkpoint_rom != null);
-    test_module.addOptions("test_options", test_options);
-    if (checkpoint_rom) |path| test_module.addAnonymousImport("checkpoint_rom", .{ .root_source_file = b.path(path) });
-    const tests = b.addTest(.{ .root_module = test_module });
-    const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
+        .core = true,
+        .sysaudio = true,
+    }) orelse return;
+    const mach = dep.module("mach");
+    const app = frontendModule(b, target, optimize, "src/app.zig", imports);
+    app.addImport("mach", mach);
+    app.addImport("objc", mach.import_table.get("objc").?);
+    const player = installFrontend(b, desktop, "zaza", app, check);
+    runStep(b, "run", "Run the desktop player", b.addRunArtifact(player));
+}
 
-    const desktop_enabled = b.option(bool, "desktop", "Include the macOS desktop player") orelse (target.result.os.tag == .macos and b.dep_prefix.len == 0);
-    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, "zaza")});
-    run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
-    b.step("run", "Run Zaza").dependOn(&run.step);
-    if (desktop_enabled) {
-        if (target.result.os.tag != .macos) {
-            executable.step.dependOn(&b.addFail("Desktop playback currently requires macOS. Use -Ddesktop=false for automation.").step);
-        } else if (b.lazyDependency("mach", .{ .target = target, .optimize = optimize, .core = true, .sysaudio = true })) |mach| {
-            const mach_module = mach.module("mach");
-            const app_module = b.createModule(.{ .root_source_file = b.path("src/app.zig"), .target = target, .optimize = optimize });
-            app_module.addImport("libzaza", lib);
-            const app = b.addExecutable(.{ .name = "zaza-app", .root_module = app_module });
-            b.installArtifact(app);
-            check.dependOn(&app.step);
-            const play = b.addRunArtifact(app);
-            if (b.args) |args| play.addArgs(args);
-            b.step("play", "Play a cartridge in the desktop app").dependOn(&play.step);
-            app_module.addImport("ini", parser.module("ini"));
-            const desktop_tests = b.addTest(.{ .root_module = b.createModule(.{
-                .root_source_file = b.path("src/desktop_config.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) });
-            desktop_tests.root_module.addImport("ini", parser.module("ini"));
-            desktop_tests.root_module.addImport("mach", mach_module);
-            const run_desktop_tests = b.addRunArtifact(desktop_tests);
-            test_step.dependOn(&run_desktop_tests.step);
-            b.step("test-desktop", "Test desktop configuration and overlay").dependOn(&run_desktop_tests.step);
-            desktop_tests.root_module.addImport("libzaza", lib);
-            app_module.addImport("mach", mach_module);
-            app_module.addImport("objc", mach_module.import_table.get("objc").?);
-        }
-    }
+fn addTests(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, bios: Build.LazyPath, ini: *Module) void {
+    const rom = b.addWriteFiles().add("direct-sound.gba", &@import("test/direct_sound_rom.zig").rom);
+    const install = b.addInstallFile(rom, "roms/direct-sound.gba");
+    b.step("audio-test-rom", "Install the silent Direct Sound test cartridge").dependOn(&install.step);
 
-    const cputest_enabled = b.option(bool, "cputest-internal", "Configure CPU vector tests") orelse false;
-    if (!cputest_enabled) {
-        const run_cputest = b.addSystemCommand(&.{
-            b.graph.zig_exe,
-            "build",
-            "cputest",
-            "-Dcputest-internal=true",
-            b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
-        });
-        run_cputest.addArg("--");
-        if (b.args) |args| run_cputest.addArgs(args);
-        b.step("cputest", "Run supported ARM7TDMI SingleStepTests vectors").dependOn(&run_cputest.step);
+    const module = b.createModule(.{ .root_source_file = b.path("src/tests.zig"), .target = target, .optimize = optimize });
+    module.addImport("libzaza", module);
+    module.addImport("ini", ini);
+    module.addAnonymousImport("direct_sound_rom", .{ .root_source_file = rom });
+    module.addAnonymousImport("emibios", .{ .root_source_file = bios });
+    const checkpoint = b.option([]const u8, "checkpoint-rom", "Additional cartridge for the frame-360 checkpoint test");
+    const options = b.addOptions();
+    options.addOption(bool, "external_checkpoint", checkpoint != null);
+    module.addOptions("test_options", options);
+    if (checkpoint) |path| module.addAnonymousImport("checkpoint_rom", .{ .root_source_file = b.path(path) });
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+}
+
+fn addCpuTests(b: *Build, optimize: std.builtin.OptimizeMode) void {
+    // Configure the host runner and fetch its vectors only when cputest is requested.
+    const description = "Run supported ARM7TDMI SingleStepTests vectors";
+    if (!(b.option(bool, "cputest-internal", "Configure CPU vector tests") orelse false)) {
+        const command = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "cputest", "-Dcputest-internal=true" });
+        command.addArgs(&.{ b.fmt("-Doptimize={s}", .{@tagName(optimize)}), "--" });
+        runStep(b, "cputest", description, command);
         return;
     }
 
     const vectors = b.lazyDependency("arm7tdmi_vectors", .{}) orelse return;
-    const runner = b.addExecutable(.{
-        .name = "cputest",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/cputest.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-        }),
-    });
-    runner.root_module.addImport("cpu", b.createModule(.{
-        .root_source_file = b.path("src/cpu.zig"),
-    }));
     const styling = b.lazyDependency("chameleon", .{ .target = b.graph.host, .optimize = optimize }) orelse return;
-    runner.root_module.addImport("chameleon", styling.module("chameleon"));
-    const run_vectors = b.addRunArtifact(runner);
-    run_vectors.addDirectoryArg(vectors.path("v1"));
-    if (b.args) |args| run_vectors.addArgs(args);
-    b.step("cputest", "Run supported ARM7TDMI SingleStepTests vectors").dependOn(&run_vectors.step);
+    const module = b.createModule(.{ .root_source_file = b.path("test/cputest.zig"), .target = b.graph.host, .optimize = optimize });
+    module.addImport("cpu", b.createModule(.{ .root_source_file = b.path("src/cpu.zig") }));
+    module.addImport("chameleon", styling.module("chameleon"));
+    const exe = b.addExecutable(.{ .name = "cputest", .root_module = module });
+    const run = b.addRunArtifact(exe);
+    run.addDirectoryArg(vectors.path("v1"));
+    runStep(b, "cputest", description, run);
+}
+
+fn runStep(b: *Build, name: []const u8, description: []const u8, run: *Build.Step.Run) void {
+    if (b.args) |args| run.addArgs(args);
+    b.step(name, description).dependOn(&run.step);
 }

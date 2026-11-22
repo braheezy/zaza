@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
         } else break;
     }
     if (args.len != 1 or std.mem.startsWith(u8, args[0], "-")) {
-        std.debug.print("Usage: zaza-app [--bios file] [--boot] [--save file] [--save-type type] [--mute | --volume 0..100] <game.gba>\n", .{});
+        std.debug.print("Usage: zaza [--bios file] [--boot] [--save file] [--save-type type] [--mute | --volume 0..100] <game.gba>\n", .{});
         if (args.len == 1 and std.mem.eql(u8, args[0], "--help")) return;
         return error.InvalidArguments;
     }
