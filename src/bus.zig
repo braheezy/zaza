@@ -87,6 +87,7 @@ timer_irq_new: u14 = 0,
 timer_irq_sync: u14 = 0,
 pending_timer_write: ?struct { address: u32, value: u32, size: u8 } = null,
 rom_fetch_cycles: u64 = 0,
+cartridge_prefetch: timing.CartridgePrefetch = .{},
 next_rom_data_address: ?u32 = null,
 iwram_data_cycles: u64 = 0,
 next_fetch_nonsequential: bool = false,
@@ -314,6 +315,7 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     const interrupted = self.next_fetch_nonsequential;
     self.next_fetch_nonsequential = false;
     self.next_rom_data_address = null;
+    if (romWindow(address) == null) self.cartridge_prefetch = .{};
     if (address < bios_size_bytes) {
         self.bus_cycles += 1;
         // The BIOS drives a 32-bit word for ARM and Thumb instruction fetches.
@@ -336,7 +338,11 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
         .nonsequential
     else
         access;
-    const cycles = timing.gamePakAccessCycles(T, effective_access, self.waitcnt, romWindow(address).?);
+    const window = romWindow(address).?;
+    var cycles = timing.gamePakAccessCycles(T, effective_access, self.waitcnt, window);
+    if (self.prefetchEnabled()) {
+        cycles = self.cartridge_prefetch.fetch(T, address, access, cycles, self.waitcnt, window);
+    }
     self.rom_fetch_cycles += cycles;
     self.bus_cycles += cycles;
     return value;
@@ -477,6 +483,7 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
                 // IF acknowledges only the written byte, without a read-modify-write.
                 if_address => self.irq_flags &= ~bits,
                 waitcnt_address => {
+                    self.cartridge_prefetch = .{};
                     self.waitcnt = ((self.waitcnt & preserve) | bits) & waitcnt_write_mask;
                     self.next_fetch_nonsequential = true;
                 },
@@ -621,11 +628,13 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
 fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
     self.next_fetch_nonsequential = true;
     if (SaveMemory.containsParallel(address)) {
+        self.bus_cycles += self.cartridge_prefetch.stop();
         self.next_rom_data_address = null;
         self.bus_cycles += timing.saveAccessCycles(self.waitcnt);
         return;
     }
     if (romWindow(address)) |window| {
+        self.bus_cycles += self.cartridge_prefetch.stop();
         const sequential = self.next_rom_data_address == address and address & 0x1_FFFF != 0;
         const access: timing.Access = if (sequential) .sequential else .nonsequential;
         self.bus_cycles += timing.gamePakAccessCycles(T, access, self.waitcnt, window);
@@ -635,6 +644,7 @@ fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
         const region: u8 = @truncate(address >> 24);
         const cycles = timing.ramAccessCycles(T, region);
         self.bus_cycles += cycles;
+        self.cartridge_prefetch.advance(cycles);
         if (region == iwram_base >> 24) self.iwram_data_cycles += cycles;
     }
 }

@@ -76,7 +76,7 @@ pub fn step(self: *Machine) !void {
 }
 
 /// Advance the clock for one CPU instruction, IRQ entry, or halted interval.
-/// Cartridge prefetch hits and contention are not included in the bus costs.
+/// Bus and internal cycles advance the shared device clock.
 pub fn stepTimed(self: *Machine) !void {
     if (self.dma_cycles_pending != 0) {
         // A display-triggered DMA owns the bus before the CPU can step again.
@@ -111,6 +111,10 @@ pub fn stepTimed(self: *Machine) !void {
     self.bus.timer_bus_origin = null;
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
     const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
+    if (internal_cycles != 0) {
+        self.bus.next_fetch_nonsequential = true;
+        self.bus.cartridge_prefetch.advance(internal_cycles);
+    }
     self.advanceClock(bus_cycles + internal_cycles);
 }
 

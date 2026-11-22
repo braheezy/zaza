@@ -685,7 +685,8 @@ fn executeThumbRegisterAlu(self: *Cpu, instruction: u16) void {
         },
         12 => left | right, // ORR.
         13 => blk: {
-            self.internal_cycles += multiplyCycles(right, true);
+            // Thumb MUL uses the original destination as the timing-sensitive multiplier.
+            self.internal_cycles += multiplyCycles(left, true);
             break :blk left *% right;
         },
         14 => left & ~right, // BIC.
