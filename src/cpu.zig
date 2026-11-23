@@ -212,25 +212,14 @@ fn executeArmBlockTransfer(
     const writeback = instruction & (1 << 21) != 0;
     const load = instruction & (1 << 20) != 0;
     const base_register: u4 = @truncate(instruction >> 16);
-    if (base_register == program_counter) return error.UnsupportedInstruction;
     var registers: u16 = @truncate(instruction);
     // An empty list transfers PC but moves the base by sixteen words.
     const count: u32 = if (registers == 0) 16 else @popCount(registers);
     if (registers == 0) registers = 1 << program_counter;
 
     const loads_pc = load and registers & (1 << program_counter) != 0;
-    const return_status: ?u32 = if (special and loads_pc) blk: {
-        const status = self.savedStatus() orelse return error.UnsupportedInstruction;
-        switch (@as(u5, @truncate(status))) {
-            0x10, 0x11, 0x12, 0x13, 0x17, 0x1B, 0x1F => {},
-            else => return error.UnsupportedInstruction,
-        }
-        break :blk status;
-    } else null;
+    const return_status = if (special and loads_pc) self.readSpsr() else null;
     const user_bank = special and !loads_pc;
-    if (user_bank and (writeback or self.mode() == .user or self.mode() == .system)) {
-        return error.UnsupportedInstruction;
-    }
 
     const base = self.readRegister(base_register);
     const updated_base = if (increment) base +% (count * 4) else base -% (count * 4);
@@ -268,7 +257,13 @@ fn executeArmBlockTransfer(
     }
     if (load) self.internal_cycles += 1;
     if (writeback and (!load or !base_in_list)) {
-        self.writeGeneralRegister(base_register, updated_base);
+        if (base_register == program_counter) {
+            target = updated_base;
+        } else if (user_bank) {
+            self.registers[base_register] = updated_base;
+        } else {
+            self.writeGeneralRegister(base_register, updated_base);
+        }
     }
     if (target) |value| {
         // Writeback belongs to the old bank; restore CPSR before fetching the return target.
@@ -951,14 +946,7 @@ fn executeArmMrs(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedIn
     _ = self.advanceArmPipeline(bus);
     if (!conditionPassed(condition, self.readFlags())) return;
 
-    var value = self.cpsr;
-    if (instruction & (1 << 22) != 0) {
-        // User and System read CPSR when no saved status register is selected.
-        value = switch (self.mode()) {
-            .user, .system => self.cpsr,
-            else => (self.savedStatus() orelse 0) | 0x10,
-        };
-    }
+    const value = if (instruction & (1 << 22) != 0) self.readSpsr() else self.cpsr;
     if (destination == program_counter) {
         // MRS writes R15 before its final increment, retaining the prefetched words.
         self.instruction_address = (value & ~@as(u32, 3)) -% 4;
@@ -994,6 +982,14 @@ fn executeArmMsr(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedIn
     self.cpsr = (self.cpsr & ~mask) | ((value | 0x10) & mask);
     // Keep the visible R15 and the two fetched ARM words if MSR sets T.
     if (self.cpsr & thumb_bit != 0) self.instruction_address +%= 4;
+}
+
+fn readSpsr(self: *Cpu) u32 {
+    // User and System read CPSR when no saved status register is selected.
+    return switch (self.mode()) {
+        .user, .system => self.cpsr,
+        else => (self.savedStatus() orelse 0) | 0x10,
+    };
 }
 
 fn savedStatus(self: *Cpu) ?u32 {
