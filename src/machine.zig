@@ -726,6 +726,10 @@ test "Mode 0 composites sprites through window masks, alpha and affine sampling"
     try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][16]);
 
     bus.writeData(u16, Bus.dispcnt_address, 0x1100);
+    // A semitransparent OBJ still blends with BG0 when all windows are disabled.
+    var row: [video.width]video.Rgb = undefined;
+    machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
+    try std.testing.expectEqual(video.decodeColor(0x3C0F), row[0]);
     bus.writeData(u16, Bus.oam_base, 0x0300); // Double-size affine OBJ.
     bus.writeData(u16, Bus.oam_base + 6, 0x0100);
     bus.writeData(u16, Bus.oam_base + 30, 0x0100);
@@ -733,6 +737,38 @@ test "Mode 0 composites sprites through window masks, alpha and affine sampling"
     try std.testing.expectEqual(video.decodeColor(0x001F), frame[3][4]);
     try std.testing.expectEqual(video.decodeColor(0x001F), frame[4][3]);
     try std.testing.expectEqual(video.decodeColor(0x7C00), frame[4][4]);
+}
+
+test "frontmost pixel composition matches a fully visible window in every mode" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const bus = &machine.bus;
+    var random = std.Random.DefaultPrng.init(73);
+    random.random().bytes(&bus.vram);
+    random.random().bytes(&bus.palette);
+    // Select every layer and effects outside WIN0. Its vertical range stays inactive.
+    bus.writeData(u16, 0x0400_004A, 0x003F);
+    bus.writeData(u16, 0x0400_004C, 0x0023);
+    bus.writeData(u16, 0x0400_0050, 0x003F);
+    for (0..4) |bg| bus.writeData(u16, 0x0400_0008 + @as(u32, @intCast(bg * 2)), @intCast(0xC0 | (3 - bg)));
+    for (0..6) |mode| {
+        bus.writeData(u16, Bus.dispcnt_address, @intCast(0x1F00 | mode));
+        var plain = machine.currentDisplay();
+        plain.green_swap = true;
+        var windowed = plain;
+        windowed.control |= 1 << 13;
+        var plain_latch: u16 = 0;
+        var windowed_latch: u16 = 0;
+        for ([_]usize{ 0, 5, 47, 159 }) |y| {
+            var actual: [video.width]video.Rgb = undefined;
+            var expected: [video.width]video.Rgb = undefined;
+            plain.renderLine(y, &actual, &plain_latch);
+            windowed.renderLine(y, &expected, &windowed_latch);
+            try std.testing.expectEqualSlices(video.Rgb, &expected, &actual);
+            try std.testing.expectEqual(windowed_latch, plain_latch);
+        }
+    }
 }
 
 test "bitmap BG2 priority and transparency compose with upper OBJ VRAM" {

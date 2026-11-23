@@ -71,11 +71,70 @@ pub const Display = struct {
         if (self.control & (1 << 12) != 0) self.drawObjects(y, mosaic, &objects);
         const effect = Effects.init(self.registers);
         const backdrop: Pixel = .{ .color = readHalf(self.palette, 0), .rank = 20, .layer = backdrop_layer };
+        // Even with normal blending off, semitransparent objects can blend
+        // when BLDCNT selects a second target.
+        if (self.control & 0xE000 == 0 and self.bg_pixel_mask == null and effect.control & 0x3FC0 == 0) {
+            self.composeFront(row, backgrounds[0..text_count], &text_pixels, affine, &objects, backdrop);
+        } else {
+            self.composeEffects(row, backgrounds[0..text_count], &text_pixels, affine, &objects, backdrop, effect);
+        }
+        if (self.green_swap) video.swapGreen(row);
+    }
+
+    fn composeFront(
+        self: Display,
+        row: *[video.width]video.Rgb,
+        backgrounds: []const ?Background,
+        text_pixels: *const [4][video.width]u8,
+        affine: [2]?AffineLine,
+        objects: *const [video.width]ObjectPixel,
+        backdrop: Pixel,
+    ) void {
+        var ranks: [video.width]u8 = @splat(backdrop.rank);
+        var colors: [video.width]u16 = @splat(backdrop.color);
+        for (backgrounds, 0..) |layer, i| {
+            const bg = layer orelse continue;
+            for (&ranks, &colors, 0..) |*rank, *color, x| {
+                if (bg.rank >= rank.*) continue;
+                const sample_x = if (bg.mosaic_width == 1) x else x - x % bg.mosaic_width;
+                const index = text_pixels[i][sample_x];
+                if (index == 0) continue;
+                rank.* = bg.rank;
+                color.* = readHalf(self.palette, @as(usize, index) * 2);
+            }
+        }
+        for (affine) |layer| {
+            const bg = layer orelse continue;
+            for (&ranks, &colors, 0..) |*rank, *color, x| {
+                if (bg.rank >= rank.*) continue;
+                color.* = bg.pixel(self, x) orelse continue;
+                rank.* = bg.rank;
+            }
+        }
+        for (row, objects, ranks, colors) |*output, object, rank, color| {
+            var visible = color;
+            if (object.pixel) |pixel| {
+                if (pixel.rank < rank) visible = pixel.color;
+            }
+            output.* = video.decodeColor(visible);
+        }
+    }
+
+    fn composeEffects(
+        self: Display,
+        row: *[video.width]video.Rgb,
+        backgrounds: []const ?Background,
+        text_pixels: *const [4][video.width]u8,
+        affine: [2]?AffineLine,
+        objects: *const [video.width]ObjectPixel,
+        backdrop: Pixel,
+        effect: Effects,
+    ) void {
         for (row, objects, 0..) |*output, object, x| {
             var mask = self.windowMask(x, object.window);
             if (self.bg_pixel_mask) |pixels| mask &= 0xF0 | pixels[x];
             var layers: Layers = .{ .front = backdrop, .behind = backdrop };
-            for (backgrounds[0..text_count], 0..) |maybe_background, index| {
+            for (backgrounds, 0..) |maybe_background, index| {
                 if (mask & (@as(u8, 1) << @intCast(index)) == 0) continue;
                 const bg = maybe_background orelse continue;
                 const palette_index = text_pixels[index][x - x % bg.mosaic_width];
@@ -95,7 +154,6 @@ pub const Display = struct {
             const color = if (mask & (1 << 5) != 0) effect.apply(layers) else layers.front.color;
             output.* = video.decodeColor(color);
         }
-        if (self.green_swap) video.swapGreen(row);
     }
 
     fn backgroundForLine(self: Display, index: usize, y: usize, mosaic: u16) Background {
