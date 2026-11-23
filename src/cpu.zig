@@ -370,15 +370,52 @@ fn writeTransferBase(self: *Cpu, bus: anytype, base: u4, updated: u32) void {
     }
 }
 
+// Bits 15..6 identify every Thumb operation. Ignore operand bits within that
+// index so entries for different registers or offsets share the same handler.
+fn thumbOpcode(bits: u16) u16 {
+    return switch (bits) {
+        0x1800...0x1fff, 0x5000...0x5fff => bits & 0xfe00,
+        0x4000...0x43ff => bits & 0xffc0,
+        0x4400...0x47ff, 0xb000...0xbfff, 0xd000...0xdfff => bits & 0xff00,
+        else => bits & 0xf800,
+    };
+}
+
+fn ThumbDispatch(comptime BusPtr: type) type {
+    return struct {
+        const Handler = *const fn (*Cpu, BusPtr, u16) error{UnsupportedInstruction}!void;
+        const table = blk: {
+            @setEvalBranchQuota(20000);
+            var handlers: [1024]Handler = undefined;
+            for (&handlers, 0..) |*entry, index| {
+                entry.* = handler(thumbOpcode(@as(u16, @intCast(index)) << 6));
+            }
+            break :blk handlers;
+        };
+
+        fn handler(comptime opcode: u16) Handler {
+            return &struct {
+                fn run(cpu: *Cpu, bus: BusPtr, instruction: u16) error{UnsupportedInstruction}!void {
+                    return cpu.stepThumbDecoded(bus, opcode, instruction);
+                }
+            }.run;
+        }
+    };
+}
+
 fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstruction}!void {
+    return ThumbDispatch(@TypeOf(bus)).table[instruction >> 6](self, bus, instruction);
+}
+
+inline fn stepThumbDecoded(self: *Cpu, bus: anytype, comptime opcode: u16, instruction: u16) error{UnsupportedInstruction}!void {
     const pc = self.instruction_address +% 4;
-    if (self.decodeThumbTransfer(instruction)) |transfer| {
+    if (self.decodeThumbTransfer(opcode, instruction)) |transfer| {
         self.advanceThumbPipeline(bus, pc);
         self.executeThumbTransfer(bus, transfer);
         return;
     }
-    const stack_transfer = instruction & 0xF600 == 0xB400;
-    if (stack_transfer or instruction >> 12 == 0xC) {
+    const stack_transfer = opcode & 0xF600 == 0xB400;
+    if (stack_transfer or opcode >> 12 == 0xC) {
         self.advanceThumbPipeline(bus, pc);
         self.executeThumbBlockTransfer(bus, instruction, stack_transfer);
         return;
@@ -386,24 +423,24 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     const immediate: u11 = @truncate(instruction);
     const signed_immediate: i32 = @as(i11, @bitCast(immediate));
     var target: ?u32 = null;
-    const software_interrupt = instruction >> 8 == 0xDF;
+    const software_interrupt = opcode >> 8 == 0xDF;
     // BX consumes only the source register field in the Thumb high-register format.
-    const exchange = instruction >> 8 == 0x47;
+    const exchange = opcode >> 8 == 0x47;
     if (software_interrupt) {
         // Exception entry runs after the sequential Thumb fetch.
     } else if (exchange) {
         const source: u4 = @truncate(instruction >> 3);
         target = self.readRegister(source);
-    } else if (instruction >> 10 == 0b010001) {
-        target = try self.executeThumbHighAlu(instruction);
-    } else if (instruction >> 12 == 0xD) {
-        const condition: u4 = @truncate(instruction >> 8);
+    } else if (opcode >> 10 == 0b010001) {
+        target = try self.executeThumbHighAlu(opcode, instruction);
+    } else if (opcode >> 12 == 0xD) {
+        const condition: u4 = @truncate(opcode >> 8);
         // The pinned ARM7TDMI vectors take the reserved 0xE condition as AL.
         if (conditionPassed(condition, self.readFlags())) {
             const displacement: i8 = @bitCast(@as(u8, @truncate(instruction)));
             target = pc +% @as(u32, @bitCast(@as(i32, displacement) * 2));
         }
-    } else switch (instruction >> 11) {
+    } else switch (opcode >> 11) {
         0b11100 => target = pc +% @as(u32, @bitCast(signed_immediate * 2)),
         0b11110 => {
             // BL's prefix stores the signed high displacement in the active LR bank.
@@ -416,7 +453,7 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
             // Bit zero marks the return address as Thumb for BX.
             self.writeGeneralRegister(link_register, (self.instruction_address +% 2) | 1);
         },
-        else => try self.executeThumbLowAlu(instruction),
+        else => try self.executeThumbLowAlu(opcode, instruction),
     }
 
     // A taken branch still performs the sequential fetch before refilling.
@@ -447,26 +484,26 @@ const ThumbTransfer = struct {
     register: u3,
 };
 
-fn decodeThumbTransfer(self: *Cpu, instruction: u16) ?ThumbTransfer {
+inline fn decodeThumbTransfer(self: *Cpu, comptime opcode: u16, instruction: u16) ?ThumbTransfer {
     const low_register: u3 = @truncate(instruction);
     const high_register: u3 = @truncate(instruction >> 8);
     const base_register: u3 = @truncate(instruction >> 3);
     const offset: u32 = @as(u5, @truncate(instruction >> 6));
-    const load = instruction & (1 << 11) != 0;
+    const load = opcode & (1 << 11) != 0;
     const offset_word = @as(u32, @as(u8, @truncate(instruction))) * 4;
-    return switch (instruction >> 12) {
+    return switch (opcode >> 12) {
         4 => if (load) .{
             .operation = .ldr,
             .address = (self.readRegister(program_counter) & ~@as(u32, 3)) +% offset_word,
             .register = high_register,
         } else null,
         5 => .{
-            .operation = @enumFromInt(@as(u3, @truncate(instruction >> 9))),
+            .operation = @enumFromInt(@as(u3, @truncate(opcode >> 9))),
             .address = self.readRegister(base_register) +% self.readRegister(@as(u3, @truncate(instruction >> 6))),
             .register = low_register,
         },
         6, 7, 8 => blk: {
-            const width: u32 = switch (instruction >> 12) {
+            const width: u32 = switch (opcode >> 12) {
                 6 => 4,
                 7 => 1,
                 8 => 2,
@@ -570,8 +607,8 @@ fn signExtendByte(value: u8) u32 {
     return @bitCast(@as(i32, @as(i8, @bitCast(value))));
 }
 
-fn executeThumbHighAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!?u32 {
-    const operation: u2 = @truncate(instruction >> 8);
+inline fn executeThumbHighAlu(self: *Cpu, comptime opcode: u16, instruction: u16) error{UnsupportedInstruction}!?u32 {
+    const operation: u2 = @truncate(opcode >> 8);
     if (operation == 3) return error.UnsupportedInstruction;
     const source: u4 = @truncate(instruction >> 3);
     const destination: u4 = (@as(u4, @truncate(instruction >> 4)) & 8) |
@@ -595,41 +632,41 @@ fn refillThumbPipeline(self: *Cpu, bus: anytype) void {
     self.pipeline = .{ current, next };
 }
 
-fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction}!void {
-    if (instruction >> 10 == 0b010000) {
-        self.executeThumbRegisterAlu(instruction);
+inline fn executeThumbLowAlu(self: *Cpu, comptime opcode: u16, instruction: u16) error{UnsupportedInstruction}!void {
+    if (opcode >> 10 == 0b010000) {
+        self.executeThumbRegisterAlu(opcode, instruction);
         return;
     }
-    if (instruction >> 12 == 0b1010) {
+    if (opcode >> 12 == 0b1010) {
         const destination: u3 = @truncate(instruction >> 8);
         const offset = @as(u32, @as(u8, @truncate(instruction))) * 4;
         // Thumb PC-relative address generation uses a word-aligned PC.
-        const base = if (instruction & (1 << 11) != 0)
+        const base = if (opcode & (1 << 11) != 0)
             self.readRegister(stack_pointer)
         else
             self.readRegister(program_counter) & ~@as(u32, 3);
         self.writeGeneralRegister(destination, base +% offset);
         return;
     }
-    if (instruction >> 8 == 0xB0) {
+    if (opcode >> 8 == 0xB0) {
         const offset = @as(u32, @as(u7, @truncate(instruction))) * 4;
         const base = self.readRegister(stack_pointer);
         const result = if (instruction & (1 << 7) != 0) base -% offset else base +% offset;
         self.writeGeneralRegister(stack_pointer, result);
         return;
     }
-    switch (instruction >> 13) {
+    switch (opcode >> 13) {
         0b000 => {
             const destination: u3 = @truncate(instruction);
             const source: u3 = @truncate(instruction >> 3);
-            const kind: u2 = @truncate(instruction >> 11);
+            const kind: u2 = @truncate(opcode >> 11);
             if (kind == 3) {
                 const operand: u3 = @truncate(instruction >> 6);
-                const right = if (instruction & (1 << 10) != 0)
+                const right = if (opcode & (1 << 10) != 0)
                     @as(u32, operand)
                 else
                     self.readRegister(operand);
-                const subtract = instruction & (1 << 9) != 0;
+                const subtract = opcode & (1 << 9) != 0;
                 const result = addWithCarry(self.readRegister(source), if (subtract) ~right else right, subtract);
                 self.writeGeneralRegister(destination, result.value);
                 self.writeFlags(result.flags);
@@ -648,7 +685,7 @@ fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction
             }
         },
         0b001 => {
-            const operation: u2 = @truncate(instruction >> 11);
+            const operation: u2 = @truncate(opcode >> 11);
             const destination: u3 = @truncate(instruction >> 8);
             const immediate: u32 = @as(u8, @truncate(instruction));
             if (operation == 0) {
@@ -670,8 +707,8 @@ fn executeThumbLowAlu(self: *Cpu, instruction: u16) error{UnsupportedInstruction
     }
 }
 
-fn executeThumbRegisterAlu(self: *Cpu, instruction: u16) void {
-    const operation: u4 = @truncate(instruction >> 6);
+inline fn executeThumbRegisterAlu(self: *Cpu, comptime opcode: u16, instruction: u16) void {
+    const operation: u4 = @truncate(opcode >> 6);
     const source: u3 = @truncate(instruction >> 3);
     const destination: u3 = @truncate(instruction);
     const left = self.readRegister(destination);
