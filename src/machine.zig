@@ -262,6 +262,27 @@ fn renderAtHBlank(self: *Machine, edge: u64) void {
     }
 }
 
+test "MSR can leave and reenter a register bank without losing its contents" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x00, 0xF0, 0x21, 0xE1, // MSR CPSR_c, r0 (reserved mode)
+        0x07, 0xD0, 0xA0, 0xE3, // MOV sp, #7
+        0x0D, 0x20, 0xA0, 0xE1, // MOV r2, sp
+        0x01, 0xF0, 0x21, 0xE1, // MSR CPSR_c, r1 (back to Supervisor)
+    };
+    var machine: Machine = undefined;
+    machine.initCartridge(&rom);
+    machine.cpu.registers[0] = 0x04;
+    machine.cpu.registers[1] = 0x13;
+    machine.cpu.banked.supervisor[0] = 0x0300_7FE0;
+    try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0x14), machine.cpu.cpsr);
+    for (0..3) |_| try machine.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0), machine.cpu.readRegister(2));
+    try std.testing.expectEqual(@as(u32, 0x13), machine.cpu.cpsr);
+    try std.testing.expectEqual(@as(u32, 0x0300_7FE0), machine.cpu.readRegister(13));
+}
+
 test "ARM compare with Rd set to PC restores status and continues sequentially" {
     const std = @import("std");
     const rom = [_]u8{

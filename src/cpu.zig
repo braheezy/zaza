@@ -8,6 +8,7 @@ const Mode = enum(u5) {
     abort = 0x17,
     undefined_instruction = 0x1B,
     system = 0x1F,
+    _,
 };
 
 const Cpu = @This();
@@ -77,15 +78,13 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         return;
     }
     if (instruction & 0x0FBF_0FFF == 0x010F_0000) {
-        try self.executeArmMrs(instruction);
-        _ = self.advanceArmPipeline(bus);
+        try self.executeArmMrs(bus, instruction);
         return;
     }
     if (instruction & 0x0FB0_FFF0 == 0x0120_F000 or
         instruction & 0x0FB0_F000 == 0x0320_F000)
     {
-        try self.executeArmMsr(instruction);
-        _ = self.advanceArmPipeline(bus);
+        try self.executeArmMsr(bus, instruction);
         return;
     }
     if (instruction >> 24 & 0xF == 0xF) {
@@ -945,34 +944,38 @@ fn enterException(self: *Cpu, bus: anytype, target_mode: Mode, vector: u32, retu
     self.refillArmPipeline(bus);
 }
 
-fn executeArmMrs(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!void {
+fn executeArmMrs(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedInstruction}!void {
     const condition: u4 = @truncate(instruction >> 28);
     const destination: u4 = @truncate(instruction >> 12);
     if (condition == 0xF) return error.UnsupportedInstruction;
-    if (destination == program_counter) return error.UnsupportedInstruction;
+    _ = self.advanceArmPipeline(bus);
     if (!conditionPassed(condition, self.readFlags())) return;
 
-    const value = if (instruction & (1 << 22) != 0)
-        self.savedStatus() orelse return error.UnsupportedInstruction
-    else
-        self.cpsr;
-    self.writeGeneralRegister(destination, value);
+    var value = self.cpsr;
+    if (instruction & (1 << 22) != 0) {
+        // User and System read CPSR when no saved status register is selected.
+        value = switch (self.mode()) {
+            .user, .system => self.cpsr,
+            else => (self.savedStatus() orelse 0) | 0x10,
+        };
+    }
+    if (destination == program_counter) {
+        // MRS writes R15 before its final increment, retaining the prefetched words.
+        self.instruction_address = (value & ~@as(u32, 3)) -% 4;
+    } else self.writeGeneralRegister(destination, value);
 }
 
-fn executeArmMsr(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!void {
+fn executeArmMsr(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedInstruction}!void {
     const condition: u4 = @truncate(instruction >> 28);
     if (condition == 0xF) return error.UnsupportedInstruction;
-    if (!conditionPassed(condition, self.readFlags())) return;
 
     const value = if (instruction & (1 << 25) != 0) blk: {
         const immediate: u8 = @truncate(instruction);
         const rotation: u4 = @truncate(instruction >> 8);
         break :blk std.math.rotr(u32, immediate, @as(u5, rotation) * 2);
-    } else blk: {
-        const source: u4 = @truncate(instruction);
-        if (source == program_counter) return error.UnsupportedInstruction;
-        break :blk self.readRegister(source);
-    };
+    } else self.readRegister(@truncate(instruction));
+    _ = self.advanceArmPipeline(bus);
+    if (!conditionPassed(condition, self.readFlags())) return;
     const fields: u4 = @truncate(instruction >> 16);
     var mask: u32 = 0;
     for (0..4) |field| {
@@ -981,20 +984,16 @@ fn executeArmMsr(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!voi
         }
     }
     if (instruction & (1 << 22) != 0) {
-        const index = self.savedStatusIndex() orelse return error.UnsupportedInstruction;
+        const index = self.savedStatusIndex() orelse return;
         self.spsr[index] = (self.spsr[index] & ~mask) | (value & mask);
         return;
     }
     // User mode can write only the selected flags byte, not the control bytes.
     if (self.mode() == .user) mask &= 0xFF00_0000;
-    // MSR is not an instruction-set transition. Leave those encodings unsupported.
-    const updated = (self.cpsr & ~mask) | (value & mask);
-    if (updated & thumb_bit != 0) return error.UnsupportedInstruction;
-    switch (@as(u5, @truncate(updated))) {
-        0x10, 0x11, 0x12, 0x13, 0x17, 0x1B, 0x1F => {},
-        else => return error.UnsupportedInstruction,
-    }
-    self.cpsr = updated;
+    // ARM7TDMI holds the high bit of the five-bit mode field set.
+    self.cpsr = (self.cpsr & ~mask) | ((value | 0x10) & mask);
+    // Keep the visible R15 and the two fetched ARM words if MSR sets T.
+    if (self.cpsr & thumb_bit != 0) self.instruction_address +%= 4;
 }
 
 fn savedStatus(self: *Cpu) ?u32 {
@@ -1010,6 +1009,7 @@ fn savedStatusIndex(self: *Cpu) ?usize {
         .abort => 2,
         .irq => 3,
         .undefined_instruction => 4,
+        else => null,
     };
 }
 
@@ -1226,7 +1226,7 @@ fn conditionPassed(condition: u4, flags: Flags) bool {
 }
 
 // Return the physical bank currently visible at the top of the register file.
-fn activeBank(self: *Cpu) []u32 {
+fn activeBank(self: *Cpu) ?[]u32 {
     return switch (self.mode()) {
         .user, .system => self.registers[15..15],
         .fiq => &self.banked.fiq,
@@ -1234,6 +1234,7 @@ fn activeBank(self: *Cpu) []u32 {
         .abort => &self.banked.abort,
         .irq => &self.banked.irq,
         .undefined_instruction => &self.banked.undefined_instruction,
+        else => null,
     };
 }
 
@@ -1249,7 +1250,7 @@ pub fn readRegister(self: *Cpu, index: u4) u32 {
         return self.instruction_address +% offset;
     }
     if (index >= 8) {
-        const bank = self.activeBank();
+        const bank = self.activeBank() orelse return 0;
         const first = 15 - bank.len;
         if (index >= first) return bank[index - first];
     }
@@ -1260,7 +1261,7 @@ fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
     // PC writes must go through the control-flow path.
     std.debug.assert(index < program_counter);
     if (index >= 8) {
-        const bank = self.activeBank();
+        const bank = self.activeBank() orelse return;
         const first = 15 - bank.len;
         if (index >= first) {
             bank[index - first] = value;
