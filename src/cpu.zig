@@ -62,6 +62,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         return;
     }
     const instruction = queued[0];
+    if (try decodeArmDataProcessing(instruction)) |decoded| {
+        try self.stepArmDataProcessing(bus, decoded);
+        return;
+    }
     if (instruction & 0x0FFF_FFF0 == 0x012F_FF10) {
         try self.executeArmBx(bus, instruction);
         return;
@@ -72,7 +76,6 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         self.executeArmBranch(bus, instruction, condition);
         return;
     }
-    // Decode status transfers before the ALU because their encodings overlap.
     if (instruction & 0x0FBF_0FFF == 0x010F_0000) {
         try self.executeArmMrs(instruction);
         _ = self.advanceArmPipeline(bus);
@@ -112,7 +115,10 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         try self.executeArmTransfer(bus, instruction, extra_transfer);
         return;
     }
-    const decoded = try decodeArmDataProcessing(instruction);
+    return error.UnsupportedInstruction;
+}
+
+fn stepArmDataProcessing(self: *Cpu, bus: anytype, decoded: ArmDataProcessing) error{UnsupportedInstruction}!void {
     const writes_result = switch (decoded.operation) {
         .tst, .teq, .cmp, .cmn => false,
         else => true,
@@ -986,122 +992,64 @@ fn savedStatusIndex(self: *Cpu) ?usize {
     };
 }
 
-const ArmDataProcessing = struct {
-    operation: enum { mov, mvn, and_, eor, orr, bic, tst, teq, add, adc, sub, sbc, rsb, rsc, cmp, cmn },
-    condition: u4,
-    set_flags: bool,
-    source: u4,
+// ARM data-processing fields occupy the same bits for both operand forms.
+const ArmDataProcessing = packed struct(u32) {
+    operand: u12,
     destination: u4,
-    operand: Operand,
+    source: u4,
+    set_flags: bool,
+    operation: enum(u4) { and_, eor, sub, rsb, add, adc, sbc, rsc, tst, teq, cmp, cmn, orr, mov, bic, mvn },
+    immediate: bool,
+    family: u2,
+    condition: u4,
 
-    const Operand = union(enum) {
-        immediate: struct { value: u32, rotated: bool },
-        shifted_register: RegisterShift,
-    };
     const RegisterShift = struct { register: u4, kind: u2, amount: union(enum) { immediate: u5, register: u4 } };
+
+    fn registerShift(self: ArmDataProcessing) bool {
+        return !self.immediate and self.operand & 0x10 != 0;
+    }
 };
 
-fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!ArmDataProcessing {
-    const condition: u4 = @truncate(instruction >> 28);
-    const destination: u4 = @truncate(instruction >> 12);
-
-    if (condition == 0xF) return error.UnsupportedInstruction;
-    const immediate_operand = instruction & (1 << 25) != 0;
-    const operand_register: u4 = @truncate(instruction);
-    if (!immediate_operand) {
-        if (instruction & (1 << 4) != 0) {
-            // Bit 7 must be clear; otherwise this can be a different encoding family.
-            if (instruction & (1 << 7) != 0) return error.UnsupportedInstruction;
-            const shift_register: u4 = @truncate(instruction >> 8);
-            if (shift_register == program_counter) return error.UnsupportedInstruction;
-        }
-    }
-    // Bits 27–26 select the encoding family; bits 24–21 name the ALU operation.
-    const family: u2 = @truncate(instruction >> 26);
-    if (family != 0) return error.UnsupportedInstruction;
-    const opcode: u4 = @truncate(instruction >> 21);
-    const set_flags = instruction & (1 << 20) != 0;
-    const source: u4 = @truncate(instruction >> 16);
-    var decoded: ArmDataProcessing = .{
-        .operation = switch (opcode) {
-            0b0000 => .and_,
-            0b0001 => .eor,
-            0b1000 => .tst,
-            0b1001 => .teq,
-            0b1100 => .orr,
-            0b1101 => .mov,
-            0b1110 => .bic,
-            0b1111 => .mvn,
-            0b0100 => .add,
-            0b0010 => .sub,
-            0b1010 => .cmp,
-            0b0011 => .rsb,
-            0b0101 => .adc,
-            0b0110 => .sbc,
-            0b0111 => .rsc,
-            0b1011 => .cmn,
-        },
-        .condition = condition,
-        .set_flags = set_flags,
-        .source = source,
-        .destination = destination,
-        .operand = undefined,
-    };
+inline fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!?ArmDataProcessing {
+    const decoded: ArmDataProcessing = @bitCast(instruction);
+    if (decoded.family != 0) return null;
+    // Test opcodes with S clear share space with status transfers and BX.
     switch (decoded.operation) {
-        .mov, .mvn => {
-            if (source != 0) return error.UnsupportedInstruction;
-        },
-        .and_, .eor, .orr, .bic, .tst, .teq => {
-            // With S clear, these test opcodes overlap other encoding families.
-            if (decoded.operation == .tst or decoded.operation == .teq) {
-                if (!set_flags) return error.UnsupportedInstruction;
-            }
-        },
-        .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
-            if (decoded.operation == .cmp or decoded.operation == .cmn) {
-                if (!set_flags) return error.UnsupportedInstruction;
-            }
-        },
+        .tst, .teq, .cmp, .cmn => if (!decoded.set_flags) return null,
+        else => {},
     }
-    if (immediate_operand) {
-        const immediate: u8 = @truncate(instruction);
-        const rotation: u4 = @truncate(instruction >> 8);
-        decoded.operand = .{ .immediate = .{
-            .value = std.math.rotr(u32, immediate, @as(u5, rotation) * 2),
-            .rotated = rotation != 0,
-        } };
-    } else {
-        decoded.operand = .{ .shifted_register = .{
-            .register = operand_register,
-            .kind = @truncate(instruction >> 5),
-            .amount = if (instruction & (1 << 4) != 0)
-                .{ .register = @truncate(instruction >> 8) }
-            else
-                .{ .immediate = @truncate(instruction >> 7) },
-        } };
+    if (decoded.registerShift()) {
+        if (decoded.operand & 0x80 != 0) return null; // Multiply or extra transfer.
+        if (decoded.operand >> 8 == program_counter) return error.UnsupportedInstruction;
     }
+    if (decoded.condition == 0xF) return error.UnsupportedInstruction;
+    if ((decoded.operation == .mov or decoded.operation == .mvn) and decoded.source != 0)
+        return error.UnsupportedInstruction;
     return decoded;
 }
 
 // Return a redirect instead of writing PC so step can preserve fetch ordering.
 fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
-    if (!conditionPassed(decoded.condition, self.readFlags())) return null;
+    if (decoded.condition != 0xE and !conditionPassed(decoded.condition, self.readFlags())) return null;
     const old_flags = self.readFlags();
-    const operand: ShifterResult = switch (decoded.operand) {
-        .immediate => |immediate| .{
-            .value = immediate.value,
-            .carry = if (immediate.rotated) immediate.value >> 31 != 0 else old_flags.carry,
-        },
-        .shifted_register => |shift| self.shiftedRegisterOperand(shift),
-    };
+    const register_shift = decoded.registerShift();
+    const operand: ShifterResult = if (decoded.immediate) blk: {
+        const rotation: u5 = @as(u5, @intCast(decoded.operand >> 8)) * 2;
+        const value = std.math.rotr(u32, @as(u8, @truncate(decoded.operand)), rotation);
+        break :blk .{ .value = value, .carry = if (rotation == 0) old_flags.carry else value >> 31 != 0 };
+    } else if (decoded.operand >> 4 == 0) .{
+        // LSL #0 is the encoding for a plain register operand.
+        .value = self.readArmAluRegister(@truncate(decoded.operand), false),
+        .carry = old_flags.carry,
+    } else self.shiftedRegisterOperand(.{
+        .register = @truncate(decoded.operand),
+        .kind = @truncate(decoded.operand >> 5),
+        .amount = if (register_shift)
+            .{ .register = @truncate(decoded.operand >> 8) }
+        else
+            .{ .immediate = @truncate(decoded.operand >> 7) },
+    });
     const value = operand.value;
-    const register_shift = switch (decoded.operand) {
-        .immediate => false,
-        .shifted_register => |shift| switch (shift.amount) {
-            .immediate => false,
-            .register => true,
-        },
-    };
     if (register_shift) self.internal_cycles += 1;
     const source = decoded.source;
     const destination = decoded.destination;
@@ -1309,9 +1257,9 @@ fn mode(self: *Cpu) Mode {
 test "ARM ALU PC operand depends on the shift encoding" {
     var cpu: Cpu = .{ .instruction_address = 0x0800_0000 };
     // MOV r0, pc; MOV r0, pc, LSL r1 (r1 contains zero).
-    _ = cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_000F));
+    _ = cpu.executeArmDataProcessing((try decodeArmDataProcessing(0xE1A0_000F)).?);
     try std.testing.expectEqual(@as(u32, 0x0800_0008), cpu.registers[0]);
-    _ = cpu.executeArmDataProcessing(try decodeArmDataProcessing(0xE1A0_011F));
+    _ = cpu.executeArmDataProcessing((try decodeArmDataProcessing(0xE1A0_011F)).?);
     try std.testing.expectEqual(@as(u32, 0x0800_000C), cpu.registers[0]);
 }
 
