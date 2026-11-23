@@ -6,6 +6,8 @@
 - **accurate**: Strict timing adherence and cycle tracking
 - **embeddable**: `libzaza` holds all emulation logic and thin clients can be created in hundreds of lines of code.
 
+![demo](./assets/hm-demo.mov)
+
 ## running
 
 If you wanna run it, you have to build it yourself. Start by getting the project:
