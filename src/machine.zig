@@ -141,14 +141,19 @@ pub fn stepTimed(self: *Machine) !void {
         self.advanceClock(@min(display_cycles, timer_cycles, self.bus.serial.cyclesUntilCompletion()));
         return;
     }
-    self.advanceClock(try self.stepInstruction());
+    self.advanceClock(try self.stepInstruction(false));
 }
 
-fn stepInstruction(self: *Machine) !u64 {
+fn stepInstruction(self: *Machine, comptime iwram_arm: bool) !u64 {
     const bus_cycles_before = self.bus.bus_cycles;
     self.bus.instruction_bus_origin = bus_cycles_before;
     defer self.bus.instruction_bus_origin = null;
-    const internal_cycles = try self.stepCpu();
+    const internal_cycles = if (iwram_arm) blk: {
+        const before = self.cpu.internal_cycles;
+        try self.cpu.stepArm(&self.bus);
+        self.bus.dma_bus_word = null;
+        break :blk self.cpu.internal_cycles - before;
+    } else try self.stepCpu();
     self.bus.instruction_bus_origin = null;
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
     if (internal_cycles != 0) {
@@ -198,8 +203,15 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
         bus.flushDeferred();
         bus.batch_deadline = 0;
     }
+    // With no asserted IRQ, only a device deadline or a peripheral access can raise one.
+    if (self.cpu.executingArmInIwram() and !bus.irqLine()) return self.runBatch(limit, true);
+    return self.runBatch(limit, false);
+}
+
+fn runBatch(self: *Machine, limit: usize, comptime iwram_arm: bool) !usize {
+    const bus = &self.bus;
     for (0..limit) |index| {
-        const cycles = try self.stepInstruction();
+        const cycles = try self.stepInstruction(iwram_arm);
         if (self.elapsed_cycles + cycles >= bus.batch_deadline) {
             bus.flushDeferred();
             self.advanceClock(cycles);
@@ -207,6 +219,7 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
         }
         self.elapsed_cycles += cycles;
         bus.deferred_cycles += cycles;
+        if (iwram_arm and !self.cpu.executingArmInIwram()) return index + 1;
     }
     return limit;
 }
@@ -388,6 +401,43 @@ test "an uninterrupted CPU batch stops at the first display edge" {
     try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
     try std.testing.expectEqual(reference.bus.display_phase, batched.bus.display_phase);
     try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+}
+
+test "IWRAM ARM batch observes an IRQ enabled by a guest store" {
+    const std = @import("std");
+    const bios: [Bus.bios_size_bytes]u8 = @splat(0);
+    var batched: Machine = undefined;
+    batched.initCartridgeWithBios(&.{}, &bios);
+    batched.bus.writeData(u32, Bus.iwram_base, 0xE3A0_0001); // MOV r0, #1
+    batched.bus.writeData(u32, Bus.iwram_base + 4, 0xE1C1_00B0); // STRH r0, [r1]
+    batched.bus.writeData(u32, Bus.iwram_base + 8, 0xE3A0_202A); // MOV r2, #42
+    batched.cpu.registers[1] = Bus.ime_address;
+    batched.cpu.instruction_address = Bus.iwram_base;
+    batched.cpu.refillArmPipeline(&batched.bus);
+    batched.bus.irq_enable = 1;
+    batched.bus.requestInterrupt(1);
+    var reference = batched;
+    try std.testing.expectEqual(@as(usize, 2), try batched.stepBatch(8));
+    _ = try batched.stepBatch(1);
+    for (0..3) |_| try reference.stepTimed();
+    try std.testing.expectEqual(@as(u32, 0x18), batched.cpu.instruction_address);
+    try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+    try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+    try std.testing.expectEqual(reference.bus.bus_cycles, batched.bus.bus_cycles);
+}
+
+test "IWRAM ARM batch stops after switching to Thumb" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    machine.bus.writeData(u32, Bus.iwram_base, 0xE12F_FF10); // BX r0
+    machine.bus.writeData(u16, Bus.iwram_base + 8, 0x212A); // MOV r1, #42
+    machine.cpu.registers[0] = Bus.iwram_base + 9;
+    machine.cpu.instruction_address = Bus.iwram_base;
+    machine.cpu.refillArmPipeline(&machine.bus);
+    try std.testing.expectEqual(@as(usize, 1), try machine.stepBatch(8));
+    _ = try machine.stepBatch(1);
+    try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[1]);
 }
 
 test "batched timer reads and IRQ propagation agree with individual timed steps" {

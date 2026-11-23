@@ -57,11 +57,20 @@ pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
 }
 
 pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
-    const queued = self.pipeline orelse return error.PipelineNotReady;
     if (self.cpsr & thumb_bit != 0) {
+        const queued = self.pipeline orelse return error.PipelineNotReady;
         try self.stepThumb(bus, @truncate(queued[0]));
         return;
     }
+    return self.stepArm(bus);
+}
+
+pub fn executingArmInIwram(self: *const Cpu) bool {
+    return self.instruction_address >> 24 == 0x03 and self.cpsr & thumb_bit == 0;
+}
+
+pub fn stepArm(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
+    const queued = self.pipeline orelse return error.PipelineNotReady;
     const instruction = queued[0];
     const key: u8 = @truncate(instruction >> 20);
     return ArmDispatch(@TypeOf(bus)).table[key](self, bus, instruction);
