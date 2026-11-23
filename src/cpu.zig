@@ -64,7 +64,7 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     }
     const instruction = queued[0];
     if (try decodeArmDataProcessing(instruction)) |decoded| {
-        try self.stepArmDataProcessing(bus, decoded);
+        self.stepArmDataProcessing(bus, decoded);
         return;
     }
     if (instruction & 0x0FFF_FFF0 == 0x012F_FF10) {
@@ -132,22 +132,15 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     return error.UnsupportedInstruction;
 }
 
-fn stepArmDataProcessing(self: *Cpu, bus: anytype, decoded: ArmDataProcessing) error{UnsupportedInstruction}!void {
-    const writes_result = switch (decoded.operation) {
-        .tst, .teq, .cmp, .cmn => false,
-        else => true,
-    };
-    const return_status: ?u32 = blk: {
-        if (decoded.destination != program_counter or !decoded.set_flags) break :blk null;
-        if (!conditionPassed(decoded.condition, self.readFlags())) break :blk null;
-        if (self.savedStatus()) |status| break :blk status;
-        if (writes_result) return error.UnsupportedInstruction;
-        // User and System have no SPSR. Keep the flags produced by the comparison.
-        break :blk null;
-    };
+fn stepArmDataProcessing(self: *Cpu, bus: anytype, decoded: ArmDataProcessing) void {
+    if (decoded.condition != 0xE and !conditionPassed(decoded.condition, self.readFlags())) {
+        _ = self.advanceArmPipeline(bus);
+        return;
+    }
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
-    if (return_status) |status| self.cpsr = status;
+    // In User and System modes this reads back the flags the ALU just wrote.
+    if (decoded.destination == program_counter and decoded.set_flags) self.cpsr = self.readSpsr();
     if (redirect) |target| {
         if (self.cpsr & thumb_bit != 0) {
             self.instruction_address = target & ~@as(u32, 1);
@@ -1038,10 +1031,7 @@ inline fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction
         .tst, .teq, .cmp, .cmn => if (!decoded.set_flags) return null,
         else => {},
     }
-    if (decoded.registerShift()) {
-        if (decoded.operand & 0x80 != 0) return null; // Multiply or extra transfer.
-        if (decoded.operand >> 8 == program_counter) return error.UnsupportedInstruction;
-    }
+    if (decoded.registerShift() and decoded.operand & 0x80 != 0) return null; // Multiply or extra transfer.
     if (decoded.condition == 0xF) return error.UnsupportedInstruction;
     if ((decoded.operation == .mov or decoded.operation == .mvn) and decoded.source != 0)
         return error.UnsupportedInstruction;
@@ -1050,7 +1040,6 @@ inline fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction
 
 // Return a redirect instead of writing PC so step can preserve fetch ordering.
 fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
-    if (decoded.condition != 0xE and !conditionPassed(decoded.condition, self.readFlags())) return null;
     const old_flags = self.readFlags();
     const register_shift = decoded.registerShift();
     const operand: ShifterResult = if (decoded.immediate) blk: {
@@ -1073,6 +1062,7 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
     if (register_shift) self.internal_cycles += 1;
     const source = decoded.source;
     const destination = decoded.destination;
+    var redirect: ?u32 = null;
     switch (decoded.operation) {
         .mov, .mvn, .and_, .eor, .orr, .bic, .tst, .teq => {
             const result = switch (decoded.operation) {
@@ -1087,8 +1077,9 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
             switch (decoded.operation) {
                 .tst, .teq => {},
                 else => {
-                    if (destination == program_counter) return result;
-                    self.writeGeneralRegister(destination, result);
+                    if (destination == program_counter) {
+                        redirect = result;
+                    } else self.writeGeneralRegister(destination, result);
                 },
             }
             if (decoded.set_flags) self.writeFlags(.{
@@ -1112,14 +1103,15 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
             switch (decoded.operation) {
                 .cmp, .cmn => {},
                 else => {
-                    if (destination == program_counter) return result.value;
-                    self.writeGeneralRegister(destination, result.value);
+                    if (destination == program_counter) {
+                        redirect = result.value;
+                    } else self.writeGeneralRegister(destination, result.value);
                 },
             }
             if (decoded.set_flags) self.writeFlags(result.flags);
         },
     }
-    return null;
+    return redirect;
 }
 
 fn addWithCarry(left: u32, right: u32, carry_in: bool) struct { value: u32, flags: Flags } {
@@ -1282,6 +1274,11 @@ test "ARM ALU PC operand depends on the shift encoding" {
     try std.testing.expectEqual(@as(u32, 0x0800_0008), cpu.registers[0]);
     _ = cpu.executeArmDataProcessing((try decodeArmDataProcessing(0xE1A0_011F)).?);
     try std.testing.expectEqual(@as(u32, 0x0800_000C), cpu.registers[0]);
+    // MOV r0, pc, LSL pc reads the count at PC + 8 and the value at PC + 12.
+    const before = cpu.internal_cycles;
+    _ = cpu.executeArmDataProcessing((try decodeArmDataProcessing(0xE1A0_0F1F)).?);
+    try std.testing.expectEqual(@as(u32, 0xC00), cpu.registers[0]);
+    try std.testing.expectEqual(before + 1, cpu.internal_cycles);
 }
 
 test "SP banks follow mode and User and System share storage" {
