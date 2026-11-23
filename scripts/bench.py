@@ -54,24 +54,30 @@ def main():
     parser.add_argument("rom", type=Path)
     parser.add_argument("frames", nargs="?", type=int, default=3000)
     parser.add_argument("--baseline", type=Path, help="compare against an existing zaza-cli build")
+    parser.add_argument("--bios", type=Path, help="use the same BIOS image in both emulators")
     args = parser.parse_args()
+    bios = args.bios.resolve(strict=True) if args.bios else None
     if not 1 <= args.frames <= 2**31 - 1:
         parser.error("frames must be between 1 and 2147483647")
     rom = args.rom.resolve(strict=True)
     binaries = build(args.baseline)
     print(f"{rom.name}  SHA-256 {hashlib.sha256(rom.read_bytes()).hexdigest()}")
     print(f"{args.frames} display frames, software video, 3 paired runs, whole-process timing")
+    print(f"BIOS SHA-256 {hashlib.sha256(bios.read_bytes()).hexdigest()}" if bios else "BIOS: emulator defaults")
     results = {name: [] for name in binaries}
     with tempfile.TemporaryDirectory() as cwd:
         for pair in range(3):
             for name in (list(results) if pair % 2 == 0 else list(reversed(results))):
                 if name != "mGBA":
-                    output, metrics = measure([binaries[name], "session", rom], cwd,
+                    output, metrics = measure([binaries[name], *(["--bios", bios] if bios else []), "session", rom], cwd,
                                               f"step {args.frames} none\nquit\n".encode())
                     if output != [f"ok {args.frames}"]:
                         raise ValueError(f"Unexpected session reply: {output}")
                 else:
-                    output, metrics = measure([binaries[name], "-P", "-F", str(args.frames), rom], cwd)
+                    output, metrics = measure([binaries[name], "-P", "-F", str(args.frames),
+                                               "-s", "0", "-C", "skipBios=1", "-C", "audioSync=0",
+                                               "-C", "videoSync=0", "-C", "idleOptimization=detect",
+                                               *(["-b", bios] if bios else []), rom], cwd)
                     row, = csv.DictReader(output)
                     if int(row["frames"]) != args.frames or row["renderer"] != "software":
                         raise ValueError(f"Unexpected mGBA result: {row}")
