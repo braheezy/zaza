@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: scripts/bench.py ROM [FRAMES]. Requires Zig, CMake and a sibling mgba checkout."""
+"""Benchmark any GBA ROM against mGBA (requires CMake and a sibling mgba checkout) or a Zaza baseline."""
 import argparse
 import csv
 import hashlib
@@ -15,9 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".zig-cache" / "bench"
 
 
-def build():
+def build(baseline):
     subprocess.run(["zig", "build", "cli", "-Doptimize=ReleaseFast", "-p", CACHE / "zaza"],
                    cwd=ROOT, check=True)
+    zaza = CACHE / "zaza/bin/zaza-cli"
+    if baseline:
+        return {"Zaza": zaza, "baseline": baseline.resolve(strict=True)}
     mgba = CACHE / "mgba"
     subprocess.run(["cmake", "-S", ROOT.parent / "mgba", "-B", mgba,
                     "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_PERF=ON", "-DBUILD_QT=OFF",
@@ -25,7 +28,7 @@ def build():
                    check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["cmake", "--build", mgba, "--target", "mgba-perf", "--parallel", "4"],
                    check=True, stdout=subprocess.DEVNULL)
-    return CACHE / "zaza/bin/zaza-cli", mgba / "mgba-perf"
+    return {"Zaza": zaza, "mGBA": mgba / "mgba-perf"}
 
 
 def measure(argv, cwd, commands=b""):
@@ -50,24 +53,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rom", type=Path)
     parser.add_argument("frames", nargs="?", type=int, default=3000)
+    parser.add_argument("--baseline", type=Path, help="compare against an existing zaza-cli build")
     args = parser.parse_args()
     if not 1 <= args.frames <= 2**31 - 1:
         parser.error("frames must be between 1 and 2147483647")
     rom = args.rom.resolve(strict=True)
-    zaza, mgba = build()
+    binaries = build(args.baseline)
     print(f"{rom.name}  SHA-256 {hashlib.sha256(rom.read_bytes()).hexdigest()}")
     print(f"{args.frames} display frames, software video, 3 paired runs, whole-process timing")
-    results = {"Zaza": [], "mGBA": []}
+    results = {name: [] for name in binaries}
     with tempfile.TemporaryDirectory() as cwd:
         for pair in range(3):
             for name in (list(results) if pair % 2 == 0 else list(reversed(results))):
-                if name == "Zaza":
-                    output, metrics = measure([zaza, "session", rom], cwd,
+                if name != "mGBA":
+                    output, metrics = measure([binaries[name], "session", rom], cwd,
                                               f"step {args.frames} none\nquit\n".encode())
                     if output != [f"ok {args.frames}"]:
                         raise ValueError(f"Unexpected session reply: {output}")
                 else:
-                    output, metrics = measure([mgba, "-P", "-F", str(args.frames), rom], cwd)
+                    output, metrics = measure([binaries[name], "-P", "-F", str(args.frames), rom], cwd)
                     row, = csv.DictReader(output)
                     if int(row["frames"]) != args.frames or row["renderer"] != "software":
                         raise ValueError(f"Unexpected mGBA result: {row}")
