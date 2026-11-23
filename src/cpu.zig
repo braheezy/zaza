@@ -63,6 +63,7 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         return;
     }
     const instruction = queued[0];
+    if (self.stepArmImmediate(bus, instruction)) return;
     if (try decodeArmDataProcessing(instruction)) |decoded| {
         self.stepArmDataProcessing(bus, decoded);
         return;
@@ -1022,6 +1023,30 @@ const ArmDataProcessing = packed struct(u32) {
     }
 };
 
+// The top twelve bits select the condition, operand form, operation, and S bit.
+fn armImmediateKey(comptime operation: @FieldType(ArmDataProcessing, "operation")) u12 {
+    return 0xE20 | (@as(u12, @intFromEnum(operation)) << 1);
+}
+
+inline fn stepArmImmediate(self: *Cpu, bus: anytype, instruction: u32) bool {
+    const decoded: ArmDataProcessing = @bitCast(instruction);
+    const result = switch (instruction >> 20) {
+        armImmediateKey(.add) => blk: {
+            if (decoded.destination == program_counter) return false;
+            break :blk self.readRegister(decoded.source) +% armImmediateValue(decoded.operand);
+        },
+        else => return false,
+    };
+    self.writeGeneralRegister(decoded.destination, result);
+    _ = self.advanceArmPipeline(bus);
+    return true;
+}
+
+inline fn armImmediateValue(operand: u12) u32 {
+    const rotation: u5 = @as(u5, @intCast(operand >> 8)) * 2;
+    return std.math.rotr(u32, @as(u8, @truncate(operand)), rotation);
+}
+
 inline fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction}!?ArmDataProcessing {
     const decoded: ArmDataProcessing = @bitCast(instruction);
     if (decoded.family != 0) return null;
@@ -1042,9 +1067,8 @@ fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
     const old_flags = self.readFlags();
     const register_shift = decoded.registerShift();
     const operand: ShifterResult = if (decoded.immediate) blk: {
-        const rotation: u5 = @as(u5, @intCast(decoded.operand >> 8)) * 2;
-        const value = std.math.rotr(u32, @as(u8, @truncate(decoded.operand)), rotation);
-        break :blk .{ .value = value, .carry = if (rotation == 0) old_flags.carry else value >> 31 != 0 };
+        const value = armImmediateValue(decoded.operand);
+        break :blk .{ .value = value, .carry = if (decoded.operand >> 8 == 0) old_flags.carry else value >> 31 != 0 };
     } else if (decoded.operand >> 4 == 0) .{
         // LSL #0 is the encoding for a plain register operand.
         .value = self.readArmAluRegister(@truncate(decoded.operand), false),
