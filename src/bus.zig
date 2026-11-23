@@ -172,6 +172,22 @@ fn syncPeripheralAccess(self: *Bus, address: u32) void {
 }
 
 fn advanceTimers(self: *Bus, cycles: u64) void {
+    if (cycles == 0) return;
+    // Most instructions end before any peripheral event needs dispatch.
+    if (self.pending_timer_write == null and
+        self.peripheral_irq_pending | self.peripheral_irq_new | self.peripheral_irq_sync == 0 and
+        self.serial.remaining == 0 and cycles < self.timers.cyclesUntilOverflow() and
+        (self.audio.capture == null or cycles < @as(u64, Audio.sample_period) - self.audio.sample_phase))
+    {
+        self.timers.advanceBeforeOverflow(cycles);
+        if (self.audio.master_enabled) self.audio.psg.advance(cycles);
+        self.audio.sample_phase +%= @truncate(cycles);
+        return;
+    }
+    self.advanceTimerEvents(cycles);
+}
+
+fn advanceTimerEvents(self: *Bus, cycles: u64) void {
     var remaining = cycles;
     if (remaining != 0) {
         if (self.pending_timer_write) |write| {

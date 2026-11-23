@@ -86,16 +86,26 @@ fn nextOverflow(self: *const Timers) u64 {
     return earliest;
 }
 
-// The first clock after enable loads the counter. Subsequent clocks count.
-pub fn advance(self: *Timers, cycles: u64) u14 {
+// Before an overflow only the divider or the amount of deferred work changes.
+pub fn advanceBeforeOverflow(self: *Timers, cycles: u64) void {
+    std.debug.assert(cycles < self.until_overflow);
     self.overflowed = 0;
     if (self.until_overflow == no_deadline) {
         self.divider +%= @truncate(cycles);
-        return 0;
-    }
-    if (cycles < self.until_overflow) {
+    } else {
         self.pending_cycles += cycles;
         self.until_overflow -= cycles;
+    }
+}
+
+pub fn advance(self: *Timers, cycles: u64) u14 {
+    if (cycles < self.until_overflow) {
+        self.advanceBeforeOverflow(cycles);
+        return 0;
+    }
+    self.overflowed = 0;
+    if (self.until_overflow == no_deadline) {
+        self.divider +%= @truncate(cycles);
         return 0;
     }
     self.syncCounters();
