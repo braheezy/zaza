@@ -306,7 +306,7 @@ fn executeArmTransfer(
     const offset_register: u4 = @truncate(instruction);
     // Post-indexed T forms use the same data bus path until it models access privilege.
     const writeback = !pre_index or writeback_bit;
-    if (writeback and base_register == program_counter) return error.UnsupportedInstruction;
+    if (!extra and writeback and base_register == program_counter) return error.UnsupportedInstruction;
 
     const Operation = enum { word, byte, halfword, signed_byte, signed_halfword };
     const operation: Operation = if (extra) switch (@as(u2, @truncate(instruction >> 5))) {
@@ -317,13 +317,11 @@ fn executeArmTransfer(
     } else if (instruction & (1 << 22) != 0) .byte else .word;
 
     const offset: u32 = if (extra) blk: {
-        // Halfword and signed transfers have no post-indexed T encoding on ARMv4T.
-        if (!pre_index and writeback_bit) return error.UnsupportedInstruction;
         if (!load and operation != .halfword) return error.UnsupportedInstruction;
         if (instruction & (1 << 22) != 0) {
             break :blk ((instruction >> 4) & 0xF0) | (instruction & 0xF);
         }
-        if (instruction & 0xF00 != 0) return error.UnsupportedInstruction;
+        // Register offsets consume Rm only; bits 11–8 do not contribute.
         break :blk self.readRegister(offset_register);
     } else if (instruction & (1 << 25) != 0) blk: {
         if (instruction & (1 << 4) != 0) return error.UnsupportedInstruction;
@@ -348,7 +346,7 @@ fn executeArmTransfer(
             .halfword => bus.writeData(u16, address, @truncate(value)),
             .signed_byte, .signed_halfword => unreachable,
         }
-        if (writeback) self.writeGeneralRegister(base_register, updated_base);
+        if (writeback) self.writeTransferBase(bus, base_register, updated_base);
         return;
     }
 
@@ -362,13 +360,23 @@ fn executeArmTransfer(
     // The load completes with an internal cycle before the result is available.
     self.internal_cycles += 1;
     if (writeback and base_register != data_register) {
-        self.writeGeneralRegister(base_register, updated_base);
+        self.writeTransferBase(bus, base_register, updated_base);
     }
     if (data_register == program_counter) {
         self.instruction_address = value & ~@as(u32, 3);
         self.refillArmPipeline(bus);
     } else {
         self.writeGeneralRegister(data_register, value);
+    }
+}
+
+fn writeTransferBase(self: *Cpu, bus: anytype, base: u4, updated: u32) void {
+    if (base == program_counter) {
+        // Address generation saw PC + 8. Writeback sees PC + 12 after the fetch.
+        self.instruction_address = (updated +% 4) & ~@as(u32, 3);
+        self.refillArmPipeline(bus);
+    } else {
+        self.writeGeneralRegister(base, updated);
     }
 }
 
