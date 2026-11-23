@@ -27,8 +27,10 @@ For servers and agents, build with `zig build cli` and run
 
 ## External tests
 
-- [SingleStepTests ARM7TDMI](https://github.com/SingleStepTests/ARM7TDMI) — mostly passing
+- [SingleStepTests ARM7TDMI](https://github.com/SingleStepTests/ARM7TDMI) — passing
 - [FuzzARM](https://github.com/DenSinH/FuzzARM) - passing
 - [Armwrestler GBA fixed](https://github.com/destoer/armwrestler-gba-fixed) - mostly passing
 - [gba-tests](https://github.com/jsmolka/gba-tests) - passing
 - [mGBA test suite](https://github.com/mgba-emu/suite) - mostlyy passing
+
+See the [hardware verification checklist](docs/hardware-verification.md) for behaviors that still need a physical GBA result.

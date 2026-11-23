@@ -397,7 +397,7 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
         target = try self.executeThumbHighAlu(instruction);
     } else if (instruction >> 12 == 0xD) {
         const condition: u4 = @truncate(instruction >> 8);
-        if (condition >= 0xE) return error.UnsupportedInstruction;
+        // The pinned ARM7TDMI vectors take the reserved 0xE condition as AL.
         if (conditionPassed(condition, self.readFlags())) {
             const displacement: i8 = @bitCast(@as(u8, @truncate(instruction)));
             target = pc +% @as(u32, @bitCast(@as(i32, displacement) * 2));
