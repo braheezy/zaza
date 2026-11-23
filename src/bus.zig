@@ -514,10 +514,24 @@ fn finishRomFetch(self: *Bus, comptime T: type, value: T, cycles: u8) T {
     return value;
 }
 
+// Work RAM needs DMA arbitration and access timing, but has no MMIO side effects.
+fn workRamAccess(self: *Bus, comptime T: type, address: u32) ?*[@sizeOf(T)]u8 {
+    const region = address >> 24;
+    const bytes = switch (region) {
+        0x02 => self.ewram[address % ewram_size_bytes ..][0..@sizeOf(T)],
+        0x03 => self.iwram[address % iwram_size_bytes ..][0..@sizeOf(T)],
+        else => return null,
+    };
+    self.next_fetch_nonsequential = true;
+    self.chargeInternalAccess(T, @truncate(region));
+    return bytes;
+}
+
 pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
     self.arbitrateDma();
+    if (self.workRamAccess(T, aligned_address)) |bytes| return std.mem.readInt(T, bytes, .little);
     self.chargeDataAccess(T, aligned_address);
     self.syncPeripheralAccess(aligned_address);
     if (self.debug_port.read(T, aligned_address)) |value| return value;
@@ -574,13 +588,6 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         return @truncate(registers >> shift);
     }
     if (Serial.contains(aligned_address)) return self.serial.read(T, aligned_address);
-    if (ewramOffset(aligned_address)) |offset| {
-        self.next_fetch_nonsequential = true;
-        return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
-    }
-    if (iwramOffset(aligned_address)) |offset| {
-        return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
-    }
     if (paletteOffset(aligned_address)) |offset| {
         return std.mem.readInt(T, self.palette[offset..][0..@sizeOf(T)], .little);
     }
@@ -617,6 +624,7 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
 pub fn writeData(self: *Bus, comptime T: type, address: u32, value: T) void {
     const aligned_address = alignDataAddress(T, address);
     self.arbitrateDma();
+    if (self.workRamAccess(T, aligned_address)) |bytes| return std.mem.writeInt(T, bytes, value, .little);
     self.chargeDataAccess(T, aligned_address);
     self.syncPeripheralAccess(aligned_address);
     if (self.debug_port.write(T, aligned_address, value)) return;
@@ -801,14 +809,7 @@ fn writeAligned(self: *Bus, comptime T: type, aligned_address: u32, value: T) vo
     // Keep real peripheral registers outside this range visible as unsupported.
     if (aligned_address >= 0x0400_0110 and
         aligned_address + @sizeOf(T) <= 0x0400_0120) return;
-    if (ewramOffset(aligned_address)) |offset| {
-        std.mem.writeInt(T, self.ewram[offset..][0..@sizeOf(T)], value, .little);
-        self.next_fetch_nonsequential = true;
-        return;
-    }
-    const offset = iwramOffset(aligned_address) orelse
-        std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), aligned_address });
-    std.mem.writeInt(T, self.iwram[offset..][0..@sizeOf(T)], value, .little);
+    std.debug.panic("unmapped {d}-bit data write at 0x{x:0>8}", .{ @bitSizeOf(T), aligned_address });
 }
 
 fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
@@ -826,13 +827,16 @@ fn chargeDataAccess(self: *Bus, comptime T: type, address: u32) void {
         self.bus_cycles += timing.gamePakAccessCycles(T, access, self.waitcnt, window);
         self.next_rom_data_address = (address & ~@as(u32, 1)) + @max(2, @sizeOf(T));
     } else {
-        self.next_rom_data_address = null;
-        const region: u8 = @truncate(address >> 24);
-        const cycles = timing.ramAccessCycles(T, region);
-        self.bus_cycles += cycles;
-        self.cartridge_prefetch.advance(cycles);
-        if (region == iwram_base >> 24) self.iwram_data_cycles += cycles;
+        self.chargeInternalAccess(T, @truncate(address >> 24));
     }
+}
+
+fn chargeInternalAccess(self: *Bus, comptime T: type, region: u8) void {
+    self.next_rom_data_address = null;
+    const cycles = timing.ramAccessCycles(T, region);
+    self.bus_cycles += cycles;
+    self.cartridge_prefetch.advance(cycles);
+    if (region == iwram_base >> 24) self.iwram_data_cycles += cycles;
 }
 
 fn alignDataAddress(comptime T: type, address: u32) u32 {

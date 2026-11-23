@@ -172,7 +172,7 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
     );
     var remaining = instruction_budget;
     while (remaining != 0) {
-        remaining -= try self.stepBatch(@min(16, remaining));
+        remaining -= try self.stepBatch(remaining);
         if (self.elapsed_cycles >= target) return;
     }
     return error.InstructionBudgetExceeded;
@@ -368,6 +368,22 @@ test "timed cartridge branch loop raises VBlank IF even with IRQ delivery masked
     machine.bus.writeData(u16, Bus.if_address, 1);
     try machine.stepTimed();
     try std.testing.expectEqual(@as(u16, 0), machine.bus.irq_flags);
+}
+
+test "an uninterrupted CPU batch stops at the first display edge" {
+    const std = @import("std");
+    const rom = [_]u8{ 0xFE, 0xFF, 0xFF, 0xEA }; // B to self.
+    var batched: Machine = undefined;
+    batched.initCartridge(&rom);
+    var reference = batched;
+    const edge = reference.next_display_edge;
+    var steps: usize = 0;
+    while (reference.elapsed_cycles < edge) : (steps += 1) try reference.stepTimed();
+    try std.testing.expect(steps > 16);
+    try std.testing.expectEqual(steps, try batched.stepBatch(timing.cycles_per_line));
+    try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+    try std.testing.expectEqual(reference.bus.display_phase, batched.bus.display_phase);
+    try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
 }
 
 test "batched timer reads and IRQ propagation agree with individual timed steps" {
