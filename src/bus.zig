@@ -392,62 +392,91 @@ pub fn prefetchEnabled(self: *const Bus) bool {
     return self.waitcnt & waitcnt_prefetch_enable != 0;
 }
 
-pub fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
-    const word = self.fetch(u32, address, access);
-    self.prefetch_word = word;
-    return word;
+pub inline fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
+    if (iwramOffset(address)) |offset| {
+        if (self.immediate_dma_at == null) {
+            self.next_rom_data_address = null;
+            self.cartridge_prefetch = .{};
+            return self.fetchIwram(u32, offset);
+        }
+    }
+    return self.fetch(u32, address, access);
 }
 
-pub fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
-    const halfword = self.fetch(u16, address, access);
-    if (address < bios_size_bytes) {
-        self.prefetch_word = self.bios_fetch_word;
-    } else if (address >> 24 == iwram_base >> 24) {
-        const shift: u5 = @intCast((address & 2) * 8);
-        const mask = @as(u32, 0xFFFF) << shift;
-        self.prefetch_word = (self.prefetch_word & ~mask) | (@as(u32, halfword) << shift);
-    } else {
-        // EWRAM and Game Pak instruction reads drive the same halfword on both lanes.
-        self.prefetch_word = @as(u32, halfword) * 0x0001_0001;
+pub inline fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
+    // A continuing prefetch identifies the ROM window and already has its wait state.
+    if (self.immediate_dma_at == null and self.cartridge_prefetch.continues(address, access)) {
+        const offset = address & 0x01FF_FFFF;
+        if (offset + 2 <= self.rom.len) {
+            const value = std.mem.readInt(u16, self.rom[offset..][0..2], .little);
+            const cycles = self.cartridge_prefetch.consume(u16, address);
+            return self.finishRomFetch(u16, value, cycles);
+        }
     }
-    return halfword;
+    return self.fetch(u16, address, access);
 }
 
 fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     self.arbitrateDma();
-    const interrupted = self.next_fetch_nonsequential;
-    self.next_fetch_nonsequential = false;
-    self.next_rom_data_address = null;
-    if (romWindow(address) == null) self.cartridge_prefetch = .{};
-    if (address < bios_size_bytes) {
-        self.bus_cycles += 1;
-        // The BIOS drives a 32-bit word for ARM and Thumb instruction fetches.
-        self.bios_fetch_word = self.readBios(u32, address & ~@as(u32, 3));
-        return wordLane(T, self.bios_fetch_word, address);
+    if (romWindow(address)) |window| {
+        const value = self.readRom(T, address);
+        const cycles = self.romFetchCycles(T, address, access, window);
+        return self.finishRomFetch(T, value, cycles);
     }
+
+    self.next_rom_data_address = null;
+    self.cartridge_prefetch = .{};
+    if (iwramOffset(address)) |offset| return self.fetchIwram(T, offset);
     if (ewramOffset(address)) |offset| {
         self.next_fetch_nonsequential = true;
-        self.bus_cycles += timing.ramAccessCycles(T, @truncate(address >> 24));
-        return std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
+        self.bus_cycles += timing.ramAccessCycles(T, 0x02);
+        const value = std.mem.readInt(T, self.ewram[offset..][0..@sizeOf(T)], .little);
+        self.prefetch_word = if (T == u32) value else @as(u32, value) * 0x0001_0001;
+        return value;
     }
-    if (iwramOffset(address)) |offset| {
-        self.next_fetch_nonsequential = true;
-        self.bus_cycles += timing.ramAccessCycles(T, @truncate(address >> 24));
-        return std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
+    if (address < bios_size_bytes) {
+        self.next_fetch_nonsequential = false;
+        self.bus_cycles += 1;
+        self.bios_fetch_word = self.readBios(u32, address & ~@as(u32, 3));
+        self.prefetch_word = self.bios_fetch_word;
+        return wordLane(T, self.bios_fetch_word, address);
     }
-    const value = self.readRom(T, address);
+    std.debug.panic("unmapped {d}-bit fetch at 0x{x:0>8}", .{ @bitSizeOf(T), address });
+}
+
+inline fn fetchIwram(self: *Bus, comptime T: type, offset: u32) T {
+    self.next_fetch_nonsequential = true;
+    self.bus_cycles += 1;
+    const value = std.mem.readInt(T, self.iwram[offset..][0..@sizeOf(T)], .little);
+    if (T == u32) {
+        self.prefetch_word = value;
+    } else {
+        const shift: u5 = @intCast((offset & 2) * 8);
+        const mask = @as(u32, 0xFFFF) << shift;
+        self.prefetch_word = (self.prefetch_word & ~mask) | (@as(u32, value) << shift);
+    }
+    return value;
+}
+
+fn romFetchCycles(self: *Bus, comptime T: type, address: u32, access: timing.Access, window: u2) u8 {
     // The cartridge starts a fresh sequence at each 128 KiB boundary.
-    const effective_access = if (interrupted or address & 0x1_FFFF == 0)
+    const effective_access = if (self.next_fetch_nonsequential or address & 0x1_FFFF == 0)
         .nonsequential
     else
         access;
-    const window = romWindow(address).?;
     var cycles = timing.gamePakAccessCycles(T, effective_access, self.waitcnt, window);
     if (self.prefetchEnabled()) {
         cycles = self.cartridge_prefetch.fetch(T, address, access, cycles, self.waitcnt, window);
     }
+    return cycles;
+}
+
+fn finishRomFetch(self: *Bus, comptime T: type, value: T, cycles: u8) T {
+    self.next_rom_data_address = null;
+    self.next_fetch_nonsequential = false;
     self.rom_fetch_cycles += cycles;
     self.bus_cycles += cycles;
+    self.prefetch_word = if (T == u32) value else @as(u32, value) * 0x0001_0001;
     return value;
 }
 
@@ -939,6 +968,18 @@ test "Thumb fetch reads two bytes at a halfword offset" {
     try std.testing.expectEqual(@as(u64, 3), bus.rom_fetch_cycles);
     _ = bus.fetch16(rom_base, .sequential);
     try std.testing.expectEqual(@as(u64, 8), bus.rom_fetch_cycles);
+}
+
+test "sequential Thumb fetch charges buffered hits across the end of a ROM image" {
+    var bus: Bus = .{ .rom = &.{ 0, 0, 0x34, 0x12, 0xAB } };
+    bus.writeData(u16, waitcnt_address, waitcnt_prefetch_enable);
+    _ = bus.fetch16(rom_base, .nonsequential);
+    bus.cartridge_prefetch.advance(6);
+    const before = bus.bus_cycles;
+    try std.testing.expectEqual(@as(u16, 0x1234), bus.fetch16(rom_base + 2, .sequential));
+    try std.testing.expectEqual(@as(u32, 0x1234_1234), bus.prefetch_word);
+    try std.testing.expectEqual(@as(u16, 0x00AB), bus.fetch16(rom_base + 4, .sequential));
+    try std.testing.expectEqual(before + 2, bus.bus_cycles);
 }
 
 test "ROM data reads align to their transfer width without rotating" {

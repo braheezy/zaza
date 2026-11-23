@@ -51,17 +51,23 @@ pub const CartridgePrefetch = struct {
         return @intFromBool(finishing);
     }
 
+    pub fn continues(self: *const CartridgePrefetch, address: u32, access: Access) bool {
+        return access == .sequential and self.next_address == address and address & 0x1_FFFF != 0;
+    }
+
+    pub fn consume(self: *CartridgePrefetch, comptime T: type, address: u32) u8 {
+        const needed = self.halfword_cycles * (@sizeOf(T) / 2);
+        const cycles = @max(1, needed -| self.progress);
+        const buffered = self.progress >= needed;
+        self.progress -|= needed;
+        if (buffered) self.advance(1);
+        self.next_address = address + @sizeOf(T);
+        return cycles;
+    }
+
     pub fn fetch(self: *CartridgePrefetch, comptime T: type, address: u32, access: Access, miss_cycles: u8, waitcnt: u16, window: u2) u8 {
-        var cycles = miss_cycles;
-        if (access == .sequential and self.next_address == address and address & 0x1_FFFF != 0) {
-            const needed = self.halfword_cycles * (@sizeOf(T) / 2);
-            cycles = @max(1, needed -| self.progress);
-            const buffered = self.progress >= needed;
-            self.progress -|= needed;
-            if (buffered) self.advance(1);
-        } else {
-            cycles += self.stop();
-        }
+        if (self.continues(address, access)) return self.consume(T, address);
+        const cycles = miss_cycles + self.stop();
         self.next_address = address + @sizeOf(T);
         self.halfword_cycles = gamePakAccessCycles(u16, .sequential, waitcnt, window);
         return cycles;
