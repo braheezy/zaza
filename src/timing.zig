@@ -57,12 +57,15 @@ pub const CartridgePrefetch = struct {
 
     pub fn consume(self: *CartridgePrefetch, comptime T: type, address: u32) u8 {
         const needed = self.halfword_cycles * (@sizeOf(T) / 2);
-        const cycles = @max(1, needed -| self.progress);
-        const buffered = self.progress >= needed;
-        self.progress -|= needed;
-        if (buffered) self.advance(1);
         self.next_address = address + @sizeOf(T);
-        return cycles;
+        if (self.progress >= needed) {
+            // Consuming a buffered fetch leaves room for one cycle of prefetch.
+            self.progress = self.progress - needed + 1;
+            return 1;
+        }
+        const remaining = needed - self.progress;
+        self.progress = 0;
+        return remaining;
     }
 
     pub fn fetch(self: *CartridgePrefetch, comptime T: type, address: u32, access: Access, miss_cycles: u8, waitcnt: u16, window: u2) u8 {
