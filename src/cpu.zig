@@ -100,8 +100,13 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     }
     // Multiply encodings overlap the data-processing space.
     if (instruction & 0x0FC0_00F0 == 0x0000_0090 or instruction & 0x0F80_00F0 == 0x0080_0090) {
-        try self.executeArmMultiply(instruction);
+        if (instruction >> 28 == 15) return error.UnsupportedInstruction;
+        // The multiplier samples operands after the sequential fetch (R15 = PC + 12).
         _ = self.advanceArmPipeline(bus);
+        if (self.executeArmMultiply(instruction)) |target| {
+            self.instruction_address = target & ~@as(u32, 3);
+            self.refillArmPipeline(bus);
+        }
         return;
     }
     if (instruction & 0x0E00_0000 == 0x0800_0000) {
@@ -738,38 +743,24 @@ fn executeArmBx(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedIns
     }
 }
 
-fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction}!void {
+fn executeArmMultiply(self: *Cpu, instruction: u32) ?u32 {
     const condition: u4 = @truncate(instruction >> 28);
-    if (condition == 15) return error.UnsupportedInstruction;
     const left_register: u4 = @truncate(instruction);
     const right_register: u4 = @truncate(instruction >> 8);
     const lower_register: u4 = @truncate(instruction >> 12);
     const upper_register: u4 = @truncate(instruction >> 16);
     const long = instruction & (1 << 23) != 0;
     const accumulate = instruction & (1 << 21) != 0;
-    // The multiplier reads its operands before writeback, so Rm can also be a destination.
-    // The ARM Architecture Reference Manual describes this behavior for ARMv4 implementations.
-    if (left_register == program_counter or right_register == program_counter or
-        upper_register == program_counter)
-    {
-        return error.UnsupportedInstruction;
-    }
-    if (long) {
-        if (lower_register == program_counter or lower_register == upper_register)
-            return error.UnsupportedInstruction;
-    } else if (accumulate) {
-        if (lower_register == program_counter) return error.UnsupportedInstruction;
-    } else if (lower_register != 0) return error.UnsupportedInstruction;
-
     var flags = self.readFlags();
-    if (!conditionPassed(condition, flags)) return;
+    if (!conditionPassed(condition, flags)) return null;
     const left = self.readRegister(left_register);
     const right = self.readRegister(right_register);
     const signed = !long or instruction & (1 << 22) != 0;
     const iterations = multiplyCycles(right, signed);
     self.internal_cycles += iterations;
     self.internal_cycles += @intFromBool(accumulate);
-    if (long) {
+    var redirect: ?u32 = null;
+    const destination_value: u32 = if (long) result_word: {
         self.internal_cycles += 1;
         var result: u64 = if (signed)
             @bitCast(@as(i64, @as(i32, @bitCast(left))) * @as(i64, @as(i32, @bitCast(right))))
@@ -783,18 +774,30 @@ fn executeArmMultiply(self: *Cpu, instruction: u32) error{UnsupportedInstruction
         if (instruction & (1 << 20) != 0) {
             flags.carry = longMultiplyCarry(left, right, accumulator, signed, iterations);
         }
-        self.writeGeneralRegister(lower_register, @truncate(result));
-        self.writeGeneralRegister(upper_register, @truncate(result >> 32));
+        // Low writes first, so the high word wins when both destinations alias.
+        const low: u32 = @truncate(result);
+        if (lower_register == program_counter) {
+            redirect = low;
+        } else {
+            self.writeGeneralRegister(lower_register, low);
+        }
         flags.negative = result >> 63 != 0;
         flags.zero = result == 0;
-    } else {
+        break :result_word @truncate(result >> 32);
+    } else result_word: {
         var result = left *% right;
         if (accumulate) result +%= self.readRegister(lower_register);
-        self.writeGeneralRegister(upper_register, result);
         flags.negative = result >> 31 != 0;
         flags.zero = result == 0;
+        break :result_word result;
+    };
+    if (upper_register == program_counter) {
+        redirect = destination_value;
+    } else {
+        self.writeGeneralRegister(upper_register, destination_value);
     }
     if (instruction & (1 << 20) != 0) self.writeFlags(flags);
+    return redirect;
 }
 
 // ARM7TDMI exposes a bit of the carry-save adder through the barrel shifter.
@@ -847,7 +850,7 @@ test "SMLALS includes the original high accumulator in the carry flag" {
     for ([_]u32{ 0x4000_0000, 0 }, [_]bool{ true, false }) |high, expected_carry| {
         cpu.registers[2] = 0;
         cpu.registers[3] = high;
-        try cpu.executeArmMultiply(0xE0F3_2190); // SMLALS r2, r3, r0, r1
+        try std.testing.expectEqual(@as(?u32, null), cpu.executeArmMultiply(0xE0F3_2190)); // SMLALS r2, r3, r0, r1
         try std.testing.expectEqual(expected_carry, cpu.readFlags().carry);
         try std.testing.expectEqual(high -% 0x091A_2B3C, cpu.registers[3]);
         try std.testing.expectEqual(@as(u32, 0), cpu.registers[2]);
@@ -860,7 +863,7 @@ test "ARM multiply reads aliased source registers before writeback" {
     cpu.registers[0] = 56;
     cpu.registers[1] = 76;
     cpu.registers[4] = 240;
-    try cpu.executeArmMultiply(0xE024_0194); // MLA r4, r4, r1, r0
+    try std.testing.expectEqual(@as(?u32, null), cpu.executeArmMultiply(0xE024_0194)); // MLA r4, r4, r1, r0
     try std.testing.expectEqual(@as(u32, 18_296), cpu.registers[4]);
     try std.testing.expectEqual(@as(u64, 2), cpu.internal_cycles);
 
@@ -868,13 +871,13 @@ test "ARM multiply reads aliased source registers before writeback" {
     cpu.registers[0] = 0xFFFF_FFFF;
     cpu.registers[1] = 7;
     cpu.registers[2] = 2;
-    try cpu.executeArmMultiply(0xE0A1_0290); // UMLAL r0, r1, r0, r2
+    try std.testing.expectEqual(@as(?u32, null), cpu.executeArmMultiply(0xE0A1_0290)); // UMLAL r0, r1, r0, r2
     try std.testing.expectEqual(@as(u32, 0xFFFF_FFFD), cpu.registers[0]);
     try std.testing.expectEqual(@as(u32, 9), cpu.registers[1]);
 
     cpu.registers[0] = 0xFFFF_FFFF;
     cpu.registers[1] = 7;
-    try cpu.executeArmMultiply(0xE0A1_0291); // UMLAL r0, r1, r1, r2
+    try std.testing.expectEqual(@as(?u32, null), cpu.executeArmMultiply(0xE0A1_0291)); // UMLAL r0, r1, r1, r2
     try std.testing.expectEqual(@as(u32, 13), cpu.registers[0]);
     try std.testing.expectEqual(@as(u32, 8), cpu.registers[1]);
 }
