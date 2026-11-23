@@ -296,7 +296,7 @@ const Report = struct {
     fn single(self: *Report, family: []const u8, index: usize, vector: Vector) !void {
         try self.style.bold().cyan().print(self.writer, "{s}", .{family});
         try self.style.magenta().print(self.writer, " · case {d}\n", .{index});
-        const failure = outcome(family, vector);
+        const failure = outcome(vector);
         const skipped_case = if (failure) |err| err == error.UnsupportedInstruction else false;
         if (skipped_case) {
             try self.style.yellow().print(self.writer, "  SKIP", .{});
@@ -353,7 +353,11 @@ const Report = struct {
                         try self.style.cyan().print(self.writer, "  {s}{s} (opcode 0x{x:0>8})\n", .{
                             mnemonic, if (opcode & (1 << 20) != 0) "S" else "", opcode,
                         });
-                    } else try self.explainImmediate(vector);
+                    } else if (std.mem.startsWith(u8, family, "arm_data_proc_")) {
+                        try self.explainImmediate(vector);
+                    } else {
+                        try self.style.cyan().print(self.writer, "  ARM opcode 0x{x:0>8}\n", .{vector.opcode});
+                    }
                 }
             }
         }
@@ -439,61 +443,13 @@ const Report = struct {
         });
     }
 
-    fn outcome(family: []const u8, vector: Vector) ?anyerror {
-        // Only run families whose state and bus accesses the adapter can check.
-        const supported_families = [_][]const u8{
-            "arm_data_proc_immediate",
-            "arm_data_proc_immediate_shift",
-            "arm_data_proc_register_shift",
-            "arm_b_bl",
-            "arm_bx",
-            "thumb_lsl_lsr_asr",
-            "thumb_add_sub",
-            "thumb_mov_cmp_add_sub",
-            "thumb_data_proc",
-            "thumb_add_sp_or_pc",
-            "thumb_add_sub_sp",
-            "thumb_b",
-            "thumb_bcc",
-            "thumb_bl_blx_prefix",
-            "thumb_bl_suffix",
-            "thumb_add_cmp_mov_hi",
-            "thumb_bx",
-            "thumb_swi",
-            "thumb_ldr_pc_rel",
-            "thumb_ldr_str_imm_offset",
-            "thumb_ldr_str_reg_offset",
-            "thumb_ldr_str_sp_rel",
-            "thumb_ldrb_strb_imm_offset",
-            "thumb_ldrh_strh_imm_offset",
-            "thumb_ldrh_strh_reg_offset",
-            "thumb_ldrsb_strb_reg_offset",
-            "thumb_ldrsh_ldrsb_reg_offset",
-            "thumb_push_pop",
-            "thumb_ldm_stm",
-            "arm_mrs",
-            "arm_msr_imm",
-            "arm_msr_reg",
-            "arm_swi",
-            "arm_mul_mla",
-            "arm_mull_mlal",
-            "arm_ldm_stm",
-            "arm_ldr_str_immediate_offset",
-            "arm_ldr_str_register_offset",
-            "arm_ldrh_strh",
-            "arm_ldrsb_ldrsh",
-        };
-        for (supported_families) |supported| {
-            if (std.mem.eql(u8, family, supported)) {
-                runSelectedVector(vector) catch |err| return err;
-                return null;
-            }
-        }
-        return error.UnsupportedInstruction;
+    fn outcome(vector: Vector) ?anyerror {
+        runSelectedVector(vector) catch |err| return err;
+        return null;
     }
 
     fn record(self: *Report, family: []const u8, index: usize, vector: Vector) !void {
-        if (outcome(family, vector)) |err| {
+        if (outcome(vector)) |err| {
             if (err == error.UnsupportedInstruction) {
                 self.skipped += 1;
                 return;

@@ -115,6 +115,16 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         try self.executeArmTransfer(bus, instruction, extra_transfer);
         return;
     }
+    // The GBA has no ARM coprocessor. A coprocessor instruction whose
+    // condition passes enters Undefined mode after the sequential fetch.
+    if (instruction >> 25 & 7 == 6 or instruction >> 24 & 15 == 14) {
+        const condition: u4 = @truncate(instruction >> 28);
+        if (condition == 0xF) return error.UnsupportedInstruction;
+        _ = self.advanceArmPipeline(bus);
+        if (conditionPassed(condition, self.readFlags()))
+            self.enterException(bus, .undefined_instruction, 0x04, self.instruction_address);
+        return;
+    }
     return error.UnsupportedInstruction;
 }
 
@@ -128,7 +138,8 @@ fn stepArmDataProcessing(self: *Cpu, bus: anytype, decoded: ArmDataProcessing) e
         if (!conditionPassed(decoded.condition, self.readFlags())) break :blk null;
         if (self.savedStatus()) |status| break :blk status;
         if (writes_result) return error.UnsupportedInstruction;
-        break :blk self.cpsr;
+        // User and System have no SPSR. Keep the flags produced by the comparison.
+        break :blk null;
     };
     const redirect = self.executeArmDataProcessing(decoded);
     _ = self.advanceArmPipeline(bus);
@@ -373,7 +384,8 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     const signed_immediate: i32 = @as(i11, @bitCast(immediate));
     var target: ?u32 = null;
     const software_interrupt = instruction >> 8 == 0xDF;
-    const exchange = instruction & 0xFF87 == 0x4700;
+    // BX consumes only the source register field in the Thumb high-register format.
+    const exchange = instruction >> 8 == 0x47;
     if (software_interrupt) {
         // Exception entry runs after the sequential Thumb fetch.
     } else if (exchange) {
@@ -561,7 +573,6 @@ fn executeThumbHighAlu(self: *Cpu, instruction: u16) error{UnsupportedInstructio
     const source: u4 = @truncate(instruction >> 3);
     const destination: u4 = (@as(u4, @truncate(instruction >> 4)) & 8) |
         @as(u3, @truncate(instruction));
-    if (source < 8 and destination < 8) return error.UnsupportedInstruction;
     const right = self.readRegister(source);
     if (operation == 1) {
         self.writeFlags(addWithCarry(self.readRegister(destination), ~right, true).flags);
@@ -711,7 +722,6 @@ fn executeArmBx(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedIns
     const condition: u4 = @truncate(instruction >> 28);
     if (condition == 0xF) return error.UnsupportedInstruction;
     const source: u4 = @truncate(instruction);
-    if (source == program_counter) return error.UnsupportedInstruction;
     const taken = conditionPassed(condition, self.readFlags());
     const target = if (taken) self.readRegister(source) else 0;
     // The old instruction stream still supplies the sequential ARM fetch.
