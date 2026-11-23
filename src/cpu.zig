@@ -63,19 +63,77 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         return;
     }
     const instruction = queued[0];
-    if (self.stepArmImmediate(bus, instruction)) return;
-    if (try decodeArmDataProcessing(instruction)) |decoded| {
-        self.stepArmDataProcessing(bus, decoded);
-        return;
-    }
+    const key: u8 = @truncate(instruction >> 20);
+    return ArmDispatch(@TypeOf(bus)).table[key](self, bus, instruction);
+}
+
+// Bits 27..20 encode the ALU operation and operand form. Other families
+// share a handler and use the full instruction for their addressing fields.
+fn ArmDispatch(comptime BusPtr: type) type {
+    return struct {
+        const Handler = *const fn (*Cpu, BusPtr, u32) error{UnsupportedInstruction}!void;
+        const table = blk: {
+            @setEvalBranchQuota(5000);
+            var handlers: [256]Handler = undefined;
+            for (&handlers, 0..) |*entry, key| {
+                entry.* = switch (key) {
+                    0x00...0x3f => dataHandler(@intCast(key)),
+                    0x40...0x7f => transfer,
+                    0x80...0x9f => blockTransfer,
+                    0xa0...0xbf => branch,
+                    0xc0...0xef => coprocessor,
+                    else => swi,
+                };
+            }
+            break :blk handlers;
+        };
+
+        fn dataHandler(comptime key: u8) Handler {
+            return &struct {
+                fn run(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+                    // Supply the known opcode bits so the compiler specializes the ALU operation.
+                    const word = (instruction & 0xf00f_ffff) | (@as(u32, key) << 20);
+                    if (try decodeArmDataProcessing(word)) |decoded| {
+                        cpu.stepArmDataProcessing(bus, decoded);
+                    } else try cpu.stepArmMisc(bus, instruction);
+                }
+            }.run;
+        }
+
+        fn transfer(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+            return cpu.executeArmTransfer(bus, instruction, false);
+        }
+
+        fn blockTransfer(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+            return cpu.executeArmBlockTransfer(bus, instruction);
+        }
+
+        fn branch(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+            const condition: u4 = @truncate(instruction >> 28);
+            if (condition == 0xF) return error.UnsupportedInstruction;
+            cpu.executeArmBranch(bus, instruction, condition);
+        }
+
+        fn swi(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+            const condition: u4 = @truncate(instruction >> 28);
+            if (condition == 0xF) return error.UnsupportedInstruction;
+            cpu.executeArmSwi(bus, condition);
+        }
+
+        fn coprocessor(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+            const condition: u4 = @truncate(instruction >> 28);
+            if (condition == 0xF) return error.UnsupportedInstruction;
+            _ = cpu.advanceArmPipeline(bus);
+            if (conditionPassed(condition, cpu.readFlags()))
+                cpu.enterException(bus, .undefined_instruction, 0x04, cpu.instruction_address);
+        }
+    };
+}
+
+// These encodings overlap data processing and require additional opcode bits.
+noinline fn stepArmMisc(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedInstruction}!void {
     if (instruction & 0x0FFF_FFF0 == 0x012F_FF10) {
         try self.executeArmBx(bus, instruction);
-        return;
-    }
-    if (instruction >> 25 & 0b111 == 0b101) {
-        const condition: u4 = @truncate(instruction >> 28);
-        if (condition == 0xF) return error.UnsupportedInstruction;
-        self.executeArmBranch(bus, instruction, condition);
         return;
     }
     if (instruction & 0x0FBF_0FFF == 0x010F_0000) {
@@ -86,12 +144,6 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         instruction & 0x0FB0_F000 == 0x0320_F000)
     {
         try self.executeArmMsr(bus, instruction);
-        return;
-    }
-    if (instruction >> 24 & 0xF == 0xF) {
-        const condition: u4 = @truncate(instruction >> 28);
-        if (condition == 0xF) return error.UnsupportedInstruction;
-        self.executeArmSwi(bus, condition);
         return;
     }
     if (instruction & 0x0FB0_0FF0 == 0x0100_0090) {
@@ -109,39 +161,25 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
         }
         return;
     }
-    if (instruction & 0x0E00_0000 == 0x0800_0000) {
-        try self.executeArmBlockTransfer(bus, instruction);
-        return;
-    }
-    const single_transfer = instruction & 0x0C00_0000 == 0x0400_0000;
-    const extra_transfer = instruction & 0x0E00_0090 == 0x0000_0090 and
-        instruction & 0x60 != 0;
-    if (single_transfer or extra_transfer) {
-        try self.executeArmTransfer(bus, instruction, extra_transfer);
-        return;
-    }
-    // The GBA has no ARM coprocessor. A coprocessor instruction whose
-    // condition passes enters Undefined mode after the sequential fetch.
-    if (instruction >> 25 & 7 == 6 or instruction >> 24 & 15 == 14) {
-        const condition: u4 = @truncate(instruction >> 28);
-        if (condition == 0xF) return error.UnsupportedInstruction;
-        _ = self.advanceArmPipeline(bus);
-        if (conditionPassed(condition, self.readFlags()))
-            self.enterException(bus, .undefined_instruction, 0x04, self.instruction_address);
-        return;
-    }
+    if (instruction & 0x0E00_0090 == 0x0000_0090 and instruction & 0x60 != 0)
+        return self.executeArmTransfer(bus, instruction, true);
     return error.UnsupportedInstruction;
 }
 
-fn stepArmDataProcessing(self: *Cpu, bus: anytype, decoded: ArmDataProcessing) void {
+inline fn stepArmDataProcessing(self: *Cpu, bus: anytype, decoded: ArmDataProcessing) void {
     if (decoded.condition != 0xE and !conditionPassed(decoded.condition, self.readFlags())) {
-        _ = self.advanceArmPipeline(bus);
+        _ = @call(.never_inline, advanceArmPipeline, .{ self, bus });
         return;
     }
     const redirect = self.executeArmDataProcessing(decoded);
-    _ = self.advanceArmPipeline(bus);
+    _ = @call(.never_inline, advanceArmPipeline, .{ self, bus });
+    if (decoded.destination == program_counter) self.finishArmAluPc(bus, decoded.set_flags, redirect);
+}
+
+// PC and status writes share the same rare refill path across ALU handlers.
+noinline fn finishArmAluPc(self: *Cpu, bus: anytype, set_flags: bool, redirect: ?u32) void {
     // In User and System modes this reads back the flags the ALU just wrote.
-    if (decoded.destination == program_counter and decoded.set_flags) self.cpsr = self.readSpsr();
+    if (set_flags) self.cpsr = self.readSpsr();
     if (redirect) |target| {
         if (self.cpsr & thumb_bit != 0) {
             self.instruction_address = target & ~@as(u32, 1);
@@ -1060,25 +1098,6 @@ const ArmDataProcessing = packed struct(u32) {
     }
 };
 
-// The top twelve bits select the condition, operand form, operation, and S bit.
-fn armImmediateKey(comptime operation: @FieldType(ArmDataProcessing, "operation")) u12 {
-    return 0xE20 | (@as(u12, @intFromEnum(operation)) << 1);
-}
-
-inline fn stepArmImmediate(self: *Cpu, bus: anytype, instruction: u32) bool {
-    const decoded: ArmDataProcessing = @bitCast(instruction);
-    const result = switch (instruction >> 20) {
-        armImmediateKey(.add) => blk: {
-            if (decoded.destination == program_counter) return false;
-            break :blk self.readRegister(decoded.source) +% armImmediateValue(decoded.operand);
-        },
-        else => return false,
-    };
-    self.writeGeneralRegister(decoded.destination, result);
-    _ = self.advanceArmPipeline(bus);
-    return true;
-}
-
 inline fn armImmediateValue(operand: u12) u32 {
     const rotation: u5 = @as(u5, @intCast(operand >> 8)) * 2;
     return std.math.rotr(u32, @as(u8, @truncate(operand)), rotation);
@@ -1100,7 +1119,7 @@ inline fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction
 }
 
 // Return a redirect instead of writing PC so step can preserve fetch ordering.
-fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
+inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
     const old_flags = self.readFlags();
     const register_shift = decoded.registerShift();
     const operand: ShifterResult = if (decoded.immediate) blk: {
