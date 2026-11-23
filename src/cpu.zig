@@ -65,8 +65,8 @@ pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstru
     return self.stepArm(bus);
 }
 
-pub fn executingArmInIwram(self: *const Cpu) bool {
-    return self.instruction_address >> 24 == 0x03 and self.cpsr & thumb_bit == 0;
+pub fn inArmState(self: *const Cpu) bool {
+    return self.cpsr & thumb_bit == 0;
 }
 
 pub fn stepArm(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {

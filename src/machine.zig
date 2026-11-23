@@ -144,11 +144,11 @@ pub fn stepTimed(self: *Machine) !void {
     self.advanceClock(try self.stepInstruction(false));
 }
 
-fn stepInstruction(self: *Machine, comptime iwram_arm: bool) !u64 {
+fn stepInstruction(self: *Machine, comptime batched_arm: bool) !u64 {
     const bus_cycles_before = self.bus.bus_cycles;
     self.bus.instruction_bus_origin = bus_cycles_before;
     defer self.bus.instruction_bus_origin = null;
-    const internal_cycles = if (iwram_arm) blk: {
+    const internal_cycles = if (batched_arm) blk: {
         const before = self.cpu.internal_cycles;
         try self.cpu.stepArm(&self.bus);
         self.bus.dma_bus_word = null;
@@ -204,14 +204,17 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
         bus.batch_deadline = 0;
     }
     // With no asserted IRQ, only a device deadline or a peripheral access can raise one.
-    if (self.cpu.executingArmInIwram() and !bus.irqLine()) return self.runBatch(limit, true);
+    const region = self.cpu.instruction_address >> 24;
+    if ((region == 0x03 or (region >= 0x08 and region <= 0x0D)) and self.cpu.inArmState() and !bus.irqLine())
+        return self.runBatch(limit, true);
     return self.runBatch(limit, false);
 }
 
-fn runBatch(self: *Machine, limit: usize, comptime iwram_arm: bool) !usize {
+fn runBatch(self: *Machine, limit: usize, comptime batched_arm: bool) !usize {
     const bus = &self.bus;
+    const region = self.cpu.instruction_address >> 24;
     for (0..limit) |index| {
-        const cycles = try self.stepInstruction(iwram_arm);
+        const cycles = try self.stepInstruction(batched_arm);
         if (self.elapsed_cycles + cycles >= bus.batch_deadline) {
             bus.flushDeferred();
             self.advanceClock(cycles);
@@ -219,7 +222,7 @@ fn runBatch(self: *Machine, limit: usize, comptime iwram_arm: bool) !usize {
         }
         self.elapsed_cycles += cycles;
         bus.deferred_cycles += cycles;
-        if (iwram_arm and !self.cpu.executingArmInIwram()) return index + 1;
+        if (batched_arm and (self.cpu.instruction_address >> 24 != region or !self.cpu.inArmState())) return index + 1;
     }
     return limit;
 }
@@ -576,6 +579,12 @@ test "a BIOS SWI can read its literal and leaves a protected fetch word after re
     };
     var machine: Machine = undefined;
     machine.initCartridgeWithBios(&rom, &bios);
+    // The cartridge batch must stop at SWI so the BIOS can read its own literal.
+    var batched = machine;
+    try std.testing.expectEqual(@as(usize, 2), try batched.stepBatch(8));
+    _ = try batched.stepBatch(1);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), batched.cpu.readRegister(0));
+
     try std.testing.expectEqual(@as(u32, 0x0300_7F00), machine.cpu.readRegister(13));
     try machine.step();
     try std.testing.expectEqual(@as(u32, 0), machine.cpu.readRegister(2));
