@@ -4,6 +4,9 @@ const DisplayRegisters = @import("display_registers.zig");
 
 const background_vram_size = 64 * 1024;
 const object_vram_size = 32 * 1024;
+// The final screen-entry fetch can outlive the last tile-data fetch.
+const text_entry_cutoff = 1007;
+const text_data_cutoff = 1004;
 const object_layer = 4;
 const backdrop_layer = 5;
 
@@ -121,6 +124,25 @@ pub const Display = struct {
     }
 
     fn fetchTextLine(self: Display, backgrounds: []const ?Background, pixels: *[4][video.width]u8, latch: *u16) void {
+        // Mapped fetches are independent. An unmapped read needs the bus value
+        // from the immediately preceding slot, which may belong to another BG.
+        var last: LastFetch = .{ .cycle = 0, .word = latch.* };
+        for (backgrounds, 0..) |maybe_bg, layer| {
+            const bg = maybe_bg orelse continue;
+            const mapped = if (bg.eight_bit)
+                self.fetchTileRows(8, bg, layer, &pixels[layer], &last)
+            else
+                self.fetchTileRows(4, bg, layer, &pixels[layer], &last);
+            if (!mapped) break;
+        } else {
+            latch.* = last.word;
+            return;
+        }
+
+        self.fetchTextBusSlots(backgrounds, pixels, latch);
+    }
+
+    fn fetchTextBusSlots(self: Display, backgrounds: []const ?Background, pixels: *[4][video.width]u8, latch: *u16) void {
         // Each dot grants the text layers one bus slot apiece, in BG number order.
         // Fetch ahead of the visible pixels, even for layers hidden by the compositor.
         var entries: [4]u16 = @splat(0);
@@ -152,15 +174,64 @@ pub const Display = struct {
                     if (phase == 7) fetching[layer] = false;
                 }
                 const cycle = dot * 4 + layer;
-                if (step >= 8 and step & 7 == 0 and cycle < 1007) {
+                if (step >= 8 and step & 7 == 0 and cycle < text_entry_cutoff) {
                     const x = ((bg.scroll_x & ~@as(usize, 7)) + step - 8) & bg.xMask();
                     const block = (x >> 8) + (y >> 8) * @as(usize, if (bg.wide) 2 else 1);
                     const tile = ((y >> 3) & 31) * 32 + ((x >> 3) & 31);
                     entries[layer] = self.fetchBackgroundHalf(bg.screen_base + block * 0x800 + tile * 2, latch);
-                    fetching[layer] = cycle < 1004;
+                    fetching[layer] = cycle < text_data_cutoff;
                 }
             }
         }
+    }
+
+    const LastFetch = struct {
+        cycle: usize,
+        word: u16,
+    };
+
+    fn fetchTileRows(self: Display, comptime bits: usize, bg: Background, layer: usize, pixels: *[video.width]u8, last: *LastFetch) bool {
+        const fine = bg.scroll_x & 7;
+        const y = bg.sample_y & bg.yMask();
+        const block_row = (y >> 8) * @as(usize, if (bg.wide) 2 else 1);
+        const map_row = bg.screen_base + block_row * 0x800 + ((y >> 3) & 31) * 64;
+        var dot: usize = 8 - fine;
+        while (dot * 4 + layer < text_entry_cutoff) : (dot += 8) {
+            const tile_x = (bg.scroll_x + dot - 8) >> 3;
+            const block = if (bg.wide) (tile_x >> 5) & 1 else 0;
+            const map = map_row + block * 0x800 + (tile_x & 31) * 2;
+            if (map >= background_vram_size) return false;
+            const entry = readHalf(self.vram, map);
+            const cycle = dot * 4 + layer;
+            if (cycle >= text_data_cutoff) {
+                if (cycle > last.cycle) last.* = .{ .cycle = cycle, .word = entry };
+                break;
+            }
+            const ty = (y & 7) ^ @as(usize, if (entry & 0x800 != 0) 7 else 0);
+            const offset = bg.character_base + (@as(usize, entry & 1023) * 8 + ty) * bits;
+            if (offset >= background_vram_size) return false;
+            const flip = entry & 0x400 != 0;
+            const bytes = self.vram[offset..][0..bits];
+            // The last halfword on the bus can come from beyond the visible area.
+            const end_cycle = cycle + (1 + 8 - 16 / bits) * 4;
+            if (end_cycle > last.cycle) last.* = .{
+                .cycle = end_cycle,
+                .word = readHalf(bytes, if (flip) 0 else bits - 2),
+            };
+            // This tile starts at dot + 1. Visible pixels start at dot 9.
+            const first = 8 -| dot;
+            const dest = dot -| 8;
+            if (dest >= pixels.len) continue;
+            var indices: [8]u8 = undefined;
+            inline for (0..8) |x| {
+                const raw = if (bits == 8) bytes[x] else (bytes[x / 2] >> (x % 2 * 4)) & 15;
+                const bank: u8 = if (bits == 4 and raw != 0) @truncate(entry >> 8 & 0xF0) else 0;
+                indices[if (flip) 7 - x else x] = raw | bank;
+            }
+            const count = @min(8 - first, pixels.len - dest);
+            @memcpy(pixels[dest..][0..count], indices[first..][0..count]);
+        }
+        return true;
     }
 
     fn windowMask(self: Display, x: usize, object_window: bool) u8 {
@@ -466,4 +537,43 @@ fn tilePixel(vram: []const u8, base: usize, x: usize, y: usize, eight_bit: bool)
     if (eight_bit) return vram[base + y * 8 + x];
     const packed_pixels = vram[base + y * 4 + x / 2];
     return (packed_pixels >> @intCast((x & 1) * 4)) & 15;
+}
+
+test "tile row fetches match ordered bus slots through the end of the scanline" {
+    var vram: [background_vram_size + object_vram_size]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(19);
+    random.random().bytes(&vram);
+    const display: Display = .{
+        .control = 0,
+        .green_swap = false,
+        .vertical_windows = .{},
+        .registers = &.{},
+        .vram = &vram,
+        .palette = undefined,
+        .oam = undefined,
+    };
+    for (0..16) |variant| {
+        var layers: [4]?Background = undefined;
+        for (&layers, 0..) |*layer, i| {
+            layer.* = .{
+                .character_base = if (variant >= 8 and i == 3) 0xC000 else 0,
+                .screen_base = i * 0x1000,
+                .wide = i & 1 == 0,
+                .tall = true,
+                .eight_bit = i >= 2,
+                .scroll_x = 248 + ((variant + i) & 7),
+                .sample_y = 259 + i,
+                .mosaic_width = 1,
+                .rank = 0,
+            };
+        }
+        var expected: [4][video.width]u8 = undefined;
+        var actual: [4][video.width]u8 = undefined;
+        var expected_latch: u16 = 0xABCD;
+        var actual_latch = expected_latch;
+        display.fetchTextBusSlots(&layers, &expected, &expected_latch);
+        display.fetchTextLine(&layers, &actual, &actual_latch);
+        try std.testing.expectEqual(expected_latch, actual_latch);
+        for (expected, actual) |a, b| try std.testing.expectEqualSlices(u8, &a, &b);
+    }
 }
