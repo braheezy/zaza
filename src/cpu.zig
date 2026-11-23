@@ -296,7 +296,6 @@ fn executeArmTransfer(
     const offset_register: u4 = @truncate(instruction);
     // Post-indexed T forms use the same data bus path until it models access privilege.
     const writeback = !pre_index or writeback_bit;
-    if (!extra and writeback and base_register == program_counter) return error.UnsupportedInstruction;
 
     const Operation = enum { word, byte, halfword, signed_byte, signed_halfword };
     const operation: Operation = if (extra) switch (@as(u2, @truncate(instruction >> 5))) {
