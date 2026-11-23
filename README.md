@@ -6,7 +6,7 @@
 - **accurate**: Strict timing adherence and cycle tracking
 - **embeddable**: `libzaza` holds all emulation logic and thin clients can be created in hundreds of lines of code.
 
-![demo](./assets/hm-demo.mov)
+https://github.com/user-attachments/assets/ee416915-b9ce-4e69-a9cd-52ba708f8d24
 
 ## running
 
