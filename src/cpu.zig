@@ -91,6 +91,16 @@ fn ArmDispatch(comptime BusPtr: type) type {
         fn dataHandler(comptime key: u8) Handler {
             return &struct {
                 fn run(cpu: *Cpu, bus: BusPtr, instruction: u32) error{UnsupportedInstruction}!void {
+                    // Unconditional ADD immediate can write an ordinary register and advance directly.
+                    if (key == 0x28 and instruction >> 28 == 0xe) {
+                        const destination: u4 = @truncate(instruction >> 12);
+                        if (destination != program_counter) {
+                            const base = cpu.readRegister(@truncate(instruction >> 16));
+                            cpu.writeGeneralRegister(destination, base +% armImmediateValue(@truncate(instruction)));
+                            _ = cpu.advanceArmPipeline(bus);
+                            return;
+                        }
+                    }
                     // Supply the known opcode bits so the compiler specializes the ALU operation.
                     const word = (instruction & 0xf00f_ffff) | (@as(u32, key) << 20);
                     if (try decodeArmDataProcessing(word)) |decoded| {
