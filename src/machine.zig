@@ -77,8 +77,13 @@ pub fn initBios(self: *Machine, rom: []const u8, bios: *const [Bus.bios_size_byt
 }
 
 pub fn step(self: *Machine) !void {
+    const internal_cycles = try self.stepCpu();
+    self.bus.cpu_internal_cycles += internal_cycles;
+}
+
+fn stepCpu(self: *Machine) !u64 {
     if (self.bus.halted) {
-        if (!self.bus.hasEnabledInterrupt()) return;
+        if (!self.bus.hasEnabledInterrupt()) return 0;
         self.bus.halted = false;
     }
     // Sample IRQ before executing the next queued instruction.
@@ -86,7 +91,7 @@ pub fn step(self: *Machine) !void {
         if (self.bus.bios == null) return error.IrqNeedsBios;
         self.bus.dma_bus_word = null;
         self.cpu.enterIrq(&self.bus);
-        return;
+        return 0;
     }
     // BIOS data visibility depends on the executing instruction, not lookahead fetches.
     self.bus.executing_bios = self.cpu.instruction_address < Bus.bios_size_bytes;
@@ -95,7 +100,7 @@ pub fn step(self: *Machine) !void {
     self.bus.executing_bios = false;
     try result;
     self.bus.dma_bus_word = null;
-    self.bus.cpu_internal_cycles += self.cpu.internal_cycles - internal_before;
+    return self.cpu.internal_cycles - internal_before;
 }
 
 /// Advance the clock for one CPU instruction, IRQ entry, or halted interval.
@@ -141,14 +146,13 @@ pub fn stepTimed(self: *Machine) !void {
 
 fn stepInstruction(self: *Machine) !u64 {
     const bus_cycles_before = self.bus.bus_cycles;
-    const internal_cycles_before = self.cpu.internal_cycles;
     self.bus.instruction_bus_origin = bus_cycles_before;
     defer self.bus.instruction_bus_origin = null;
-    try self.step();
+    const internal_cycles = try self.stepCpu();
     self.bus.instruction_bus_origin = null;
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
-    const internal_cycles = self.cpu.internal_cycles - internal_cycles_before;
     if (internal_cycles != 0) {
+        self.bus.cpu_internal_cycles += internal_cycles;
         self.bus.next_fetch_nonsequential = true;
         self.bus.cartridge_prefetch.advance(internal_cycles);
     }
