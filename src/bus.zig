@@ -79,6 +79,11 @@ bg_enable_previous: u4 = 0,
 bg_enable_ready: u4 = 0,
 greenswap: u16 = 0,
 display_phase: u64 = 0,
+// Completed CPU cycles still owed to the devices during a frame run.
+deferred_cycles: u64 = 0,
+// Absolute machine cycle. Zero ends a batch at the current instruction.
+batch_deadline: u64 = 0,
+
 dispstat: u16 = vcount_match_status,
 vcount: u8 = 0,
 irq_enable: u16 = 0,
@@ -163,7 +168,20 @@ fn writeKeypadControl(self: *Bus, value: u16) void {
     if (!previous_match and self.keypadIrqCondition()) self.requestInterrupt(keypad_irq);
 }
 
+pub fn flushDeferred(self: *Bus) void {
+    if (self.deferred_cycles == 0) return;
+    const cycles = self.deferred_cycles;
+    self.deferred_cycles = 0;
+    self.advanceWithinDisplayInterval(cycles);
+}
+
 fn syncPeripheralAccess(self: *Bus, address: u32) void {
+    // I/O and cartridge save accesses can observe time or change a deadline.
+    const region = address >> 24;
+    if (region == 0x04 or region >= 0x0D) {
+        self.flushDeferred();
+        self.batch_deadline = 0;
+    }
     const origin = self.instruction_bus_origin orelse return;
     if (!Audio.contains(address) and !Timers.contains(address) and !Serial.contains(address) and (address < ie_address or address > ime_address + 3)) return;
     const elapsed = self.bus_cycles - origin;

@@ -136,6 +136,10 @@ pub fn stepTimed(self: *Machine) !void {
         self.advanceClock(@min(display_cycles, timer_cycles, self.bus.serial.cyclesUntilCompletion()));
         return;
     }
+    self.advanceClock(try self.stepInstruction());
+}
+
+fn stepInstruction(self: *Machine) !u64 {
     const bus_cycles_before = self.bus.bus_cycles;
     const internal_cycles_before = self.cpu.internal_cycles;
     self.bus.instruction_bus_origin = bus_cycles_before;
@@ -148,7 +152,7 @@ pub fn stepTimed(self: *Machine) !void {
         self.bus.next_fetch_nonsequential = true;
         self.bus.cartridge_prefetch.advance(internal_cycles);
     }
-    self.advanceClock(bus_cycles + internal_cycles);
+    return bus_cycles + internal_cycles;
 }
 
 /// Apply a full keypad snapshot and run to the next VBlank for frontends and replay.
@@ -166,11 +170,41 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
         timing.vblank_start,
         timing.cycles_per_frame,
     );
-    for (0..instruction_budget) |_| {
-        try self.stepTimed();
+    var remaining = instruction_budget;
+    while (remaining != 0) {
+        remaining -= try self.stepBatch(@min(16, remaining));
         if (self.elapsed_cycles >= target) return;
     }
     return error.InstructionBudgetExceeded;
+}
+
+// Defer device updates only while every elapsed cycle precedes the first event.
+fn stepBatch(self: *Machine, limit: usize) !usize {
+    const bus = &self.bus;
+    if (self.dma_cycles_pending != 0 or bus.halted or bus.immediate_dma_at != null or
+        bus.pending_timer_write != null or bus.peripheral_irq_pending | bus.peripheral_irq_new | bus.peripheral_irq_sync != 0)
+    {
+        try self.stepTimed();
+        return 1;
+    }
+    var interval = @min(self.next_display_edge - self.elapsed_cycles, bus.timers.cyclesUntilOverflow(), bus.serial.cyclesUntilCompletion());
+    if (bus.audio.capture != null) interval = @min(interval, @as(u64, Audio.sample_period) - bus.audio.sample_phase);
+    bus.batch_deadline = self.elapsed_cycles + interval;
+    defer {
+        bus.flushDeferred();
+        bus.batch_deadline = 0;
+    }
+    for (0..limit) |index| {
+        const cycles = try self.stepInstruction();
+        if (self.elapsed_cycles + cycles >= bus.batch_deadline) {
+            bus.flushDeferred();
+            self.advanceClock(cycles);
+            return index + 1;
+        }
+        self.elapsed_cycles += cycles;
+        bus.deferred_cycles += cycles;
+    }
+    return limit;
 }
 
 fn advanceClock(self: *Machine, cycles: u64) void {
@@ -313,6 +347,36 @@ test "timed cartridge branch loop raises VBlank IF even with IRQ delivery masked
     machine.bus.writeData(u16, Bus.if_address, 1);
     try machine.stepTimed();
     try std.testing.expectEqual(@as(u16, 0), machine.bus.irq_flags);
+}
+
+test "batched timer reads and IRQ propagation agree with individual timed steps" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x01, 0x20, 0x82, 0xE2, // ADD r2, r2, #1
+        0x01, 0x20, 0x82, 0xE2, // ADD r2, r2, #1
+        0xB0, 0x00, 0xD1, 0xE1, // LDRH r0, [r1] (timer counter)
+        0xFB, 0xFF, 0xFF, 0xEA, // B to first ADD
+    };
+    var batched: Machine = undefined;
+    batched.initCartridge(&rom);
+    batched.cpu.registers[1] = 0x0400_0100;
+    batched.bus.writeData(u32, 0x0400_0100, 0x00C0_FF83);
+    var reference = batched;
+    var longest: usize = 0;
+    while (batched.elapsed_cycles < timing.cycles_per_line * 2) {
+        const count = try batched.stepBatch(16);
+        longest = @max(longest, count);
+        for (0..count) |_| try reference.stepTimed();
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+        try std.testing.expectEqual(reference.bus.display_phase, batched.bus.display_phase);
+        try std.testing.expectEqualDeep(reference.bus.timers, batched.bus.timers);
+        try std.testing.expectEqual(reference.bus.irq_flags, batched.bus.irq_flags);
+        try std.testing.expectEqual(reference.bus.peripheral_irq_pending, batched.bus.peripheral_irq_pending);
+        try std.testing.expectEqual(reference.bus.peripheral_irq_new, batched.bus.peripheral_irq_new);
+        try std.testing.expectEqual(reference.bus.peripheral_irq_sync, batched.bus.peripheral_irq_sync);
+    }
+    try std.testing.expect(longest > 1);
 }
 
 test "timed ROM fetches use WAITCNT even with prefetch enabled" {
