@@ -173,12 +173,10 @@ fn executeArmSwap(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedI
     const base: u4 = @truncate(instruction >> 16);
     const destination: u4 = @truncate(instruction >> 12);
     const source: u4 = @truncate(instruction);
-    if (base == program_counter or destination == program_counter or source == program_counter) {
-        return error.UnsupportedInstruction;
-    }
+    // Both address and store data see PC + 12 after the sequential fetch.
+    _ = self.advanceArmPipeline(bus);
     const address = self.readRegister(base);
     const outgoing = self.readRegister(source);
-    _ = self.advanceArmPipeline(bus);
 
     // Read and write as one instruction, before replacing any aliased source register.
     const incoming: u32 = if (instruction & (1 << 22) != 0) blk: {
@@ -191,7 +189,12 @@ fn executeArmSwap(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedI
         break :blk previous;
     };
     self.internal_cycles += 1;
-    self.writeGeneralRegister(destination, incoming);
+    if (destination == program_counter) {
+        self.instruction_address = incoming & ~@as(u32, 3);
+        self.refillArmPipeline(bus);
+    } else {
+        self.writeGeneralRegister(destination, incoming);
+    }
 }
 
 fn executeArmBlockTransfer(
