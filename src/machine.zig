@@ -156,12 +156,15 @@ fn stepInstruction(self: *Machine, comptime batched_arm: bool) !u64 {
     } else try self.stepCpu();
     self.bus.instruction_bus_origin = null;
     const bus_cycles = self.bus.bus_cycles - bus_cycles_before;
-    if (internal_cycles != 0) {
-        self.bus.cpu_internal_cycles += internal_cycles;
-        self.bus.next_fetch_nonsequential = true;
-        self.bus.cartridge_prefetch.advance(internal_cycles);
-    }
+    self.finishInternalCycles(internal_cycles);
     return bus_cycles + internal_cycles;
+}
+
+inline fn finishInternalCycles(self: *Machine, cycles: u64) void {
+    if (cycles == 0) return;
+    self.bus.cpu_internal_cycles += cycles;
+    self.bus.next_fetch_nonsequential = true;
+    self.bus.cartridge_prefetch.advance(cycles);
 }
 
 /// Apply a full keypad snapshot and run to the next VBlank for frontends and replay.
@@ -207,20 +210,53 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
     const region = self.cpu.instruction_address >> 24;
     if ((region == 0x03 or (region >= 0x08 and region <= 0x0D)) and self.cpu.inArmState() and !bus.irqLine())
         return if (region == 3) self.runBatch(limit, .iwram) else self.runBatch(limit, .rom);
-    if (!self.cpu.inArmState() and region >= 0x08 and region <= 0x0D and !bus.irqLine()) {
-        const run = self.cpu.runThumbUntil(bus, limit, interval);
-        if (run.instructions != 0) {
-            const edge_cycles = run.edge_cycles;
-            self.elapsed_cycles += run.cycles - edge_cycles;
-            bus.deferred_cycles += run.cycles - edge_cycles;
-            if (edge_cycles != 0) {
-                bus.flushDeferred();
-                self.advanceClock(edge_cycles);
-            }
-            return run.instructions;
+    if (!self.cpu.inArmState() and region >= 0x08 and region <= 0x0D and !bus.irqLine())
+        return self.runThumbBatch(limit, interval);
+    return self.runBatch(limit, .generic);
+}
+
+// The read-only runner can skip repeated polling iterations. Its first unhandled
+// instruction and the rest of this interval use the ordinary Thumb handlers.
+fn runThumbBatch(self: *Machine, limit: usize, interval: u64) !usize {
+    const bus = &self.bus;
+    const prefix = self.cpu.runReadOnlyThumbUntil(bus, limit, interval);
+    var count = prefix.instructions;
+    var edge_cycles = prefix.edge_cycles;
+    var elapsed = prefix.cycles - edge_cycles;
+    bus.deferred_cycles = elapsed;
+
+    // Peripheral accesses flush earlier instructions at the actual bus beat.
+    // The instruction that reaches or changes a deadline advances devices separately.
+    defer {
+        bus.instruction_bus_origin = null;
+        self.elapsed_cycles += elapsed;
+        if (edge_cycles != 0) {
+            bus.flushDeferred();
+            self.advanceClock(edge_cycles);
         }
     }
-    return self.runBatch(limit, .generic);
+    if (edge_cycles != 0) return count;
+    while (count < limit) {
+        const before = bus.bus_cycles;
+        bus.instruction_bus_origin = before;
+        const internal_before = self.cpu.internal_cycles;
+        try self.cpu.stepQueuedThumb(bus);
+        bus.dma_bus_word = null;
+        const internal = self.cpu.internal_cycles - internal_before;
+        self.finishInternalCycles(internal);
+
+        count += 1;
+        const cycles = bus.bus_cycles - before + internal;
+        if (elapsed + cycles >= interval or bus.batch_deadline == 0) {
+            edge_cycles = cycles;
+            break;
+        }
+        elapsed += cycles;
+        bus.deferred_cycles = elapsed;
+        const region = self.cpu.instruction_address >> 24;
+        if (region < 0x08 or region > 0x0D or self.cpu.inArmState()) break;
+    }
+    return count;
 }
 
 fn runBatch(self: *Machine, limit: usize, comptime mode: enum { generic, arm_dispatch, iwram, rom }) !usize {
@@ -548,6 +584,67 @@ test "Thumb display polling samples the correct bus beat across display edges" {
             } else return error.DisplayEdgeNotObserved;
         }
     }
+}
+
+test "mixed Thumb run stops at MMIO and an exchange to ARM" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x01, 0x24, // MOVS r4, #1
+        0x08, 0x60, // STR r0, [r1]
+        0x0A, 0x68, // LDR r2, [r1]
+        0x90, 0x42, // CMP r0, r2
+        0x00, 0xD0, // BEQ to STRH
+        0xFF, 0x22, // MOVS r2, #255 (skipped)
+        0x1A, 0x80, // STRH r2, [r3] (IME)
+        0x28, 0x47, // BX r5
+    };
+    var batched: Machine = undefined;
+    batched.initCartridge(&rom);
+    batched.bus.writeData(u16, Bus.waitcnt_address, 0x4317);
+    batched.cpu.registers[0] = 1;
+    batched.cpu.registers[1] = Bus.ewram_base;
+    batched.cpu.registers[3] = Bus.ime_address;
+    batched.cpu.registers[5] = Bus.iwram_base;
+    const pc = Bus.rom_base + 0x0200_0000;
+    batched.cpu.cpsr |= 1 << 5;
+    batched.cpu.instruction_address = pc;
+    batched.cpu.pipeline = .{ batched.bus.fetch16(pc, .nonsequential), batched.bus.fetch16(pc + 2, .sequential) };
+    var reference = batched;
+    for ([_]usize{ 6, 1 }) |expected| {
+        try std.testing.expectEqual(expected, try batched.stepBatch(32));
+        for (0..expected) |_| try reference.stepTimed();
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+        try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+    }
+    try std.testing.expect(batched.bus.ime_enabled);
+    try std.testing.expect(batched.cpu.inArmState());
+    try std.testing.expectEqual(Bus.iwram_base, batched.cpu.instruction_address);
+}
+
+test "Thumb decode fault preserves timing of earlier instructions in the batch" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x01, 0x20, // MOVS r0, #1
+        0x08, 0x60, // STR r0, [r1]
+        0x00, 0xB1, // Unsupported on ARM7TDMI
+        0x00, 0x00,
+    };
+    var batched: Machine = undefined;
+    batched.initCartridge(&rom);
+    batched.cpu.registers[1] = Bus.ewram_base;
+    const pc = Bus.rom_base + 0x0200_0000;
+    batched.cpu.cpsr |= 1 << 5;
+    batched.cpu.instruction_address = pc;
+    batched.cpu.pipeline = .{ batched.bus.fetch16(pc, .nonsequential), batched.bus.fetch16(pc + 2, .sequential) };
+    var reference = batched;
+    try reference.stepTimed();
+    try reference.stepTimed();
+    try std.testing.expectError(error.UnsupportedInstruction, reference.stepTimed());
+    try std.testing.expectError(error.UnsupportedInstruction, batched.stepBatch(16));
+    try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+    try std.testing.expectEqualDeep(reference.bus, batched.bus);
+    try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
 }
 
 test "Thumb arithmetic spans hand off to timed MMIO without losing the pipeline" {

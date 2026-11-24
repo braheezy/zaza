@@ -58,15 +58,18 @@ pub fn refillArmPipeline(self: *Cpu, bus: anytype) void {
 
 pub fn step(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
     if (self.cpsr & thumb_bit != 0) {
-        const queued = self.pipeline orelse return error.PipelineNotReady;
-        try self.stepThumb(bus, @truncate(queued[0]));
-        return;
+        return self.stepQueuedThumb(bus);
     }
     return self.stepArm(bus);
 }
 
 pub fn inArmState(self: *const Cpu) bool {
     return self.cpsr & thumb_bit == 0;
+}
+
+pub fn stepQueuedThumb(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
+    const queued = self.pipeline orelse return error.PipelineNotReady;
+    return self.stepThumb(bus, @truncate(queued[0]));
 }
 
 pub fn stepArm(self: *Cpu, bus: anytype) error{ PipelineNotReady, UnsupportedInstruction }!void {
@@ -652,7 +655,7 @@ pub fn runRomAluSpan(self: *Cpu, bus: anytype, comptime T: type, limit: usize, c
 
 /// Run Thumb arithmetic, stable reads and short branches up to a device event.
 /// The admitted instructions can change PC, the pipeline, flags and low registers.
-pub fn runThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u64) struct {
+pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u64) struct {
     instructions: usize,
     cycles: u64,
     edge_cycles: u64,
