@@ -487,6 +487,24 @@ pub inline fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
     return self.fetch(u32, address, access);
 }
 
+/// A Thumb branch refills two consecutive halfwords. Both bus beats are charged,
+/// but only the second value remains on the open bus once the refill completes.
+pub fn fetchThumbPair(self: *Bus, address: u32) [2]u32 {
+    if (romWindow(address)) |window| {
+        const offset = address & 0x01FF_FFFF;
+        if (self.immediate_dma_at == null and address & 0x1_FFFF != 0x1_FFFE and
+            offset + 4 <= self.rom.len)
+        {
+            const word = std.mem.readInt(u32, self.rom[offset..][0..4], .little);
+            // A word fetch has the same first and sequential halfword timings.
+            const cycles = self.romFetchCycles(u32, address, .nonsequential, window);
+            const next = self.finishRomFetch(u16, @truncate(word >> 16), cycles);
+            return .{ @as(u16, @truncate(word)), next };
+        }
+    }
+    return .{ self.fetch16(address, .nonsequential), self.fetch16(address +% 2, .sequential) };
+}
+
 pub inline fn fetch16(self: *Bus, address: u32, access: timing.Access) u16 {
     // A continuing prefetch identifies the ROM window and already has its wait state.
     if (self.immediate_dma_at == null and self.cartridge_prefetch.continues(address, access)) {
@@ -1063,6 +1081,41 @@ test "Thumb fetch reads two bytes at a halfword offset" {
     try std.testing.expectEqual(@as(u64, 3), bus.rom_fetch_cycles);
     _ = bus.fetch16(rom_base, .sequential);
     try std.testing.expectEqual(@as(u64, 8), bus.rom_fetch_cycles);
+}
+
+test "Thumb branch refill matches two bus beats across Game Pak boundaries" {
+    var rom = [_]u8{0} ** 0x20005;
+    rom[2..6].* = .{ 0x01, 0x23, 0x45, 0x67 };
+    rom[0x1fffe..][0..6].* = .{ 0x89, 0xAB, 0xCD, 0xEF, 0x12, 0x34 };
+
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        for ([_]u32{ 0x0800_0002, 0x0A01_FFFE, 0x0C02_0000, 0x0802_0002 }) |pc| {
+            var bus: Bus = .{ .rom = &rom, .waitcnt = waitcnt };
+            _ = bus.fetch16(pc, .nonsequential);
+            // Branch away while the old FIFO is just about to complete a beat.
+            if (bus.prefetchEnabled()) {
+                bus.cartridge_prefetch.advance(bus.cartridge_prefetch.halfword_cycles - 1);
+            }
+            try expectThumbRefill(&bus, pc);
+        }
+    }
+
+    // Immediate DMA becomes eligible between the two halves of a refill.
+    var bus: Bus = .{ .rom = &rom };
+    bus.writeData(u16, iwram_base, 0x1234);
+    bus.writeData(u32, DMA.base, iwram_base);
+    bus.writeData(u32, DMA.base + 4, ewram_base);
+    bus.writeData(u32, DMA.base + 8, 0x8000_0001);
+    try expectThumbRefill(&bus, rom_base + 2);
+    try std.testing.expectEqual(@as(u16, 0x1234), bus.readData(u16, ewram_base));
+}
+
+fn expectThumbRefill(bus: *Bus, pc: u32) !void {
+    var reference = bus.*;
+    const first = reference.fetch16(pc, .nonsequential);
+    const second = reference.fetch16(pc + 2, .sequential);
+    try std.testing.expectEqual([2]u32{ first, second }, bus.fetchThumbPair(pc));
+    try std.testing.expectEqualDeep(reference, bus.*);
 }
 
 test "sequential Thumb fetch charges buffered hits across the end of a ROM image" {

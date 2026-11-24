@@ -979,6 +979,10 @@ inline fn executeThumbHighAlu(self: *Cpu, comptime opcode: u16, instruction: u16
 
 fn refillThumbPipeline(self: *Cpu, bus: anytype) void {
     std.debug.assert(self.instruction_address & 1 == 0);
+    if (@hasDecl(@TypeOf(bus.*), "fetchThumbPair")) {
+        self.pipeline = bus.fetchThumbPair(self.instruction_address);
+        return;
+    }
     const current = bus.fetch16(self.instruction_address, .nonsequential);
     const next = bus.fetch16(self.instruction_address +% 2, .sequential);
     self.pipeline = .{ current, next };
