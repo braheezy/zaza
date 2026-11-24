@@ -68,11 +68,11 @@ pub const CartridgePrefetch = struct {
         return remaining;
     }
 
-    pub fn fetch(self: *CartridgePrefetch, comptime T: type, address: u32, access: Access, miss_cycles: u8, waitcnt: u16, window: u2) u8 {
+    pub fn fetch(self: *CartridgePrefetch, comptime T: type, address: u32, access: Access, miss_cycles: u8, sequential_halfword_cycles: u8) u8 {
         if (self.continues(address, access)) return self.consume(T, address);
         const cycles = miss_cycles + self.stop();
         self.next_address = address + @sizeOf(T);
-        self.halfword_cycles = gamePakAccessCycles(u16, .sequential, waitcnt, window);
+        self.halfword_cycles = sequential_halfword_cycles;
         return cycles;
     }
 };
@@ -113,11 +113,11 @@ test "WAITCNT independently selects first and subsequent wait states" {
 test "Game Pak prefetch caps at eight halfwords and discards a redirected stream" {
     var fifo: CartridgePrefetch = .{};
     const base: u32 = 0x0800_0100;
-    try std.testing.expectEqual(@as(u8, 8), fifo.fetch(u32, base, .nonsequential, 8, 0, 0));
+    try std.testing.expectEqual(@as(u8, 8), fifo.fetch(u32, base, .nonsequential, 8, 3));
     fifo.advance(100);
     try std.testing.expectEqual(@as(u8, 24), fifo.progress);
-    try std.testing.expectEqual(@as(u8, 1), fifo.fetch(u32, base + 4, .sequential, 8, 0, 0));
-    try std.testing.expectEqual(@as(u8, 8), fifo.fetch(u32, base, .nonsequential, 8, 0, 0));
+    try std.testing.expectEqual(@as(u8, 1), fifo.fetch(u32, base + 4, .sequential, 8, 3));
+    try std.testing.expectEqual(@as(u8, 8), fifo.fetch(u32, base, .nonsequential, 8, 3));
     fifo.advance(2);
     try std.testing.expectEqual(@as(u8, 1), fifo.stop());
     try std.testing.expectEqual(@as(u8, 0), fifo.stop());

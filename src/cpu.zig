@@ -12,7 +12,8 @@ const Mode = enum(u5) {
 };
 
 const Cpu = @This();
-pub const FetchAccess = @import("timing.zig").Access;
+const timing = @import("timing.zig");
+pub const FetchAccess = timing.Access;
 
 registers: [15]u32 = @splat(0),
 banked: BankedRegisters = .{},
@@ -586,35 +587,38 @@ fn runArmRamTransfer(
     const transfer = @call(.always_inline, decodeArmTransfer, .{ self, word, extra }) catch return null;
     if (transfer.data_register == program_counter or
         (transfer.writeback and transfer.base_register == program_counter)) return null;
-    return switch (transfer.operation) {
-        inline else => |op| self.transferWorkRam(bus, transfer, op, budget),
+    const cycles = switch (transfer.operation) {
+        inline else => |op| self.accessWorkRam(bus, op, transfer.address, transfer.data_register, transfer.load, budget) orelse return null,
     };
-}
-
-// Check both the RAM mapping and the deadline before changing registers or memory.
-inline fn transferWorkRam(
-    self: *Cpu,
-    bus: anytype,
-    transfer: ArmTransfer,
-    comptime op: ArmTransfer.Operation,
-    budget: u64,
-) ?u64 {
-    const T = op.Data();
-    const aligned = transfer.address & ~@as(u32, @sizeOf(T) - 1);
-    const bytes = bus.workRamBytes(T, aligned) orelse return null;
-    const region: u8 = @truncate(transfer.address >> 24);
-    const data_cycles = @import("timing.zig").ramAccessCycles(T, region);
-    const internal: u64 = @intFromBool(transfer.load);
-    const cycles = data_cycles + internal;
-    if (cycles > budget) return null;
-    if (transfer.load) {
-        const value = std.mem.readInt(T, bytes, .little);
-        self.writeGeneralRegister(transfer.data_register, op.loadValue(value, transfer.address));
-    } else {
-        std.mem.writeInt(T, bytes, @truncate(self.readRegister(transfer.data_register)), .little);
-    }
     if (transfer.writeback and (!transfer.load or transfer.base_register != transfer.data_register))
         self.writeGeneralRegister(transfer.base_register, transfer.updated_base);
+    return cycles;
+}
+
+// Only work RAM can be accessed here without synchronizing devices. Check the
+// mapping and budget before committing either a register or a memory write.
+inline fn accessWorkRam(
+    self: *Cpu,
+    bus: anytype,
+    comptime op: ArmTransfer.Operation,
+    address: u32,
+    register: u4,
+    load: bool,
+    budget: u64,
+) ?u8 {
+    const T = op.Data();
+    const aligned = address & ~@as(u32, @sizeOf(T) - 1);
+    const bytes = bus.workRamBytes(T, aligned) orelse return null;
+    const region: u8 = @truncate(address >> 24);
+    const data_cycles = timing.ramAccessCycles(T, region);
+    const internal: u8 = @intFromBool(load);
+    const cycles = data_cycles + internal;
+    if (cycles > budget) return null;
+    if (load) {
+        self.writeGeneralRegister(register, op.loadValue(std.mem.readInt(T, bytes, .little), address));
+    } else {
+        std.mem.writeInt(T, bytes, @truncate(self.readRegister(register)), .little);
+    }
     if (region == 3) bus.iwram_data_cycles += data_cycles;
     self.internal_cycles += internal;
     return cycles;
@@ -651,6 +655,141 @@ pub fn runRomAluSpan(self: *Cpu, bus: anytype, comptime T: type, limit: usize, c
         bus.finishRomFetchSpan(T, cycles, self.instruction_address + 2 * width, queue[1]);
     }
     return .{ .steps = count, .cycles = cycles };
+}
+
+const ThumbStep = packed struct(u8) {
+    data_cycles: u3 = 0,
+    internal_cycles: u3 = 0,
+    flow: enum(u2) { next, branch, handoff } = .next,
+};
+
+fn RomThumbDispatch(comptime BusPtr: type) type {
+    return struct {
+        const Handler = *const fn (*Cpu, BusPtr, u16) ThumbStep;
+        const table = blk: {
+            @setEvalBranchQuota(20000);
+            var handlers: [1024]Handler = undefined;
+            for (&handlers, 0..) |*entry, i| entry.* = handler(thumbOpcode(@as(u16, @intCast(i)) << 6));
+            break :blk handlers;
+        };
+
+        fn handler(comptime opcode: u16) Handler {
+            return &struct {
+                fn run(cpu: *Cpu, bus: BusPtr, op: u16) ThumbStep {
+                    return cpu.executeRomThumb(bus, opcode, op);
+                }
+            }.run;
+        }
+    };
+}
+
+inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u16) ThumbStep {
+    if (opcode >= 0xD000 and opcode < 0xDF00 or opcode == 0xE000) {
+        if (opcode != 0xE000 and !conditionPassed(@truncate(opcode >> 8), self.readFlags())) return .{};
+        const target = thumbBranchTarget(self.instruction_address + 4, op, opcode == 0xE000);
+        // A window change, unbacked target or refill straddling a Game Pak page
+        // needs the two ordinary bus fetches and their individual wait states.
+        if ((target ^ self.instruction_address) >> 25 != 0 or
+            (target & 0x01FF_FFFF) + 4 > bus.rom.len or target & 0x1_FFFF == 0x1_FFFE)
+            return .{ .flow = .handoff };
+        self.instruction_address = target;
+        return .{ .flow = .branch };
+    }
+    if (opcode >= 0x4400 and opcode < 0x4700) {
+        // High-register ADD and MOV may write PC. CMP only updates flags.
+        if (opcode != 0x4500 and op & 0x87 == 0x87) return .{ .flow = .handoff };
+        _ = self.executeThumbHighAlu(opcode, op) catch unreachable;
+        return .{};
+    }
+    if (opcode == 0x4700 or opcode >= 0xB100) return .{ .flow = .handoff };
+    if (self.decodeThumbTransfer(opcode, op)) |transfer| {
+        const kind: ArmTransfer.Operation = switch (transfer.operation) {
+            .str, .ldr => .word,
+            .strh, .ldrh => .halfword,
+            .strb, .ldrb => .byte,
+            .ldrsb => .signed_byte,
+            .ldrsh => .signed_halfword,
+        };
+        const load = switch (transfer.operation) {
+            .str, .strb, .strh => false,
+            else => true,
+        };
+        const cycles = switch (kind) {
+            inline else => |width| self.accessWorkRam(bus, width, transfer.address, transfer.register, load, std.math.maxInt(u8)) orelse return .{ .flow = .handoff },
+        };
+        const internal: u3 = @intFromBool(load);
+        return .{ .data_cycles = @intCast(cycles - internal), .internal_cycles = internal };
+    }
+    const before = self.internal_cycles;
+    self.executeThumbLowAlu(opcode, op) catch return .{ .flow = .handoff };
+    return .{ .internal_cycles = @intCast(self.internal_cycles - before) };
+}
+
+const ThumbRun = struct { steps: usize = 0, cycles: u64 = 0, edge_cycles: u64 = 0 };
+
+/// Stream immutable cartridge instructions while fetch timing is predictable.
+/// RAM operands can change on every visit. An access that can observe devices,
+/// a complex control transfer or an unsupported opcode stays queued for step.
+pub fn runRomThumb(self: *Cpu, bus: anytype, limit: usize, deadline: u64) ThumbRun {
+    const pc = self.instruction_address;
+    const offset = pc & 0x01FF_FFFF;
+    const mapped = @min(bus.rom.len, 0x0200_0000);
+    if (offset + 6 > mapped) return .{};
+    const queued = self.pipeline orelse return .{};
+    const pair = std.mem.readInt(u32, bus.rom[offset..][0..4], .little);
+    if (queued[0] != @as(u16, @truncate(pair)) or queued[1] != pair >> 16) return .{};
+
+    const base = pc & 0xFE00_0000;
+    const last = base + @as(u32, @intCast(mapped)) - 6;
+    const window: u2 = @intCast((pc - @TypeOf(bus.*).rom_base) >> 25);
+    const sequential = timing.gamePakAccessCycles(u16, .sequential, bus.waitcnt, window);
+    const first = timing.gamePakAccessCycles(u16, .nonsequential, bus.waitcnt, window);
+    const prefetch = bus.prefetchEnabled();
+    var fifo = bus.cartridge_prefetch;
+    var nonsequential = bus.next_fetch_nonsequential;
+    var fetch_total: u64 = 0;
+    const internal_before = self.internal_cycles;
+    var run: ThumbRun = .{};
+    while (run.steps < limit and self.instruction_address <= last) {
+        const address = self.instruction_address + 4;
+        const op = std.mem.readInt(u16, bus.rom[self.instruction_address - base ..][0..2], .little);
+        const executed = RomThumbDispatch(@TypeOf(bus)).table[op >> 6](self, bus, op);
+        if (executed.flow == .handoff) break;
+        const miss = if (nonsequential or address & 0x1_FFFF == 0) first else sequential;
+        var fetch = if (prefetch) fifo.fetch(u16, address, .sequential, miss, sequential) else miss;
+        if (executed.flow == .branch) {
+            const refill = first + sequential;
+            fetch += if (prefetch) fifo.fetch(u32, self.instruction_address, .nonsequential, refill, sequential) else refill;
+        } else self.instruction_address += 2;
+        const other = @as(u8, executed.data_cycles) + executed.internal_cycles;
+        fifo.advance(other);
+        nonsequential = other != 0;
+        fetch_total += fetch;
+        const cycles = @as(u64, fetch) + other;
+        run.steps += 1;
+        run.cycles += cycles;
+        if (run.cycles >= deadline) {
+            run.edge_cycles = cycles;
+            break;
+        }
+    }
+
+    if (run.steps != 0) {
+        // Only the last two fetched halfwords are visible to the next instruction.
+        const next_offset = self.instruction_address - base;
+        const next_pair = std.mem.readInt(u32, bus.rom[next_offset..][0..4], .little);
+        self.pipeline = .{ @as(u16, @truncate(next_pair)), next_pair >> 16 };
+        bus.prefetch_word = (next_pair >> 16) * 0x0001_0001;
+        bus.next_rom_data_address = null;
+        bus.dma_bus_word = null;
+        bus.cartridge_prefetch = fifo;
+        bus.next_fetch_nonsequential = nonsequential;
+        bus.rom_fetch_cycles += fetch_total;
+        const internal = self.internal_cycles - internal_before;
+        bus.bus_cycles += run.cycles - internal;
+        bus.cpu_internal_cycles += internal;
+    }
+    return run;
 }
 
 /// Run Thumb arithmetic, stable reads and short branches up to a device event.
@@ -756,6 +895,14 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     return ThumbDispatch(@TypeOf(bus)).table[instruction >> 6](self, bus, instruction);
 }
 
+inline fn thumbBranchTarget(pc: u32, instruction: u16, comptime unconditional: bool) u32 {
+    const displacement: i32 = if (unconditional)
+        @as(i11, @bitCast(@as(u11, @truncate(instruction))))
+    else
+        @as(i8, @bitCast(@as(u8, @truncate(instruction))));
+    return pc +% @as(u32, @bitCast(displacement * 2));
+}
+
 inline fn stepThumbDecoded(self: *Cpu, bus: anytype, comptime opcode: u16, instruction: u16) error{UnsupportedInstruction}!void {
     const pc = self.instruction_address +% 4;
     if (self.decodeThumbTransfer(opcode, instruction)) |transfer| {
@@ -786,11 +933,10 @@ inline fn stepThumbDecoded(self: *Cpu, bus: anytype, comptime opcode: u16, instr
         const condition: u4 = @truncate(opcode >> 8);
         // The pinned ARM7TDMI vectors take the reserved 0xE condition as AL.
         if (conditionPassed(condition, self.readFlags())) {
-            const displacement: i8 = @bitCast(@as(u8, @truncate(instruction)));
-            target = pc +% @as(u32, @bitCast(@as(i32, displacement) * 2));
+            target = thumbBranchTarget(pc, instruction, false);
         }
     } else switch (opcode >> 11) {
-        0b11100 => target = pc +% @as(u32, @bitCast(signed_immediate * 2)),
+        0b11100 => target = thumbBranchTarget(pc, instruction, true),
         0b11110 => {
             // BL's prefix stores the signed high displacement in the active LR bank.
             const base = pc +% @as(u32, @bitCast(signed_immediate * 4096));

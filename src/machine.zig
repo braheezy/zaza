@@ -215,8 +215,8 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
     return self.runBatch(limit, .generic);
 }
 
-// The read-only runner can skip repeated polling iterations. Its first unhandled
-// instruction and the rest of this interval use the ordinary Thumb handlers.
+// Skip stable polling iterations, then stream cartridge code up to a device event.
+// The ordinary handler executes any instruction that needs the full bus.
 fn runThumbBatch(self: *Machine, limit: usize, interval: u64) !usize {
     const bus = &self.bus;
     const prefix = self.cpu.runReadOnlyThumbUntil(bus, limit, interval);
@@ -237,6 +237,12 @@ fn runThumbBatch(self: *Machine, limit: usize, interval: u64) !usize {
     }
     if (edge_cycles != 0) return count;
     while (count < limit) {
+        const run = self.cpu.runRomThumb(bus, limit - count, interval - elapsed);
+        count += run.steps;
+        elapsed += run.cycles - run.edge_cycles;
+        edge_cycles = run.edge_cycles;
+        bus.deferred_cycles = elapsed;
+        if (edge_cycles != 0 or count == limit) break;
         const before = bus.bus_cycles;
         bus.instruction_bus_origin = before;
         const internal_before = self.cpu.internal_cycles;
@@ -620,6 +626,51 @@ test "mixed Thumb run stops at MMIO and an exchange to ARM" {
     try std.testing.expect(batched.bus.ime_enabled);
     try std.testing.expect(batched.cpu.inArmState());
     try std.testing.expectEqual(Bus.iwram_base, batched.cpu.instruction_address);
+}
+
+test "streamed Thumb execution matches single steps across Game Pak pages and device edges" {
+    const std = @import("std");
+    const start = 0x1FFF0;
+    const rom = comptime blk: {
+        var data = [_]u8{0} ** (start + 40);
+        const words = [_]u16{
+            0x4808, // LDR r0, [pc, #32] (literal at start + 36)
+            0x6008, // STR r0, [r1]
+            0x680A, // LDR r2, [r1]
+            0x4690, // MOV r8, r2
+            0x4352, // MUL r2, r2
+            0x2A09, // CMP r2, #9
+            0xD001, // BEQ across the Game Pak page
+            0xB100, // Unsupported if reached
+            0xB100,
+            0x801A, // STRH r2, [r3] (IME)
+            0xE7F4, // B to the literal load
+        };
+        for (words, 0..) |word, i| std.mem.writeInt(u16, data[start + i * 2 ..][0..2], word, .little);
+        data[start + 36] = 3;
+        break :blk data;
+    };
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        var batched: Machine = undefined;
+        batched.initCartridge(&rom);
+        batched.bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+        batched.cpu.registers[1] = Bus.ewram_base + 4;
+        batched.cpu.registers[3] = Bus.ime_address;
+        const pc = 0x0A00_0000 + start;
+        batched.cpu.cpsr |= 1 << 5;
+        batched.cpu.instruction_address = pc;
+        batched.cpu.pipeline = batched.bus.fetchThumbPair(pc);
+        var reference = batched;
+        for (0..64) |i| {
+            const budgets = [_]usize{ 1, 4, 2, 19 };
+            const count = try batched.stepBatch(budgets[i % budgets.len]);
+            for (0..count) |_| try reference.stepTimed();
+            try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+            try std.testing.expectEqualDeep(reference.bus, batched.bus);
+            try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+        }
+        try std.testing.expect(batched.bus.ime_enabled);
+    }
 }
 
 test "Thumb decode fault preserves timing of earlier instructions in the batch" {

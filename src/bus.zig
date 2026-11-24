@@ -572,7 +572,8 @@ fn romFetchCycles(self: *Bus, comptime T: type, address: u32, access: timing.Acc
         access;
     var cycles = timing.gamePakAccessCycles(T, effective_access, self.waitcnt, window);
     if (self.prefetchEnabled()) {
-        cycles = self.cartridge_prefetch.fetch(T, address, access, cycles, self.waitcnt, window);
+        const sequential = timing.gamePakAccessCycles(u16, .sequential, self.waitcnt, window);
+        cycles = self.cartridge_prefetch.fetch(T, address, access, cycles, sequential);
     }
     return cycles;
 }
