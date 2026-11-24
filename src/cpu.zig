@@ -460,6 +460,138 @@ fn ThumbDispatch(comptime BusPtr: type) type {
     };
 }
 
+/// Execute arithmetic from the live pipeline while sequential fetch timing is constant.
+pub fn runAluSpan(self: *Cpu, bus: anytype, comptime T: type, comptime iwram: bool, limit: usize, cycles_left: u64) struct { steps: usize, cycles: u64 } {
+    var queue = self.pipeline orelse return .{ .steps = 0, .cycles = 0 };
+    // In ROM, setting up a timed span only pays off across successive ALU operations.
+    if (T == u32 and !iwram and (queue[0] | queue[1]) & 0x0C00_0000 != 0) return .{ .steps = 0, .cycles = 0 };
+    const width = @sizeOf(T);
+    const span = bus.fetchSpan(T, iwram, self.instruction_address + 2 * width);
+    const count_limit = @min(limit, span.bytes.len / width, cycles_left / span.cycles_per_fetch);
+    var count: usize = 0;
+    while (count < count_limit) : (count += 1) {
+        const word = queue[0];
+        if (T == u32) {
+            const decoded = (decodeArmDataProcessing(word) catch break) orelse break;
+            if (decoded.registerShift() or decoded.destination == program_counter) break;
+            if (decoded.condition == 0xE or conditionPassed(decoded.condition, self.readFlags())) {
+                _ = self.executeArmDataProcessing(decoded);
+            }
+        } else {
+            if (word >= 0x4000) break;
+            const op: u16 = @intCast(word);
+            self.executeThumbLowAlu(op, op) catch unreachable;
+        }
+        queue = .{ queue[1], std.mem.readInt(T, span.bytes[count * width ..][0..width], .little) };
+        self.instruction_address += width;
+    }
+    const cycles = count * @as(u64, span.cycles_per_fetch);
+    if (count != 0) {
+        self.pipeline = queue;
+        bus.finishFetchSpan(T, iwram, cycles, self.instruction_address + 2 * width, queue[1]);
+    }
+    return .{ .steps = count, .cycles = cycles };
+}
+
+/// Run Thumb arithmetic, stable reads and short branches up to a device event.
+/// The admitted instructions can change PC, the pipeline, flags and low registers.
+pub fn runThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u64) struct {
+    instructions: usize,
+    cycles: u64,
+    edge_cycles: u64,
+} {
+    const start_pc = self.instruction_address;
+    const registers = self.registers[0..8].*;
+    const flags = self.cpsr;
+    const pipeline = self.pipeline;
+    const fifo = bus.cartridge_prefetch;
+    const latch = bus.prefetch_word;
+    const nonsequential = bus.next_fetch_nonsequential;
+    const start_bus = bus.bus_cycles;
+    const start_internal = self.internal_cycles;
+    const start_rom = bus.rom_fetch_cycles;
+    const start_iwram = bus.iwram_data_cycles;
+    var count: usize = 0;
+    var cycles: u64 = 0;
+    var last: u64 = 0;
+    while (count < limit and cycles < deadline) {
+        // Leave room for either branch displacement and its pipeline refill.
+        if (self.instruction_address < 0x0800_0800 or self.instruction_address >= 0x0DFF_F7FC) break;
+        const queued = self.pipeline orelse break;
+        const op: u16 = @truncate(queued[0]);
+        if ((queued[0] | queued[1]) < 0x4000) {
+            const span = self.runAluSpan(bus, u16, false, limit - count, deadline - cycles - 1);
+            if (span.steps != 0) {
+                count += span.steps;
+                cycles += span.cycles;
+                continue;
+            }
+        }
+        const before = self.internal_cycles;
+        if (!self.stepReadOnlyThumb(bus, op, deadline - cycles)) break;
+        const internal = self.internal_cycles - before;
+        if (internal != 0) {
+            bus.next_fetch_nonsequential = true;
+            bus.cartridge_prefetch.advance(internal);
+        }
+        count += 1;
+        const elapsed = (bus.bus_cycles - start_bus) + (self.internal_cycles - start_internal);
+        last = elapsed - cycles;
+        cycles = elapsed;
+
+        // A read-only loop with identical operands, pipeline and fetch timing
+        // repeats exactly until the first device event or instruction budget.
+        if (self.instruction_address == start_pc and cycles < deadline and
+            self.cpsr == flags and std.mem.eql(u32, self.registers[0..8], &registers) and
+            std.meta.eql(self.pipeline, pipeline) and std.meta.eql(bus.cartridge_prefetch, fifo) and
+            bus.next_fetch_nonsequential == nonsequential and bus.prefetch_word == latch)
+        {
+            const repeats = @min((deadline - 1 - cycles) / cycles, (limit - count) / count);
+            bus.bus_cycles += (bus.bus_cycles - start_bus) * repeats;
+            bus.rom_fetch_cycles += (bus.rom_fetch_cycles - start_rom) * repeats;
+            bus.iwram_data_cycles += (bus.iwram_data_cycles - start_iwram) * repeats;
+            self.internal_cycles += (self.internal_cycles - start_internal) * repeats;
+            count += count * repeats;
+            cycles += cycles * repeats;
+        }
+    }
+    if (count != 0) {
+        bus.cpu_internal_cycles += self.internal_cycles - start_internal;
+        bus.dma_bus_word = null;
+    }
+    return .{ .instructions = count, .cycles = cycles, .edge_cycles = if (cycles >= deadline) last else 0 };
+}
+
+// RAM and display status remain stable until the deadline in this read-only run.
+// A rejected instruction is left queued for the normal timed interpreter.
+inline fn stepReadOnlyThumb(self: *Cpu, bus: anytype, op: u16, cycles_left: u64) bool {
+    switch (op >> 11) {
+        0...7, 28 => self.stepThumb(bus, op) catch unreachable,
+        8 => {
+            if (op >= 0x4400) return false; // High registers can redirect PC.
+            self.stepThumb(bus, op) catch unreachable;
+        },
+        26, 27 => {
+            if (op >= 0xDE00) return false; // Reserved condition or SWI.
+            self.stepThumb(bus, op) catch unreachable;
+        },
+        13, 15, 17 => {
+            const transfer = self.decodeThumbTransfer(op, op).?;
+            const region = transfer.address >> 24;
+            if (region == 2 or region == 3) {
+                self.advanceThumbPipeline(bus, self.instruction_address + 4);
+                self.executeThumbTransfer(bus, transfer);
+            } else {
+                if (transfer.operation != .ldrh or !@TypeOf(bus.*).canReadStableDisplay(transfer.address, cycles_left)) return false;
+                self.advanceThumbPipeline(bus, self.instruction_address + 4);
+                self.finishThumbLoad(transfer.register, bus.readStableDisplay(transfer.address));
+            }
+        },
+        else => return false,
+    }
+    return true;
+}
+
 fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstruction}!void {
     return ThumbDispatch(@TypeOf(bus)).table[instruction >> 6](self, bus, instruction);
 }
@@ -541,7 +673,7 @@ const ThumbTransfer = struct {
     register: u3,
 };
 
-inline fn decodeThumbTransfer(self: *Cpu, comptime opcode: u16, instruction: u16) ?ThumbTransfer {
+inline fn decodeThumbTransfer(self: *Cpu, opcode: u16, instruction: u16) ?ThumbTransfer {
     const low_register: u3 = @truncate(instruction);
     const high_register: u3 = @truncate(instruction >> 8);
     const base_register: u3 = @truncate(instruction >> 3);
@@ -600,6 +732,10 @@ fn executeThumbTransfer(self: *Cpu, bus: anytype, transfer: ThumbTransfer) void 
         .ldrsb => signExtendByte(bus.readData(u8, address)),
         .ldrsh => readSignedHalfword(bus, address),
     };
+    self.finishThumbLoad(register, result);
+}
+
+inline fn finishThumbLoad(self: *Cpu, register: u3, result: u32) void {
     self.internal_cycles += 1;
     self.writeGeneralRegister(register, result);
 }
@@ -689,7 +825,7 @@ fn refillThumbPipeline(self: *Cpu, bus: anytype) void {
     self.pipeline = .{ current, next };
 }
 
-inline fn executeThumbLowAlu(self: *Cpu, comptime opcode: u16, instruction: u16) error{UnsupportedInstruction}!void {
+inline fn executeThumbLowAlu(self: *Cpu, opcode: u16, instruction: u16) error{UnsupportedInstruction}!void {
     if (opcode >> 10 == 0b010000) {
         self.executeThumbRegisterAlu(opcode, instruction);
         return;
@@ -764,7 +900,7 @@ inline fn executeThumbLowAlu(self: *Cpu, comptime opcode: u16, instruction: u16)
     }
 }
 
-inline fn executeThumbRegisterAlu(self: *Cpu, comptime opcode: u16, instruction: u16) void {
+inline fn executeThumbRegisterAlu(self: *Cpu, opcode: u16, instruction: u16) void {
     const operation: u4 = @truncate(opcode >> 6);
     const source: u3 = @truncate(instruction >> 3);
     const destination: u3 = @truncate(instruction);

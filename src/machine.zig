@@ -206,15 +206,41 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
     // With no asserted IRQ, only a device deadline or a peripheral access can raise one.
     const region = self.cpu.instruction_address >> 24;
     if ((region == 0x03 or (region >= 0x08 and region <= 0x0D)) and self.cpu.inArmState() and !bus.irqLine())
-        return self.runBatch(limit, true);
-    return self.runBatch(limit, false);
+        return if (region == 3) self.runBatch(limit, .iwram) else self.runBatch(limit, .rom);
+    if (!self.cpu.inArmState() and region >= 0x08 and region <= 0x0D and !bus.irqLine()) {
+        const run = self.cpu.runThumbUntil(bus, limit, interval);
+        if (run.instructions != 0) {
+            const edge_cycles = run.edge_cycles;
+            self.elapsed_cycles += run.cycles - edge_cycles;
+            bus.deferred_cycles += run.cycles - edge_cycles;
+            if (edge_cycles != 0) {
+                bus.flushDeferred();
+                self.advanceClock(edge_cycles);
+            }
+            return run.instructions;
+        }
+    }
+    return self.runBatch(limit, .generic);
 }
 
-fn runBatch(self: *Machine, limit: usize, comptime batched_arm: bool) !usize {
+fn runBatch(self: *Machine, limit: usize, comptime mode: enum { generic, arm_dispatch, iwram, rom }) !usize {
     const bus = &self.bus;
     const region = self.cpu.instruction_address >> 24;
-    for (0..limit) |index| {
-        const cycles = try self.stepInstruction(batched_arm);
+    var index: usize = 0;
+    while (index < limit) : (index += 1) {
+        if (mode == .iwram or mode == .rom) {
+            const before_edge = bus.batch_deadline - self.elapsed_cycles;
+            const run = self.cpu.runAluSpan(bus, u32, mode == .iwram, limit - index, before_edge -| 1);
+            // For mixed ROM code, amortize the next span probe across a device interval.
+            if (mode == .rom and run.steps == 0) {
+                return index + try self.runBatch(limit - index, .arm_dispatch);
+            }
+            self.elapsed_cycles += run.cycles;
+            bus.deferred_cycles += run.cycles;
+            index += run.steps;
+            if (index == limit) return limit;
+        }
+        const cycles = try self.stepInstruction(mode != .generic);
         if (self.elapsed_cycles + cycles >= bus.batch_deadline) {
             bus.flushDeferred();
             self.advanceClock(cycles);
@@ -222,7 +248,7 @@ fn runBatch(self: *Machine, limit: usize, comptime batched_arm: bool) !usize {
         }
         self.elapsed_cycles += cycles;
         bus.deferred_cycles += cycles;
-        if (batched_arm and (self.cpu.instruction_address >> 24 != region or !self.cpu.inArmState())) return index + 1;
+        if (mode != .generic and (self.cpu.instruction_address >> 24 != region or !self.cpu.inArmState())) return index + 1;
     }
     return limit;
 }
@@ -248,7 +274,7 @@ fn renderVisibleLines(self: *Machine, end: u64) u64 {
     var line_start = self.elapsed_cycles + timing.cycles_per_line - line_phase;
     while (@min(line_start, edge) <= end) {
         if (line_start < edge) {
-            const line = (line_start % timing.cycles_per_frame) / timing.cycles_per_line;
+            const line: usize = @intCast((line_start % timing.cycles_per_frame) / timing.cycles_per_line);
             self.vertical_windows.beginLine(line, &self.bus.display_registers);
             line_start += timing.cycles_per_line;
         } else {
@@ -260,7 +286,7 @@ fn renderVisibleLines(self: *Machine, end: u64) u64 {
 }
 
 fn renderAtHBlank(self: *Machine, edge: u64) void {
-    const line = (edge % timing.cycles_per_frame) / timing.cycles_per_line;
+    const line: usize = @intCast((edge % timing.cycles_per_frame) / timing.cycles_per_line);
     const control = self.bus.scanlineDisplayControl();
     defer self.bus.bg_pixels_changed = false;
     // OBJ evaluation for the next line precedes OAM writes during HBlank.
@@ -441,6 +467,166 @@ test "IWRAM ARM batch stops after switching to Thumb" {
     try std.testing.expectEqual(@as(usize, 1), try machine.stepBatch(8));
     _ = try machine.stepBatch(1);
     try std.testing.expectEqual(@as(u32, 42), machine.cpu.registers[1]);
+}
+
+test "Thumb polling observes HBlank DMA at the same instruction as single stepping" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x08, 0x68, // LDR r0, [r1]
+        0x00, 0x28, // CMP r0, #0
+        0xFC, 0xD0, // BEQ to LDR
+        0x2A, 0x24, // MOV r4, #42
+        0xFE, 0xE7, // B to self
+    };
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        var batched: Machine = undefined;
+        batched.initCartridge(&rom);
+        const bus = &batched.bus;
+        bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+        bus.writeData(u32, Bus.iwram_base, 1);
+        bus.writeData(u32, 0x0400_00D4, Bus.iwram_base);
+        bus.writeData(u32, 0x0400_00D8, Bus.ewram_base);
+        bus.writeData(u32, 0x0400_00DC, 0xA400_0001);
+        batched.cpu.registers[1] = Bus.ewram_base;
+        const pc = Bus.rom_base + 0x0200_0000;
+        batched.cpu.cpsr |= 1 << 5;
+        batched.cpu.instruction_address = pc;
+        batched.cpu.pipeline = .{ bus.fetch16(pc, .nonsequential), bus.fetch16(pc + 2, .sequential) };
+        var reference = batched;
+        for (0..64) |i| {
+            const limit = [_]usize{ 1, 4, 17, 200 };
+            const count = try batched.stepBatch(limit[i % limit.len]);
+            try std.testing.expect(count > 0 and count <= limit[i % limit.len]);
+            for (0..count) |_| try reference.stepTimed();
+            try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+            try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+            try std.testing.expectEqual(reference.dma_cycles_pending, batched.dma_cycles_pending);
+            try std.testing.expectEqualDeep(reference.bus, batched.bus);
+            if (batched.cpu.registers[4] == 42) break;
+        } else return error.DmaNotObserved;
+    }
+}
+
+test "Thumb display polling samples the correct bus beat across display edges" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x08, 0x88, // LDRH r0, [r1]
+        0x10, 0x42, // TST r0, r2
+        0xFC, 0xD0, // BEQ to LDRH
+        0x2A, 0x24, // MOV r4, #42
+        0xFE, 0xE7, // B to self
+    };
+    const cases = [_]struct { address: u32, mask: u32, edge: u64 }{
+        .{ .address = Bus.dispstat_address, .mask = 2, .edge = timing.hblank_start },
+        .{ .address = Bus.vcount_address, .mask = 1, .edge = timing.cycles_per_line },
+        .{ .address = Bus.dispstat_address, .mask = 1, .edge = timing.vblank_start },
+    };
+    for (cases) |case| {
+        for ([_]u64{ 2, 11, 13, 200 }) |distance| {
+            var batched: Machine = undefined;
+            batched.initCartridge(&rom);
+            batched.elapsed_cycles = case.edge - distance;
+            batched.bus.display_phase = batched.elapsed_cycles;
+            batched.next_display_edge = case.edge;
+            batched.cpu.registers[1] = case.address;
+            batched.cpu.registers[2] = case.mask;
+            const pc = Bus.rom_base + 0x0200_0000;
+            batched.cpu.cpsr |= 1 << 5;
+            batched.cpu.instruction_address = pc;
+            batched.cpu.pipeline = .{ batched.bus.fetch16(pc, .nonsequential), batched.bus.fetch16(pc + 2, .sequential) };
+            var reference = batched;
+            for (0..32) |_| {
+                const count = try batched.stepBatch(30);
+                for (0..count) |_| try reference.stepTimed();
+                try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+                try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+                try std.testing.expectEqualDeep(reference.bus, batched.bus);
+                if (batched.cpu.registers[4] == 42) break;
+            } else return error.DisplayEdgeNotObserved;
+        }
+    }
+}
+
+test "Thumb arithmetic spans hand off to timed MMIO without losing the pipeline" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x01, 0x30, // ADDS r0, #1
+        0x41, 0x00, // LSLS r1, r0, #1
+        0x01, 0x39, // SUBS r1, #1
+        0x01, 0x29, // CMP r1, #1
+        0x13, 0x88, // LDRH r3, [r2] (running timer)
+        0xF9, 0xE7, // B to ADDS
+    };
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        var batched: Machine = undefined;
+        batched.initCartridge(&rom);
+        batched.bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+        batched.cpu.registers[2] = 0x0400_0100;
+        batched.bus.writeData(u32, 0x0400_0100, 0x00C0_FFC0);
+        const pc = Bus.rom_base + 0x0200_0000;
+        batched.cpu.cpsr |= 1 << 5;
+        batched.cpu.instruction_address = pc;
+        batched.cpu.pipeline = .{ batched.bus.fetch16(pc, .nonsequential), batched.bus.fetch16(pc + 2, .sequential) };
+        var reference = batched;
+        for (0..64) |_| {
+            const count = try batched.stepBatch(19);
+            for (0..count) |_| try reference.stepTimed();
+            try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+            try std.testing.expectEqualDeep(reference.bus, batched.bus);
+            try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+        }
+    }
+}
+
+test "ARM spans preserve Game Pak wait states, FIFO and unbacked fetches at a page edge" {
+    const std = @import("std");
+    const rom = comptime blk: {
+        var bytes = [_]u8{0} ** 0x20012;
+        for (0..12) |i| std.mem.writeInt(u32, bytes[0x1FFE0 + i * 4 ..][0..4], 0xE280_0001, .little);
+        break :blk bytes;
+    };
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        var batched: Machine = undefined;
+        batched.initCartridge(&rom);
+        batched.bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+        batched.cpu.instruction_address = Bus.rom_base + 0x1FFE0;
+        batched.cpu.refillArmPipeline(&batched.bus);
+        batched.bus.cartridge_prefetch.advance(4);
+        var reference = batched;
+        for ([_]usize{ 1, 3, 2, 5, 2 }) |limit| {
+            const steps = try batched.stepBatch(limit);
+            for (0..steps) |_| try reference.stepTimed();
+            try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+            try std.testing.expectEqualDeep(reference.bus, batched.bus);
+            try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+        }
+    }
+}
+
+test "IWRAM arithmetic run preserves prefetched words, PC operands and bus timing" {
+    const std = @import("std");
+    var batched: Machine = undefined;
+    batched.initCartridge(&.{});
+    const words = [_]u32{
+        0xE28F_0000, // ADD r0, pc, #0
+        0xE250_1001, // SUBS r1, r0, #1
+        0x0280_2001, // ADDEQ r2, r0, #1 (condition fails)
+        0xE1A0_3311, // MOV r3, r1, LSL r3 (extra internal cycle)
+        0xEAFF_FFFA, // B to ADD
+    };
+    for (words, 0..) |word, i| batched.bus.writeData(u32, Bus.iwram_base + @as(u32, @intCast(i * 4)), word);
+    batched.cpu.instruction_address = Bus.iwram_base;
+    batched.cpu.refillArmPipeline(&batched.bus);
+    // An already prefetched opcode survives a write to its backing RAM.
+    batched.bus.writeData(u32, Bus.iwram_base, 0xE3A0_002A);
+    var reference = batched;
+    for ([_]usize{ 1, 3, 5, 53, 1024 }) |limit| {
+        const count = try batched.stepBatch(limit);
+        for (0..count) |_| try reference.stepTimed();
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+    }
 }
 
 test "batched timer reads and IRQ propagation agree with individual timed steps" {

@@ -289,6 +289,20 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
 }
 
 // DISPSTAT and VCOUNT share a word and must describe the same bus beat.
+pub fn canReadStableDisplay(address: u32, cycles_left: u64) bool {
+    // A Thumb LDRH takes at most 9 Game Pak clocks, one prefetch stop
+    // clock, one I/O clock and one internal clock.
+    return (address == dispstat_address or address == vcount_address) and cycles_left > 12;
+}
+
+/// Called inside a CPU run only when the entire halfword load precedes the
+/// next event. DISPSTAT and VCOUNT are constant throughout that interval.
+pub fn readStableDisplay(self: *Bus, address: u32) u16 {
+    std.debug.assert(address == dispstat_address or address == vcount_address);
+    self.chargeDataAccess(u16, address);
+    return wordLane(u16, self.displayStatusAt(self.display_phase), address);
+}
+
 fn displayStatusAt(self: *const Bus, phase: u64) u32 {
     const line = phase / timing.cycles_per_line;
     var status = self.dispstat & ~display_status_mask;
@@ -424,6 +438,41 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
 
 pub fn prefetchEnabled(self: *const Bus) bool {
     return self.waitcnt & waitcnt_prefetch_enable != 0;
+}
+
+const FetchSpan = struct { bytes: []const u8 = &.{}, cycles_per_fetch: u8 = 1 };
+
+/// A span of sequential instruction fetches with a constant cycle cost. A change
+/// of Game Pak wait state, a FIFO transition or unbacked ROM ends the span.
+pub fn fetchSpan(self: *const Bus, comptime T: type, comptime iwram_run: bool, first: u32) FetchSpan {
+    if (iwram_run) {
+        comptime std.debug.assert(T == u32);
+        if (first >> 24 != 3) return .{};
+        return .{ .bytes = self.iwram[first % iwram_size_bytes ..], .cycles_per_fetch = 1 };
+    }
+    const window = romWindow(first) orelse return .{};
+    const offset = first & 0x01FF_FFFF;
+    const within_page = first & 0x1_FFFF;
+    if (offset >= self.rom.len or within_page == 0) return .{};
+    if (self.prefetchEnabled()) {
+        if (!self.cartridge_prefetch.continues(first, .sequential) or self.cartridge_prefetch.progress != 0) return .{};
+    } else if (self.next_fetch_nonsequential) return .{};
+    const size = @min(0x20000 - within_page, self.rom.len - offset);
+    return .{ .bytes = self.rom[offset..][0..size], .cycles_per_fetch = timing.gamePakAccessCycles(T, .sequential, self.waitcnt, window) };
+}
+
+pub fn finishFetchSpan(self: *Bus, comptime T: type, comptime iwram_run: bool, cycles: u64, next: u32, word: u32) void {
+    self.bus_cycles += cycles;
+    self.prefetch_word = if (T == u32) word else word * 0x0001_0001;
+    self.next_fetch_nonsequential = iwram_run;
+    self.next_rom_data_address = null;
+    self.dma_bus_word = null;
+    if (iwram_run) {
+        self.cartridge_prefetch = .{};
+    } else {
+        self.rom_fetch_cycles += cycles;
+        if (self.prefetchEnabled()) self.cartridge_prefetch.next_address = next;
+    }
 }
 
 pub inline fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
