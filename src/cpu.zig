@@ -180,7 +180,7 @@ noinline fn stepArmMisc(self: *Cpu, bus: anytype, instruction: u32) error{Unsupp
         }
         return;
     }
-    if (instruction & 0x0E00_0090 == 0x0000_0090 and instruction & 0x60 != 0)
+    if (isArmExtraTransfer(instruction))
         return self.executeArmTransfer(bus, instruction, true);
     return error.UnsupportedInstruction;
 }
@@ -350,8 +350,36 @@ fn executeArmTransfer(
     self.finishArmTransfer(bus, transfer);
 }
 
+fn isArmExtraTransfer(word: u32) bool {
+    // Bits 6..5 distinguish these transfers from multiply and swap.
+    return word & 0x0E00_0090 == 0x0000_0090 and word & 0x60 != 0;
+}
+
 const ArmTransfer = struct {
-    const Operation = enum { word, byte, halfword, signed_byte, signed_halfword };
+    const Operation = enum {
+        word,
+        byte,
+        halfword,
+        signed_byte,
+        signed_halfword,
+
+        fn Data(comptime op: Operation) type {
+            return switch (op) {
+                .word => u32,
+                .halfword, .signed_halfword => u16,
+                .byte, .signed_byte => u8,
+            };
+        }
+
+        fn loadValue(comptime op: Operation, value: op.Data(), address: u32) u32 {
+            return switch (op) {
+                .word, .halfword => std.math.rotr(u32, value, (address & (@sizeOf(op.Data()) - 1)) * 8),
+                .byte => value,
+                .signed_byte => signExtendByte(value),
+                .signed_halfword => signedHalfwordValue(value, address),
+            };
+        }
+    };
 
     operation: Operation,
     address: u32,
@@ -424,12 +452,8 @@ fn finishArmTransfer(self: *Cpu, bus: anytype, transfer: ArmTransfer) void {
         return;
     }
 
-    const value: u32 = switch (transfer.operation) {
-        .word => std.math.rotr(u32, bus.readData(u32, transfer.address), (transfer.address & 3) * 8),
-        .byte => bus.readData(u8, transfer.address),
-        .halfword => std.math.rotr(u32, bus.readData(u16, transfer.address), (transfer.address & 1) * 8),
-        .signed_byte => signExtendByte(bus.readData(u8, transfer.address)),
-        .signed_halfword => readSignedHalfword(bus, transfer.address),
+    const value = switch (transfer.operation) {
+        inline else => |op| op.loadValue(bus.readData(op.Data(), transfer.address), transfer.address),
     };
     // The load completes with an internal cycle before the result is available.
     self.internal_cycles += 1;
@@ -517,21 +541,25 @@ pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) Instruct
             }
         } else if (word & 0x0C00_0000 == 0x0400_0000) {
             if (execute) {
-                const transfer = @call(.always_inline, decodeArmTransfer, .{ self, word, false }) catch break;
-                if (transfer.data_register == program_counter or
-                    (transfer.writeback and transfer.base_register == program_counter)) break;
-                const remaining = budget - run.cycles - 1;
-                const data_cycles = if (transfer.operation == .word)
-                    self.transferWorkRam(bus, transfer, u32, remaining)
-                else
-                    self.transferWorkRam(bus, transfer, u8, remaining);
-                run.cycles += data_cycles orelse break;
+                const data_budget = budget - run.cycles - 1;
+                const cycles = @call(.always_inline, runArmRamTransfer, .{
+                    self, bus, word, false, data_budget,
+                });
+                run.cycles += cycles orelse break;
             }
-        } else {
-            const decoded = (decodeArmDataProcessing(word) catch break) orelse break;
+        } else if (decodeArmDataProcessing(word) catch break) |decoded| {
             if (decoded.registerShift() or decoded.destination == program_counter) break;
             if (execute) _ = self.executeArmDataProcessing(decoded);
-        }
+        } else if (isArmExtraTransfer(word)) {
+            if (execute) {
+                const data_budget = budget - run.cycles - 1;
+                // Keep the less frequent halfword and signed handlers out of the hot loop.
+                const cycles = @call(.never_inline, runArmRamTransfer, .{
+                    self, bus, word, true, data_budget,
+                });
+                run.cycles += cycles orelse break;
+            }
+        } else break;
         queue = .{ queue[1], next };
         self.instruction_address = pc + 4;
         run.cycles += 1;
@@ -545,8 +573,30 @@ pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) Instruct
     return run;
 }
 
+fn runArmRamTransfer(
+    self: *Cpu,
+    bus: anytype,
+    word: u32,
+    comptime extra: bool,
+    budget: u64,
+) ?u64 {
+    const transfer = @call(.always_inline, decodeArmTransfer, .{ self, word, extra }) catch return null;
+    if (transfer.data_register == program_counter or
+        (transfer.writeback and transfer.base_register == program_counter)) return null;
+    return switch (transfer.operation) {
+        inline else => |op| self.transferWorkRam(bus, transfer, op, budget),
+    };
+}
+
 // Check both the RAM mapping and the deadline before changing registers or memory.
-inline fn transferWorkRam(self: *Cpu, bus: anytype, transfer: ArmTransfer, comptime T: type, budget: u64) ?u64 {
+inline fn transferWorkRam(
+    self: *Cpu,
+    bus: anytype,
+    transfer: ArmTransfer,
+    comptime op: ArmTransfer.Operation,
+    budget: u64,
+) ?u64 {
+    const T = op.Data();
     const aligned = transfer.address & ~@as(u32, @sizeOf(T) - 1);
     const bytes = bus.workRamBytes(T, aligned) orelse return null;
     const region: u8 = @truncate(transfer.address >> 24);
@@ -556,10 +606,7 @@ inline fn transferWorkRam(self: *Cpu, bus: anytype, transfer: ArmTransfer, compt
     if (cycles > budget) return null;
     if (transfer.load) {
         const value = std.mem.readInt(T, bytes, .little);
-        self.writeGeneralRegister(transfer.data_register, if (T == u32)
-            std.math.rotr(u32, value, (transfer.address & 3) * 8)
-        else
-            value);
+        self.writeGeneralRegister(transfer.data_register, op.loadValue(value, transfer.address));
     } else {
         std.mem.writeInt(T, bytes, @truncate(self.readRegister(transfer.data_register)), .little);
     }
@@ -840,7 +887,7 @@ fn executeThumbTransfer(self: *Cpu, bus: anytype, transfer: ThumbTransfer) void 
         .ldrh => std.math.rotr(u32, bus.readData(u16, address), (address & 1) * 8),
         .ldrb => bus.readData(u8, address),
         .ldrsb => signExtendByte(bus.readData(u8, address)),
-        .ldrsh => readSignedHalfword(bus, address),
+        .ldrsh => signedHalfwordValue(bus.readData(u16, address), address),
     };
     self.finishThumbLoad(register, result);
 }
@@ -899,8 +946,7 @@ fn executeThumbBlockTransfer(self: *Cpu, bus: anytype, instruction: u16, stack: 
     }
 }
 
-fn readSignedHalfword(bus: anytype, address: u32) u32 {
-    const value = bus.readData(u16, address);
+fn signedHalfwordValue(value: u16, address: u32) u32 {
     // An odd address selects and sign-extends the upper byte of the halfword.
     if (address & 1 != 0) return signExtendByte(@truncate(value >> 8));
     return @bitCast(@as(i32, @as(i16, @bitCast(value))));

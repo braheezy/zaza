@@ -665,6 +665,56 @@ test "mixed ARM work RAM runs preserve stores to code, load timing and branch re
     }
 }
 
+test "batched ARM halfword and signed transfers match timed steps in both work RAM regions" {
+    const std = @import("std");
+    const words = [_]u32{
+        0xE1E1_00B1, // STRH r0, [r1, #1]! (odd store aligns down)
+        0xE1D1_20B0, // LDRH r2, [r1]
+        0xE1D1_30F0, // LDRSH r3, [r1]
+        0xE111_40D5, // LDRSB r4, [r1, -r5]
+        0xE151_60F1, // LDRSH r6, [r1, #-1]
+        0xE0D1_10B2, // LDRH r1, [r1], #2 (loaded value wins over writeback)
+    };
+    for ([_]u32{ Bus.ewram_base, Bus.iwram_base }) |region| {
+        var batched: Machine = undefined;
+        batched.initCartridge(&.{});
+        for (words, 0..) |word, i| {
+            batched.bus.writeData(u32, Bus.iwram_base + @as(u32, @intCast(i * 4)), word);
+        }
+        batched.cpu.instruction_address = Bus.iwram_base;
+        batched.cpu.refillArmPipeline(&batched.bus);
+        batched.cpu.registers[0] = 0x1234_80AB;
+        batched.cpu.registers[1] = region + 0x100;
+        batched.cpu.registers[5] = 1;
+        var reference = batched;
+
+        // One cycle is enough to fetch, but the store must wait for its data access.
+        const short = batched.cpu.runArmIwram(&batched.bus, words.len, 1);
+        try std.testing.expectEqual(@as(usize, 0), short.steps);
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+
+        // Finish exactly on the cycle budget with all six instructions in the runner.
+        const data_cycles = timing.ramAccessCycles(u16, @truncate(region >> 24));
+        const budget = words.len * (1 + @as(u64, data_cycles)) + 5;
+        const run = batched.cpu.runArmIwram(&batched.bus, words.len, budget);
+        try std.testing.expectEqual(words.len, run.steps);
+        try std.testing.expectEqual(budget, run.cycles);
+        batched = reference;
+
+        try std.testing.expectEqual(words.len, try batched.stepBatch(words.len));
+        for (words) |_| try reference.stepTimed();
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+        try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+        try std.testing.expectEqual(@as(u32, 0xAB00_0080), batched.cpu.registers[1]);
+        try std.testing.expectEqual(@as(u32, 0xAB00_0080), batched.cpu.registers[2]);
+        try std.testing.expectEqual(@as(u32, 0xFFFF_FF80), batched.cpu.registers[3]);
+        try std.testing.expectEqual(@as(u32, 0xFFFF_FFAB), batched.cpu.registers[4]);
+        try std.testing.expectEqual(@as(u32, 0xFFFF_80AB), batched.cpu.registers[6]);
+    }
+}
+
 test "batched timer reads and IRQ propagation agree with individual timed steps" {
     const std = @import("std");
     const rom = [_]u8{
