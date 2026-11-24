@@ -444,12 +444,7 @@ const FetchSpan = struct { bytes: []const u8 = &.{}, cycles_per_fetch: u8 = 1 };
 
 /// A span of sequential instruction fetches with a constant cycle cost. A change
 /// of Game Pak wait state, a FIFO transition or unbacked ROM ends the span.
-pub fn fetchSpan(self: *const Bus, comptime T: type, comptime iwram_run: bool, first: u32) FetchSpan {
-    if (iwram_run) {
-        comptime std.debug.assert(T == u32);
-        if (first >> 24 != 3) return .{};
-        return .{ .bytes = self.iwram[first % iwram_size_bytes ..], .cycles_per_fetch = 1 };
-    }
+pub fn romFetchSpan(self: *const Bus, comptime T: type, first: u32) FetchSpan {
     const window = romWindow(first) orelse return .{};
     const offset = first & 0x01FF_FFFF;
     const within_page = first & 0x1_FFFF;
@@ -461,18 +456,24 @@ pub fn fetchSpan(self: *const Bus, comptime T: type, comptime iwram_run: bool, f
     return .{ .bytes = self.rom[offset..][0..size], .cycles_per_fetch = timing.gamePakAccessCycles(T, .sequential, self.waitcnt, window) };
 }
 
-pub fn finishFetchSpan(self: *Bus, comptime T: type, comptime iwram_run: bool, cycles: u64, next: u32, word: u32) void {
+pub fn finishRomFetchSpan(self: *Bus, comptime T: type, cycles: u64, next: u32, word: u32) void {
     self.bus_cycles += cycles;
     self.prefetch_word = if (T == u32) word else word * 0x0001_0001;
-    self.next_fetch_nonsequential = iwram_run;
+    self.next_fetch_nonsequential = false;
     self.next_rom_data_address = null;
     self.dma_bus_word = null;
-    if (iwram_run) {
-        self.cartridge_prefetch = .{};
-    } else {
-        self.rom_fetch_cycles += cycles;
-        if (self.prefetchEnabled()) self.cartridge_prefetch.next_address = next;
-    }
+    self.rom_fetch_cycles += cycles;
+    if (self.prefetchEnabled()) self.cartridge_prefetch.next_address = next;
+}
+
+pub fn finishIwramRun(self: *Bus, cycles: u64, internal: u64, word: u32) void {
+    self.bus_cycles += cycles;
+    self.cpu_internal_cycles += internal;
+    self.prefetch_word = word;
+    self.next_fetch_nonsequential = true;
+    self.next_rom_data_address = null;
+    self.dma_bus_word = null;
+    self.cartridge_prefetch = .{};
 }
 
 pub inline fn fetch32(self: *Bus, address: u32, access: timing.Access) u32 {
@@ -527,6 +528,10 @@ fn fetch(self: *Bus, comptime T: type, address: u32, access: timing.Access) T {
     std.debug.panic("unmapped {d}-bit fetch at 0x{x:0>8}", .{ @bitSizeOf(T), address });
 }
 
+pub inline fn iwramWord(self: *const Bus, address: u32) u32 {
+    return std.mem.readInt(u32, self.iwram[address % iwram_size_bytes ..][0..4], .little);
+}
+
 inline fn fetchIwram(self: *Bus, comptime T: type, offset: u32) T {
     self.next_fetch_nonsequential = true;
     self.bus_cycles += 1;
@@ -565,15 +570,18 @@ fn finishRomFetch(self: *Bus, comptime T: type, value: T, cycles: u8) T {
 
 // Work RAM needs DMA arbitration and access timing, but has no MMIO side effects.
 fn workRamAccess(self: *Bus, comptime T: type, address: u32) ?*[@sizeOf(T)]u8 {
-    const region = address >> 24;
-    const bytes = switch (region) {
+    const bytes = self.workRamBytes(T, address) orelse return null;
+    self.next_fetch_nonsequential = true;
+    self.chargeInternalAccess(T, @truncate(address >> 24));
+    return bytes;
+}
+
+pub inline fn workRamBytes(self: *Bus, comptime T: type, address: u32) ?*[@sizeOf(T)]u8 {
+    return switch (address >> 24) {
         0x02 => self.ewram[address % ewram_size_bytes ..][0..@sizeOf(T)],
         0x03 => self.iwram[address % iwram_size_bytes ..][0..@sizeOf(T)],
-        else => return null,
+        else => null,
     };
-    self.next_fetch_nonsequential = true;
-    self.chargeInternalAccess(T, @truncate(region));
-    return bytes;
 }
 
 pub fn readData(self: *Bus, comptime T: type, address: u32) T {

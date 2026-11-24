@@ -230,7 +230,10 @@ fn runBatch(self: *Machine, limit: usize, comptime mode: enum { generic, arm_dis
     while (index < limit) : (index += 1) {
         if (mode == .iwram or mode == .rom) {
             const before_edge = bus.batch_deadline - self.elapsed_cycles;
-            const run = self.cpu.runAluSpan(bus, u32, mode == .iwram, limit - index, before_edge -| 1);
+            const run = if (mode == .iwram)
+                self.cpu.runArmIwram(bus, limit - index, before_edge -| 1)
+            else
+                self.cpu.runRomAluSpan(bus, u32, limit - index, before_edge -| 1);
             // For mixed ROM code, amortize the next span probe across a device interval.
             if (mode == .rom and run.steps == 0) {
                 return index + try self.runBatch(limit - index, .arm_dispatch);
@@ -626,6 +629,39 @@ test "IWRAM arithmetic run preserves prefetched words, PC operands and bus timin
         try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
         try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
         try std.testing.expectEqualDeep(reference.bus, batched.bus);
+    }
+}
+
+test "mixed ARM work RAM runs preserve stores to code, load timing and branch refills" {
+    const std = @import("std");
+    var batched: Machine = undefined;
+    batched.initCartridge(&.{});
+    const code = Bus.iwram_base;
+    const words = [_]u32{
+        0xE582_3008, // STR r3, [r2, #8] overwrites the word fetched by this instruction.
+        0xE5C1_3001, // STRB r3, [r1, #1]
+        0xE280_0001, // ADD r0, r0, #1 (already queued on the first pass)
+        0xE491_4004, // LDR r4, [r1], #4 (unaligned)
+        0xE754_5004, // LDRB r5, [r4, -r4] (BIOS fallback)
+        0xE251_1004, // SUBS r1, r1, #4
+        0x05C1_3000, // STRBEQ r3, [r1] (condition fails)
+        0x1BFF_FFF7, // BLNE to the first store
+    };
+    for (words, 0..) |word, i| {
+        batched.bus.writeData(u32, code + @as(u32, @intCast(i * 4)), word);
+    }
+    batched.cpu.instruction_address = code;
+    batched.cpu.refillArmPipeline(&batched.bus);
+    batched.cpu.registers[1] = Bus.ewram_base + 1;
+    batched.cpu.registers[2] = code;
+    batched.cpu.registers[3] = 0xE280_0002; // ADD r0, r0, #2
+    var reference = batched;
+    for ([_]usize{ 3, 1, 8, 4, 17, 45, 900, 900, 900 }) |limit| {
+        const count = try batched.stepBatch(limit);
+        for (0..count) |_| try reference.stepTimed();
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+        try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
     }
 }
 

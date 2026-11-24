@@ -345,6 +345,24 @@ fn executeArmTransfer(
         return;
     }
 
+    const transfer = try self.decodeArmTransfer(instruction, extra);
+    _ = self.advanceArmPipeline(bus);
+    self.finishArmTransfer(bus, transfer);
+}
+
+const ArmTransfer = struct {
+    const Operation = enum { word, byte, halfword, signed_byte, signed_halfword };
+
+    operation: Operation,
+    address: u32,
+    updated_base: u32,
+    base_register: u4,
+    data_register: u4,
+    load: bool,
+    writeback: bool,
+};
+
+fn decodeArmTransfer(self: *Cpu, instruction: u32, extra: bool) error{UnsupportedInstruction}!ArmTransfer {
     const pre_index = instruction & (1 << 24) != 0;
     const add = instruction & (1 << 23) != 0;
     const writeback_bit = instruction & (1 << 21) != 0;
@@ -355,8 +373,7 @@ fn executeArmTransfer(
     // Post-indexed T forms use the same data bus path until it models access privilege.
     const writeback = !pre_index or writeback_bit;
 
-    const Operation = enum { word, byte, halfword, signed_byte, signed_halfword };
-    const operation: Operation = if (extra) switch (@as(u2, @truncate(instruction >> 5))) {
+    const operation: ArmTransfer.Operation = if (extra) switch (@as(u2, @truncate(instruction >> 5))) {
         1 => .halfword,
         2 => .signed_byte,
         3 => .signed_halfword,
@@ -382,38 +399,48 @@ fn executeArmTransfer(
     const base = self.readRegister(base_register);
     const updated_base = if (add) base +% offset else base -% offset;
     const address = if (pre_index) updated_base else base;
-    _ = self.advanceArmPipeline(bus);
+    return .{
+        .operation = operation,
+        .address = address,
+        .updated_base = updated_base,
+        .base_register = base_register,
+        .data_register = data_register,
+        .load = load,
+        .writeback = writeback,
+    };
+}
 
-    if (!load) {
+fn finishArmTransfer(self: *Cpu, bus: anytype, transfer: ArmTransfer) void {
+    if (!transfer.load) {
         // A store of R15 sees the PC after the sequential fetch (instruction + 12).
-        const value = self.readRegister(data_register);
-        switch (operation) {
-            .word => bus.writeData(u32, address, value),
-            .byte => bus.writeData(u8, address, @truncate(value)),
-            .halfword => bus.writeData(u16, address, @truncate(value)),
+        const value = self.readRegister(transfer.data_register);
+        switch (transfer.operation) {
+            .word => bus.writeData(u32, transfer.address, value),
+            .byte => bus.writeData(u8, transfer.address, @truncate(value)),
+            .halfword => bus.writeData(u16, transfer.address, @truncate(value)),
             .signed_byte, .signed_halfword => unreachable,
         }
-        if (writeback) self.writeTransferBase(bus, base_register, updated_base);
+        if (transfer.writeback) self.writeTransferBase(bus, transfer.base_register, transfer.updated_base);
         return;
     }
 
-    const value: u32 = switch (operation) {
-        .word => std.math.rotr(u32, bus.readData(u32, address), (address & 3) * 8),
-        .byte => bus.readData(u8, address),
-        .halfword => std.math.rotr(u32, bus.readData(u16, address), (address & 1) * 8),
-        .signed_byte => signExtendByte(bus.readData(u8, address)),
-        .signed_halfword => readSignedHalfword(bus, address),
+    const value: u32 = switch (transfer.operation) {
+        .word => std.math.rotr(u32, bus.readData(u32, transfer.address), (transfer.address & 3) * 8),
+        .byte => bus.readData(u8, transfer.address),
+        .halfword => std.math.rotr(u32, bus.readData(u16, transfer.address), (transfer.address & 1) * 8),
+        .signed_byte => signExtendByte(bus.readData(u8, transfer.address)),
+        .signed_halfword => readSignedHalfword(bus, transfer.address),
     };
     // The load completes with an internal cycle before the result is available.
     self.internal_cycles += 1;
-    if (writeback and base_register != data_register) {
-        self.writeTransferBase(bus, base_register, updated_base);
+    if (transfer.writeback and transfer.base_register != transfer.data_register) {
+        self.writeTransferBase(bus, transfer.base_register, transfer.updated_base);
     }
-    if (data_register == program_counter) {
+    if (transfer.data_register == program_counter) {
         self.instruction_address = value & ~@as(u32, 3);
         self.refillArmPipeline(bus);
     } else {
-        self.writeGeneralRegister(data_register, value);
+        self.writeGeneralRegister(transfer.data_register, value);
     }
 }
 
@@ -460,13 +487,96 @@ fn ThumbDispatch(comptime BusPtr: type) type {
     };
 }
 
+const InstructionRun = struct { steps: usize = 0, cycles: u64 = 0 };
+
+/// In IWRAM each instruction fetch costs one cycle, including both words of a branch refill.
+pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) InstructionRun {
+    var queue = self.pipeline orelse return .{};
+    var run: InstructionRun = .{};
+    const internal_before = self.internal_cycles;
+    while (run.steps < limit and run.cycles < budget) {
+        const pc = self.instruction_address;
+        const fetch = pc +% 8;
+        if (fetch >> 24 != 3) break;
+        const word = queue[0];
+        const condition: u4 = @truncate(word >> 28);
+        if (condition == 0xF) break;
+        const execute = condition == 0xE or conditionPassed(condition, self.readFlags());
+        // A store may replace the word being fetched. The pipeline sees its old contents.
+        const next = bus.iwramWord(fetch);
+        if (word & 0x0E00_0000 == 0x0A00_0000) {
+            if (execute) {
+                const target = armBranchTarget(pc, word);
+                if (target >> 24 != 3 or (target +% 4) >> 24 != 3 or budget - run.cycles < 3) break;
+                if (word & (1 << 24) != 0) self.writeGeneralRegister(link_register, pc + 4);
+                queue = .{ bus.iwramWord(target), bus.iwramWord(target + 4) };
+                self.instruction_address = target;
+                run.cycles += 3;
+                run.steps += 1;
+                continue;
+            }
+        } else if (word & 0x0C00_0000 == 0x0400_0000) {
+            if (execute) {
+                const transfer = @call(.always_inline, decodeArmTransfer, .{ self, word, false }) catch break;
+                if (transfer.data_register == program_counter or
+                    (transfer.writeback and transfer.base_register == program_counter)) break;
+                const remaining = budget - run.cycles - 1;
+                const data_cycles = if (transfer.operation == .word)
+                    self.transferWorkRam(bus, transfer, u32, remaining)
+                else
+                    self.transferWorkRam(bus, transfer, u8, remaining);
+                run.cycles += data_cycles orelse break;
+            }
+        } else {
+            const decoded = (decodeArmDataProcessing(word) catch break) orelse break;
+            if (decoded.registerShift() or decoded.destination == program_counter) break;
+            if (execute) _ = self.executeArmDataProcessing(decoded);
+        }
+        queue = .{ queue[1], next };
+        self.instruction_address = pc + 4;
+        run.cycles += 1;
+        run.steps += 1;
+    }
+    if (run.steps != 0) {
+        self.pipeline = queue;
+        const internal = self.internal_cycles - internal_before;
+        bus.finishIwramRun(run.cycles - internal, internal, queue[1]);
+    }
+    return run;
+}
+
+// Check both the RAM mapping and the deadline before changing registers or memory.
+inline fn transferWorkRam(self: *Cpu, bus: anytype, transfer: ArmTransfer, comptime T: type, budget: u64) ?u64 {
+    const aligned = transfer.address & ~@as(u32, @sizeOf(T) - 1);
+    const bytes = bus.workRamBytes(T, aligned) orelse return null;
+    const region: u8 = @truncate(transfer.address >> 24);
+    const data_cycles = @import("timing.zig").ramAccessCycles(T, region);
+    const internal: u64 = @intFromBool(transfer.load);
+    const cycles = data_cycles + internal;
+    if (cycles > budget) return null;
+    if (transfer.load) {
+        const value = std.mem.readInt(T, bytes, .little);
+        self.writeGeneralRegister(transfer.data_register, if (T == u32)
+            std.math.rotr(u32, value, (transfer.address & 3) * 8)
+        else
+            value);
+    } else {
+        std.mem.writeInt(T, bytes, @truncate(self.readRegister(transfer.data_register)), .little);
+    }
+    if (transfer.writeback and (!transfer.load or transfer.base_register != transfer.data_register))
+        self.writeGeneralRegister(transfer.base_register, transfer.updated_base);
+    if (region == 3) bus.iwram_data_cycles += data_cycles;
+    self.internal_cycles += internal;
+    return cycles;
+}
+
 /// Execute arithmetic from the live pipeline while sequential fetch timing is constant.
-pub fn runAluSpan(self: *Cpu, bus: anytype, comptime T: type, comptime iwram: bool, limit: usize, cycles_left: u64) struct { steps: usize, cycles: u64 } {
+pub fn runRomAluSpan(self: *Cpu, bus: anytype, comptime T: type, limit: usize, cycles_left: u64) InstructionRun {
     var queue = self.pipeline orelse return .{ .steps = 0, .cycles = 0 };
     // In ROM, setting up a timed span only pays off across successive ALU operations.
-    if (T == u32 and !iwram and (queue[0] | queue[1]) & 0x0C00_0000 != 0) return .{ .steps = 0, .cycles = 0 };
+    if (T == u32 and (queue[0] | queue[1]) & 0x0C00_0000 != 0) return .{ .steps = 0, .cycles = 0 };
     const width = @sizeOf(T);
-    const span = bus.fetchSpan(T, iwram, self.instruction_address + 2 * width);
+    const span = bus.romFetchSpan(T, self.instruction_address + 2 * width);
     const count_limit = @min(limit, span.bytes.len / width, cycles_left / span.cycles_per_fetch);
     var count: usize = 0;
     while (count < count_limit) : (count += 1) {
@@ -488,7 +598,7 @@ pub fn runAluSpan(self: *Cpu, bus: anytype, comptime T: type, comptime iwram: bo
     const cycles = count * @as(u64, span.cycles_per_fetch);
     if (count != 0) {
         self.pipeline = queue;
-        bus.finishFetchSpan(T, iwram, cycles, self.instruction_address + 2 * width, queue[1]);
+        bus.finishRomFetchSpan(T, cycles, self.instruction_address + 2 * width, queue[1]);
     }
     return .{ .steps = count, .cycles = cycles };
 }
@@ -520,7 +630,7 @@ pub fn runThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u64) stru
         const queued = self.pipeline orelse break;
         const op: u16 = @truncate(queued[0]);
         if ((queued[0] | queued[1]) < 0x4000) {
-            const span = self.runAluSpan(bus, u16, false, limit - count, deadline - cycles - 1);
+            const span = self.runRomAluSpan(bus, u16, limit - count, deadline - cycles - 1);
             if (span.steps != 0) {
                 count += span.steps;
                 cycles += span.cycles;
@@ -1119,10 +1229,14 @@ fn executeArmBranch(self: *Cpu, bus: anytype, instruction: u32, condition: u4) v
     if (instruction & (1 << 24) != 0) {
         self.writeGeneralRegister(link_register, address +% 4);
     }
+    self.instruction_address = armBranchTarget(address, instruction);
+    self.refillArmPipeline(bus);
+}
+
+fn armBranchTarget(address: u32, instruction: u32) u32 {
     const words: i24 = @bitCast(@as(u24, @truncate(instruction)));
     const offset: u32 = @bitCast(@as(i32, words) * 4);
-    self.instruction_address = address +% 8 +% offset;
-    self.refillArmPipeline(bus);
+    return address +% 8 +% offset;
 }
 
 fn executeArmSwi(self: *Cpu, bus: anytype, condition: u4) void {
