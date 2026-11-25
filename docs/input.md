@@ -105,7 +105,38 @@ Step, screen, checkpoint, and restore reply on stdout with `ok <current frame>`.
 Restoring before the first checkpoint returns `error NoCheckpoint` and leaves the game running.
 Invalid commands and capture errors reply with `error <reason>`; the session
 stays open. Quit closes stdout. Guest logs and fatal errors go to stderr.
-To reproduce a run, keep the initial ROM, BIOS, save, and sequence of step, checkpoint, and restore commands.
+
+### Recording and replaying a session
+
+Add `--record` after the ROM to save the session's execution commands to a new
+transcript. For example, this session takes a checkpoint, tries one branch,
+then restores the checkpoint and tries another.
+
+```sh
+printf 'step 2 none\ncheckpoint\nstep 4 Right A\nrestore\nstep 3 Left\nquit\n' |
+  zig-out/bin/zaza-cli session game.gba --record attempt.zaza-session
+zig-out/bin/zaza-cli replay-session game.gba attempt.zaza-session final.bmp
+```
+
+The transcript is published on `quit` or end of input and requires a fresh
+path. It contains successful `step`, `checkpoint`, and `restore` commands in
+order. `screen` commands and their output paths are omitted. Replay prints one
+`ok <current frame>` after verification. Omit the BMP path to verify without
+writing an image.
+
+The transcript stores the boot mode, save type, and BLAKE3 digests of the ROM,
+BIOS, and starting battery save. Use the same starting data and boot mode when
+replaying. If recording can change an existing save, keep a copy from before
+the session and pass that copy as `--save` before `replay-session`. If the
+session began with empty save memory, omit `--save` for replay and repeat any
+`--save-type` override. Replay reads a supplied save without writing back to it.
+
+The format starts with `zaza-session 1`, followed by a `start` line carrying
+those fields in this order: boot mode, ROM digest, BIOS digest, save type, save
+digest. The final `end` line stores the frame number and a BLAKE3 digest of
+row-major RGB bytes, or `unavailable` if the display mode could not be captured.
+Replay checks the starting fields and final result before writing the optional
+BMP. ROM, BIOS, and save contents stay outside the transcript.
 
 ## Headless execution
 

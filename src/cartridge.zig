@@ -23,9 +23,15 @@ pub const Options = struct {
     }
 
     pub fn start(self: Options, machine: *Machine, io: std.Io, allocator: std.mem.Allocator, rom: []const u8) !?save_file.Session {
-        const bios = if (self.bios_path) |path| try loadBios(io, allocator, path) else zaza.bundled_bios;
-        try machine.init(rom, .{ .bios = bios, .boot = if (self.boot) .bios else .cartridge });
+        try machine.init(rom, try self.emulatorOptions(io, allocator));
         return self.save.open(io, allocator, machine.saveMemory());
+    }
+
+    pub fn emulatorOptions(self: Options, io: std.Io, arena: std.mem.Allocator) !zaza.Options {
+        return .{
+            .bios = if (self.bios_path) |path| try loadBios(io, arena, path) else zaza.bundled_bios,
+            .boot = if (self.boot) .bios else .cartridge,
+        };
     }
 };
 fn loadBios(io: std.Io, arena: std.mem.Allocator, path: []const u8) !*const [@sizeOf(zaza.Bios)]u8 {

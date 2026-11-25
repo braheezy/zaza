@@ -4,11 +4,13 @@ const replay = @import("replay.zig");
 const Machine = @import("libzaza").Emulator;
 const video = @import("libzaza").video;
 const cartridge = @import("cartridge.zig");
+const session_cli = @import("session.zig");
 
 const demo = @import("mode3_demo.zig");
 
 const usage =
-    "Usage: zaza-cli [options] session <game.gba>\n" ++
+    "Usage: zaza-cli [options] session <game.gba> [--record <transcript>]\n" ++
+    "       zaza-cli [options] replay-session <game.gba> <transcript> [<output.bmp>]\n" ++
     "       zaza-cli [options] replay <game.gba> <frames> <output.bmp> [--input <script> | --input-file <path>] [--wav <output.wav>]\n" ++
     "       zaza-cli [options] snapshot <game.gba> <steps> <output.bmp>\n" ++
     "       zaza-cli demo <output.bmp>\n" ++
@@ -27,7 +29,19 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 0) {
         const command = args[0];
         if (std.mem.eql(u8, command, "replay")) return replay.replayInput(init.io, arena, options, args[1..]);
-        if (std.mem.eql(u8, command, "session") and args.len == 2) return @import("session.zig").run(init, options, args[1]);
+        if (std.mem.eql(u8, command, "session")) {
+            if (args.len == 2) return session_cli.run(init, options, args[1], null);
+            if (args.len == 4 and std.mem.eql(u8, args[2], "--record")) {
+                return session_cli.run(init, options, args[1], args[3]);
+            }
+        }
+        if (std.mem.eql(u8, command, "replay-session") and (args.len == 3 or args.len == 4)) {
+            const output = if (args.len == 4) args[3] else null;
+            return session_cli.replayTranscript(init, options, args[1], .{
+                .transcript = args[2],
+                .bitmap = output,
+            });
+        }
         if (std.mem.eql(u8, command, "snapshot") and args.len == 4) {
             const steps = try std.fmt.parseInt(usize, args[2], 10);
             if (steps == 0) return error.InvalidStepCount;
