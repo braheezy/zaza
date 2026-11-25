@@ -4,8 +4,17 @@ On macOS, build the player and open a cartridge.
 
 ```sh
 zig build desktop -Doptimize=ReleaseFast
-./zig-out/bin/zaza /path/to/game.gba
+./zig-out/bin/zaza
 ```
+
+Choose **File → Open ROM…** or press **⌘O** to pick a `.gba` file. You can
+also pass a ROM path at launch. Opening another ROM starts it in the same
+window. Canceling the picker or selecting a file that fails to load keeps the
+current cartridge running.
+
+Choose **Emulation → Pause** or press **⌘P** to freeze the game. Choose
+**Resume** or press **⌘P** again to continue from the same frame. Opening a
+new cartridge starts it running.
 
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
@@ -21,6 +30,36 @@ Live mode plays through the default audio device at 30% volume. Put
 
 The window has a fixed 720 × 480 point content area (3× the GBA display).
 Escape closes the player by default. Losing focus releases all keys.
+
+## Save states
+
+Press **⌘S** before a difficult section and **⌘L** to retry from that frame.
+Quick Save replaces the quick slot immediately. The window title confirms each
+operation. Loading while paused shows the restored frame and keeps the game paused.
+
+Open **States → Slot 1**, **Slot 2**, or **Slot 3** to keep longer-lived
+checkpoints. Each slot shows **Empty** or **Saved** and has commands to save,
+load, or delete. Replacing or deleting a numbered state asks for confirmation.
+
+States survive quitting and reopening Zaza. Moving or renaming the ROM keeps
+its slots. Zaza stores them under `~/Library/Application Support/Zaza/States/`
+with a separate directory for each ROM, BIOS, and save-hardware configuration.
+A state includes the cartridge’s emulated save memory. If you use `--save`,
+restored changes to that memory are written on the usual cartridge-save flush.
+
+### Disk format
+
+Version 1 begins with the six ASCII bytes `ZAZAST`, a zero byte, and a version
+byte. Next come two 32-byte BLAKE3 digests. The first identifies the BIOS
+bytes, initial save-hardware kind byte, and ROM bytes concatenated in that order.
+The second covers the remaining machine-state payload. Files are replaced atomically.
+
+The payload follows the Zig machine fields in declaration order, including the
+framebuffer. It omits the borrowed ROM, BIOS, and audio-capture pointers.
+Arrays use element order. Integers and enum tags use little endian, rounded up
+to whole bytes, and signed values use two’s complement. Booleans use one byte
+(0 or 1). Optionals use a boolean followed by the value when present. A change
+to field order, width, or meaning requires a format revision.
 
 ## FPS and emulator hotkeys
 
@@ -128,8 +167,11 @@ the cartridge's save data stays in memory for the session.
 ```
 
 Zaza writes changed data after a successful capture or on normal window
-exit. It rejects a save whose size does not match the cartridge and uses
-an adjacent `.lock` file to prevent two Zaza sessions from writing the same save.
+exit, and before switching cartridges in the player. The first successfully
+opened ROM uses any `--save` and `--save-type` launch options. Later ROMs use
+automatic save-type detection and keep their saves in memory. Zaza rejects a
+save whose size does not match the cartridge and uses an adjacent `.lock` file
+to prevent two Zaza sessions from writing the same save.
 
 ## Silent audio testing
 

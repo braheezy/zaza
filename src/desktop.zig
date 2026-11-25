@@ -8,6 +8,9 @@ const Playback = @import("desktop_audio.zig");
 const Machine = @import("libzaza").Emulator;
 const input = @import("libzaza").input;
 const Config = @import("desktop_config.zig");
+const Store = @import("state_file.zig");
+const Menu = @import("macos_menu.zig");
+const SaveSession = @import("save_file.zig").Session;
 const Fps = @import("fps.zig");
 
 const frame_period_ns = @import("libzaza").frame_period_ns;
@@ -18,33 +21,71 @@ const black: video.Rgb = .{ .red = 0, .green = 0, .blue = 0 };
 
 const Modules = mach.Modules(.{ mach.Core, App });
 
-pub fn play(init: std.process.Init, options: cartridge.Options, path: []const u8, volume: u8) !void {
+pub fn play(init: std.process.Init, options: cartridge.Options, path: ?[]const u8, volume: u8) !void {
     const arena = init.arena.allocator();
     const config = Config.load(init.io, arena) catch |err| {
         std.log.err("loading zaza.ini: {s}", .{@errorName(err)});
         return err;
     };
-    const rom = try cartridge.loadRom(init.io, arena, path);
-    const machine = try arena.create(Machine);
-    const save = try options.start(machine, init.io, arena, rom);
-    defer if (save) |session| session.close(init.io);
     var playback: Playback = undefined;
     var live_audio: ?*Playback = null;
     defer if (live_audio) |audio| audio.deinit();
     if (volume != 0) {
         if (playback.init(init.gpa, volume)) {
             live_audio = &playback;
-            machine.setAudioCapture(&playback.capture);
         } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
     }
 
     var modules: Modules = undefined;
     try modules.init(init.gpa, init.io);
     defer modules.deinit(init.gpa);
-    modules.mods.app = .{ .machine = machine, .audio = live_audio, .config = config, .save = save };
+    const app = &modules.mods.app;
+    const state_root = try std.fs.path.join(arena, &.{ init.environ_map.get("HOME") orelse return error.MissingHomeDirectory, "Library/Application Support/Zaza/States" });
+    app.* = .{ .state_root = state_root, .options = options, .audio = live_audio, .config = config };
+    if (path) |initial| {
+        app.game = try Game.load(init.gpa, init.io, initial, options, live_audio, state_root);
+        app.options.save = .{};
+    }
+    defer if (app.game) |*game| game.deinit(init.io);
     modules.get(.app).run(.main);
     if (modules.mods.app.failure) |err| return err;
 }
+
+// Each cartridge owns the storage borrowed by its emulator, including an optional custom BIOS.
+const Game = struct {
+    arena: std.heap.ArenaAllocator,
+    machine: *Machine,
+    save: ?SaveSession,
+    title: [:0]const u8,
+    paused: bool = false,
+    states: Store,
+    refresh_frame: bool = false,
+    first_frame: bool = true,
+
+    fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: cartridge.Options, audio: ?*Playback, root: []const u8) !Game {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        const rom = try cartridge.loadRom(io, allocator, path);
+        const title = try std.fmt.allocPrintSentinel(allocator, "Zaza — {s}", .{std.fs.path.basename(path)}, 0);
+        const machine = try allocator.create(Machine);
+        const save = try options.start(machine, io, allocator, rom);
+        errdefer if (save) |session| session.close(io);
+        const kind = options.save.kind orelse @import("libzaza").SaveMemory.Kind.detect(rom);
+        const states = try Store.init(allocator, io, root, machine, kind);
+        if (audio) |playback| machine.setAudioCapture(&playback.capture);
+        return .{ .arena = arena, .machine = machine, .save = save, .title = title, .states = states };
+    }
+
+    fn flush(self: *Game, io: std.Io) !void {
+        if (self.save) |*session| try session.flush(io, self.machine.saveMemory());
+    }
+
+    fn deinit(self: *Game, io: std.Io) void {
+        if (self.save) |session| session.close(io);
+        self.arena.deinit();
+    }
+};
 
 const App = struct {
     pub const mach_module = .app;
@@ -62,10 +103,16 @@ const App = struct {
         .{ mach.Core, .snapshotEnd },
     });
 
+    menu: Menu = undefined,
     config: Config,
-    save: ?@import("save_file.zig").Session,
+    state_root: []const u8,
+    options: cartridge.Options,
+    game: ?Game = null,
+    // AppKit replaces the cartridge on the main thread, between emulation frames.
+    game_mutex: std.Io.Mutex = .init,
+    core: *mach.Core = undefined,
+    window_id: mach.ObjectID = undefined,
     display_fps: bool = false,
-    machine: *Machine,
     audio: ?*Playback,
     failure: ?anyerror = null,
     frame: video.Frame = @splat(@splat(black)),
@@ -83,9 +130,10 @@ const App = struct {
         core_mod: mach.Mod(mach.Core),
         io: std.Io,
     ) !void {
+        app.core = core;
         core.on_exit = app_mod.id.deinit;
         const window_id = try core.windows.new(.{
-            .title = "Zaza",
+            .title = if (app.game) |game| game.title else "Zaza — Open ROM (⌘O)",
             .width = window_width,
             .height = window_height,
             .on_render = app_mod.id.render,
@@ -99,8 +147,84 @@ const App = struct {
             const native = core.windows.get(window_id, .native) orelse return error.WindowNotCreated;
             break :blk native.window;
         };
+        app.window_id = window_id;
         lockWindowSize(window);
+        app.menu = try Menu.install(app, performCommand);
+        app.menu.updateStates(if (app.game) |game| game.states.occupied else null);
+        app.menu.updatePause(app.game != null, false);
         app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
+    }
+
+    fn performCommand(app: *App, action: Menu.Action, slot: usize) void {
+        switch (action) {
+            .save_state, .load_state, .delete_state => {
+                const game = if (app.game) |*current| current else return;
+                if (action == .delete_state and !Menu.confirmChange("Delete", slot)) return;
+                if (action == .save_state and slot != 0 and game.states.occupied[slot] and
+                    !Menu.confirmChange("Replace", slot)) return;
+                app.stateCommand(action, slot) catch |err| Menu.showError("State operation failed", game.title, err);
+            },
+            .quit => app.core.exit(),
+            .toggle_pause => {
+                app.game_mutex.lockUncancelable(app.core.io);
+                defer app.game_mutex.unlock(app.core.io);
+                const game = if (app.game) |*current| current else return;
+                game.paused = !game.paused;
+                app.menu.updatePause(true, game.paused);
+            },
+            .open_rom => {
+                const path = Menu.chooseRom() orelse return;
+                app.openRom(path) catch |err| Menu.showError("Couldn’t open the ROM", path, err);
+            },
+        }
+    }
+
+    fn stateCommand(app: *App, action: Menu.Action, slot: usize) !void {
+        const core = app.core;
+        app.game_mutex.lockUncancelable(core.io);
+        defer app.game_mutex.unlock(core.io);
+        const game = &app.game.?;
+        switch (action) {
+            .save_state => try game.states.save(core.allocator, core.io, slot, game.machine),
+            .load_state => {
+                try game.states.load(core.allocator, core.io, slot, game.machine);
+                if (app.audio) |audio| audio.discardQueued();
+                game.refresh_frame = true;
+            },
+            .delete_state => try game.states.remove(core.io, slot),
+            else => unreachable,
+        }
+        app.menu.updateStates(game.states.occupied);
+        const status = switch (action) {
+            .save_state => "saved",
+            .load_state => "loaded",
+            .delete_state => "deleted",
+            else => unreachable,
+        };
+        core.windows.lock();
+        defer core.windows.unlock();
+        if (slot == 0) try core.fmtTitle(app.window_id, "{s} · Quick state {s}", .{ game.title, status }) else try core.fmtTitle(app.window_id, "{s} · Slot {d} {s}", .{ game.title, slot, status });
+    }
+
+    fn openRom(app: *App, path: []const u8) !void {
+        const core = app.core;
+        var next = try Game.load(core.allocator, core.io, path, app.options, app.audio, app.state_root);
+        errdefer next.deinit(core.io);
+
+        app.game_mutex.lockUncancelable(core.io);
+        defer app.game_mutex.unlock(core.io);
+        if (app.game) |*current| try current.flush(core.io);
+        {
+            core.windows.lock();
+            defer core.windows.unlock();
+            try core.fmtTitle(app.window_id, "{s}", .{next.title});
+        }
+        if (app.game) |*current| current.deinit(core.io);
+        app.game = next;
+        app.menu.updateStates(next.states.occupied);
+        app.menu.updatePause(true, false);
+        // Explicit save options belong to the first successfully opened cartridge.
+        app.options.save = .{};
     }
 
     pub fn pollInput(app: *App, core: *mach.Core) void {
@@ -125,13 +249,31 @@ const App = struct {
     }
 
     pub fn emulate(app: *App, core: *mach.Core, io: std.Io) void {
-        const machine = app.machine;
         if (app.failure != null or core.state.load(.acquire) != .running) return;
         const now_ns = std.Io.Clock.awake.now(io).nanoseconds;
         const deadline_ns = app.next_frame_ns orelse now_ns;
         if (now_ns < deadline_ns) return;
         // Keep the cadence despite polling jitter, but avoid an unbounded backlog.
         app.next_frame_ns = @max(now_ns, deadline_ns + frame_period_ns);
+        app.game_mutex.lockUncancelable(io);
+        defer app.game_mutex.unlock(io);
+        const game = if (app.game) |*current| current else return;
+        if (game.refresh_frame) {
+            game.refresh_frame = false;
+            app.keys.pressed_since_sample = 0;
+            var restored: video.Frame = undefined;
+            game.machine.snapshotFrame(&restored) catch {
+                restored = @splat(@splat(black));
+            };
+            app.pending = restored;
+            return;
+        }
+        if (game.paused) return;
+        if (game.first_frame) {
+            app.keys = .{};
+            game.first_frame = false;
+        }
+        const machine = game.machine;
         machine.runFrame(app.keys.sample()) catch |err| {
             std.log.err("live emulation stopped at 0x{x:0>8}", .{machine.instructionAddress()});
             app.failure = err;
@@ -217,7 +359,11 @@ const App = struct {
     pub fn deinit(app: *App, io: std.Io) !void {
         app.app_thread.join();
         // Mach exits the process after this callback, so publish SRAM here.
-        if (app.save) |*session| try session.flush(io, app.machine.saveMemory());
+        if (app.game) |*game| {
+            try game.flush(io);
+            game.deinit(io);
+            app.game = null;
+        }
         if (app.renderer) |renderer| {
             renderer.bind_group.release();
             renderer.pipeline.release();
