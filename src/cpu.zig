@@ -674,7 +674,14 @@ fn runArmRamTransfer(
     word: u32,
     comptime extra: bool,
     budget: u64,
-) ?u64 {
+) ?u8 {
+    // LDR Rd, [Rn, #imm] needs only a base and a positive byte offset.
+    if (!extra and word & 0x03F0_0000 == 0x0190_0000) {
+        const destination: u4 = @truncate(word >> 12);
+        if (destination == program_counter) return null;
+        const address = self.readRegister(@truncate(word >> 16)) +% (word & 0xFFF);
+        return self.accessRam(bus, .work_and_video, .word, address, destination, true, budget);
+    }
     const transfer = @call(.always_inline, decodeArmTransfer, .{ self, word, extra }) catch return null;
     if (transfer.data_register == program_counter or
         (transfer.writeback and transfer.base_register == program_counter)) return null;

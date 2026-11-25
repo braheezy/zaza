@@ -863,6 +863,32 @@ test "batched ARM halfword and signed transfers match timed steps in both work R
     }
 }
 
+test "IWRAM positive-offset word loads preserve PC reads, rotation and the device deadline" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const code = Bus.iwram_base;
+    machine.bus.writeData(u32, code, 0xE59F_8004); // LDR r8, [pc, #4]
+    machine.bus.writeData(u32, code + 4, 0xE598_8001); // LDR r8, [r8, #1]
+    machine.bus.writeData(u32, code + 12, Bus.ewram_base);
+    machine.bus.writeData(u32, Bus.ewram_base, 0x0102_0304);
+    machine.cpu.cpsr = 0x11; // FIQ banks r8.
+    machine.cpu.instruction_address = code;
+    machine.cpu.refillArmPipeline(&machine.bus);
+    var reference = machine;
+    try std.testing.expectEqual(@as(usize, 1), try machine.stepBatch(1));
+    try reference.stepTimed();
+    const deadline = machine.cpu.runArmIwram(&machine.bus, 1, 7);
+    try std.testing.expectEqual(@as(usize, 0), deadline.steps);
+    try std.testing.expectEqualDeep(reference.cpu, machine.cpu);
+    try std.testing.expectEqual(@as(usize, 1), try machine.stepBatch(1));
+    try reference.stepTimed();
+    try std.testing.expectEqual(reference.elapsed_cycles, machine.elapsed_cycles);
+    try std.testing.expectEqualDeep(reference.cpu, machine.cpu);
+    try std.testing.expectEqualDeep(reference.bus, machine.bus);
+    try std.testing.expectEqual(@as(u32, 0x0401_0203), machine.cpu.readRegister(8));
+}
+
 test "IWRAM ARM shifts and multiplies preserve register banks, PC operands and internal cycles" {
     const words = [_]u32{
         0xE28D_8001, // ADD r8, sp, #1
