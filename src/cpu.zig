@@ -760,9 +760,9 @@ pub fn runRomAluSpan(self: *Cpu, bus: anytype, comptime T: type, limit: usize, c
 }
 
 const ThumbStep = packed struct(u8) {
-    data_cycles: u3 = 0,
-    internal_cycles: u3 = 0,
-    flow: enum(u2) { next, branch, handoff } = .next,
+    // The runner charges Game Pak cycles after the handler returns.
+    extra_cycles: u6 = 0,
+    flow: enum(u2) { next, branch, literal, handoff } = .next,
 };
 
 fn RomThumbDispatch(comptime BusPtr: type) type {
@@ -804,6 +804,18 @@ inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u1
         return .{};
     }
     if (opcode == 0x4700 or opcode >= 0xB100) return .{ .flow = .handoff };
+    if (opcode == 0x4800) {
+        const address = thumbLiteralAddress(self.instruction_address + 4, op);
+        const offset = address & 0x01FF_FFFF;
+        // Stay in the fetch window whose wait states the runner already knows.
+        // The high cartridge region can synchronize peripherals on a data read.
+        if ((address ^ self.instruction_address) >> 25 != 0 or
+            address >= 0x0D00_0000 or offset + 4 > bus.rom.len) return .{ .flow = .handoff };
+        const value = std.mem.readInt(u32, bus.rom[offset..][0..4], .little);
+        self.finishThumbLoad(@truncate(op >> 8), value);
+        bus.next_rom_data_address = address + 4;
+        return .{ .flow = .literal, .extra_cycles = 1 };
+    }
     if (self.decodeThumbTransfer(opcode, op)) |transfer| {
         const kind: ArmTransfer.Operation = switch (transfer.operation) {
             .str, .ldr => .word,
@@ -819,12 +831,11 @@ inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u1
         const cycles = switch (kind) {
             inline else => |width| self.accessRam(bus, .work, width, transfer.address, transfer.register, load, std.math.maxInt(u8)) orelse return .{ .flow = .handoff },
         };
-        const internal: u3 = @intFromBool(load);
-        return .{ .data_cycles = @intCast(cycles - internal), .internal_cycles = internal };
+        return .{ .extra_cycles = @intCast(cycles) };
     }
     const before = self.internal_cycles;
     self.executeThumbLowAlu(opcode, op) catch return .{ .flow = .handoff };
-    return .{ .internal_cycles = @intCast(self.internal_cycles - before) };
+    return .{ .extra_cycles = @intCast(self.internal_cycles - before) };
 }
 
 const ThumbRun = struct { steps: usize = 0, cycles: u64 = 0, edge_cycles: u64 = 0 };
@@ -851,6 +862,9 @@ pub fn runRomThumb(self: *Cpu, bus: anytype, limit: usize, deadline: u64) ThumbR
     var nonsequential = bus.next_fetch_nonsequential;
     var fetch_total: u64 = 0;
     const internal_before = self.internal_cycles;
+    // A sequential step or branch refill leaves the FIFO at the next opcode fetch.
+    // A literal load takes the cartridge bus and stops that stream.
+    var continues = fifo.next_address == pc + 4;
     var run: ThumbRun = .{};
     while (run.steps < limit and self.instruction_address <= last) {
         const address = self.instruction_address + 4;
@@ -858,12 +872,21 @@ pub fn runRomThumb(self: *Cpu, bus: anytype, limit: usize, deadline: u64) ThumbR
         const executed = RomThumbDispatch(@TypeOf(bus)).table[op >> 6](self, bus, op);
         if (executed.flow == .handoff) break;
         const miss = if (nonsequential or address & 0x1_FFFF == 0) first else sequential;
-        var fetch = if (prefetch) fifo.fetch(u16, address, .sequential, miss, sequential) else miss;
+        var fetch = if (!prefetch) miss else if (continues and address & 0x1_FFFF != 0)
+            fifo.consume(u16, address)
+        else
+            fifo.fetch(u16, address, .sequential, miss, sequential);
         if (executed.flow == .branch) {
             const refill = first + sequential;
             fetch += if (prefetch) fifo.fetch(u32, self.instruction_address, .nonsequential, refill, sequential) else refill;
         } else self.instruction_address += 2;
-        const other = @as(u8, executed.data_cycles) + executed.internal_cycles;
+        var other: u8 = executed.extra_cycles;
+        continues = executed.flow != .literal;
+        if (!continues) {
+            // The instruction fetch runs first. The data word then takes the Game Pak
+            // bus for one nonsequential and one sequential halfword.
+            other += fifo.stop() + first + sequential;
+        }
         fifo.advance(other);
         nonsequential = other != 0;
         fetch_total += fetch;
@@ -882,7 +905,8 @@ pub fn runRomThumb(self: *Cpu, bus: anytype, limit: usize, deadline: u64) ThumbR
         const next_pair = std.mem.readInt(u32, bus.rom[next_offset..][0..4], .little);
         self.pipeline = .{ @as(u16, @truncate(next_pair)), next_pair >> 16 };
         bus.prefetch_word = (next_pair >> 16) * 0x0001_0001;
-        bus.next_rom_data_address = null;
+        // Only a literal as the final instruction leaves a cartridge data sequence open.
+        if (continues) bus.next_rom_data_address = null;
         bus.dma_bus_word = null;
         bus.cartridge_prefetch = fifo;
         bus.next_fetch_nonsequential = nonsequential;
@@ -1081,6 +1105,10 @@ const ThumbTransfer = struct {
     register: u3,
 };
 
+inline fn thumbLiteralAddress(pc: u32, instruction: u16) u32 {
+    return (pc & ~@as(u32, 3)) +% (@as(u32, @as(u8, @truncate(instruction))) * 4);
+}
+
 inline fn decodeThumbTransfer(self: *Cpu, opcode: u16, instruction: u16) ?ThumbTransfer {
     const low_register: u3 = @truncate(instruction);
     const high_register: u3 = @truncate(instruction >> 8);
@@ -1091,7 +1119,7 @@ inline fn decodeThumbTransfer(self: *Cpu, opcode: u16, instruction: u16) ?ThumbT
     return switch (opcode >> 12) {
         4 => if (load) .{
             .operation = .ldr,
-            .address = (self.readRegister(program_counter) & ~@as(u32, 3)) +% offset_word,
+            .address = thumbLiteralAddress(self.readRegister(program_counter), instruction),
             .register = high_register,
         } else null,
         5 => .{

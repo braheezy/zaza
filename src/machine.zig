@@ -673,6 +673,42 @@ test "streamed Thumb execution matches single steps across Game Pak pages and de
     }
 }
 
+test "Thumb literal loads preserve Game Pak data timing at the end of a cartridge" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0, 0, 0x02, 0x49, // LDR r1 at PC+2 aligns its literal base down.
+        0x02, 0x4A, 0,    0x20, // LDR r2 reads a word straddling the end.
+        0,    0,    0,    0,
+        0x12, 0x34, 0x56, 0x78,
+        0xAB, 0xCD,
+    };
+    for ([_]u32{ 0x0800_0000, 0x0A00_0000, 0x0C00_0000 }) |base| {
+        for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+            var batched: Machine = undefined;
+            batched.initCartridge(&rom);
+            const bus = &batched.bus;
+            bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+            batched.cpu.cpsr |= 1 << 5;
+            batched.cpu.instruction_address = base + 2;
+            batched.cpu.pipeline = bus.fetchThumbPair(base + 2);
+            if (bus.prefetchEnabled()) {
+                // Leave a halfword one clock from completion after the next opcode fetch.
+                bus.cartridge_prefetch.advance(2 * bus.cartridge_prefetch.halfword_cycles - 2);
+            }
+            var reference = batched;
+            for (0..3) |_| {
+                try std.testing.expectEqual(@as(usize, 1), try batched.stepBatch(1));
+                try reference.stepTimed();
+                try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+                try std.testing.expectEqualDeep(reference.bus, batched.bus);
+                try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+            }
+            try std.testing.expectEqual(@as(u32, 0x7856_3412), batched.cpu.registers[1]);
+            try std.testing.expectEqual(@as(u32, 0x0009_CDAB), batched.cpu.registers[2]);
+        }
+    }
+}
+
 test "Thumb decode fault preserves timing of earlier instructions in the batch" {
     const std = @import("std");
     const rom = [_]u8{
