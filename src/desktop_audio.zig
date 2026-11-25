@@ -5,6 +5,7 @@ const sysaudio = @import("mach").sysaudio;
 const Playback = @This();
 
 const capacity = 4096;
+const no_cutoff = std.math.maxInt(u64);
 const Stereo = [2]i16;
 const Cursor = std.atomic.Value(u32);
 
@@ -15,6 +16,8 @@ capture: zaza.AudioCapture,
 frames: [capacity]Stereo = undefined,
 published: Cursor = Cursor.init(0),
 consumed: Cursor = Cursor.init(0),
+// Only the audio callback advances consumed. It applies this cutoff after a restore.
+discard_before: std.atomic.Value(u64) = .init(no_cutoff),
 fraction: u32 = 0,
 primed: bool = false,
 rate: u32,
@@ -68,11 +71,25 @@ pub fn publish(self: *Playback) void {
     self.capture.bytes = 0;
 }
 
+pub fn discardQueued(self: *Playback) void {
+    self.discard_before.store(self.published.load(.acquire), .release);
+}
+
 fn render(user_data: ?*anyopaque, output: []u8) void {
     const self: *Playback = @ptrCast(@alignCast(user_data.?));
     @memset(output, 0);
-    const head = self.published.load(.acquire);
+    const cutoff = self.discard_before.swap(no_cutoff, .acq_rel);
     var tail = self.consumed.load(.monotonic);
+    if (cutoff != no_cutoff) {
+        const cursor: u32 = @intCast(cutoff);
+        if (cursor -% tail <= capacity) {
+            tail = cursor;
+            self.consumed.store(tail, .release);
+        }
+        self.primed = false;
+        self.fraction = 0;
+    }
+    const head = self.published.load(.acquire);
     // Accumulate two video frames of source audio after startup or an underrun.
     if (!self.primed and head -% tail < 1100) return;
     self.primed = true;

@@ -8,6 +8,7 @@ const Playback = @import("desktop_audio.zig");
 const Machine = @import("libzaza").Emulator;
 const input = @import("libzaza").input;
 const Config = @import("desktop_config.zig");
+const Store = @import("state_file.zig");
 const Menu = @import("macos_menu.zig");
 const SaveSession = @import("save_file.zig").Session;
 const Fps = @import("fps.zig");
@@ -39,9 +40,10 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: ?[]const u
     try modules.init(init.gpa, init.io);
     defer modules.deinit(init.gpa);
     const app = &modules.mods.app;
-    app.* = .{ .options = options, .audio = live_audio, .config = config };
+    const state_root = try std.fs.path.join(arena, &.{ init.environ_map.get("HOME") orelse return error.MissingHomeDirectory, "Library/Application Support/Zaza/States" });
+    app.* = .{ .state_root = state_root, .options = options, .audio = live_audio, .config = config };
     if (path) |initial| {
-        app.game = try Game.load(init.gpa, init.io, initial, options, live_audio);
+        app.game = try Game.load(init.gpa, init.io, initial, options, live_audio, state_root);
         app.options.save = .{};
     }
     defer if (app.game) |*game| game.deinit(init.io);
@@ -56,9 +58,11 @@ const Game = struct {
     save: ?SaveSession,
     title: [:0]const u8,
     paused: bool = false,
+    states: Store,
+    refresh_frame: bool = false,
     first_frame: bool = true,
 
-    fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: cartridge.Options, audio: ?*Playback) !Game {
+    fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: cartridge.Options, audio: ?*Playback, root: []const u8) !Game {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const allocator = arena.allocator();
@@ -66,8 +70,11 @@ const Game = struct {
         const title = try std.fmt.allocPrintSentinel(allocator, "Zaza — {s}", .{std.fs.path.basename(path)}, 0);
         const machine = try allocator.create(Machine);
         const save = try options.start(machine, io, allocator, rom);
+        errdefer if (save) |session| session.close(io);
+        const kind = options.save.kind orelse @import("libzaza").SaveMemory.Kind.detect(rom);
+        const states = try Store.init(allocator, io, root, machine, kind);
         if (audio) |playback| machine.setAudioCapture(&playback.capture);
-        return .{ .arena = arena, .machine = machine, .save = save, .title = title };
+        return .{ .arena = arena, .machine = machine, .save = save, .title = title, .states = states };
     }
 
     fn flush(self: *Game, io: std.Io) !void {
@@ -98,6 +105,7 @@ const App = struct {
 
     menu: Menu = undefined,
     config: Config,
+    state_root: []const u8,
     options: cartridge.Options,
     game: ?Game = null,
     // AppKit replaces the cartridge on the main thread, between emulation frames.
@@ -142,12 +150,20 @@ const App = struct {
         app.window_id = window_id;
         lockWindowSize(window);
         app.menu = try Menu.install(app, performCommand);
+        app.menu.updateStates(if (app.game) |game| game.states.occupied else null);
         app.menu.updatePause(app.game != null, false);
         app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
     }
 
-    fn performCommand(app: *App, action: Menu.Action) void {
+    fn performCommand(app: *App, action: Menu.Action, slot: usize) void {
         switch (action) {
+            .save_state, .load_state, .delete_state => {
+                const game = if (app.game) |*current| current else return;
+                if (action == .delete_state and !Menu.confirmChange("Delete", slot)) return;
+                if (action == .save_state and slot != 0 and game.states.occupied[slot] and
+                    !Menu.confirmChange("Replace", slot)) return;
+                app.stateCommand(action, slot) catch |err| Menu.showError("State operation failed", game.title, err);
+            },
             .quit => app.core.exit(),
             .toggle_pause => {
                 app.game_mutex.lockUncancelable(app.core.io);
@@ -158,14 +174,41 @@ const App = struct {
             },
             .open_rom => {
                 const path = Menu.chooseRom() orelse return;
-                app.openRom(path) catch |err| Menu.showOpenError(path, err);
+                app.openRom(path) catch |err| Menu.showError("Couldn’t open the ROM", path, err);
             },
         }
     }
 
+    fn stateCommand(app: *App, action: Menu.Action, slot: usize) !void {
+        const core = app.core;
+        app.game_mutex.lockUncancelable(core.io);
+        defer app.game_mutex.unlock(core.io);
+        const game = &app.game.?;
+        switch (action) {
+            .save_state => try game.states.save(core.allocator, core.io, slot, game.machine),
+            .load_state => {
+                try game.states.load(core.allocator, core.io, slot, game.machine);
+                if (app.audio) |audio| audio.discardQueued();
+                game.refresh_frame = true;
+            },
+            .delete_state => try game.states.remove(core.io, slot),
+            else => unreachable,
+        }
+        app.menu.updateStates(game.states.occupied);
+        const status = switch (action) {
+            .save_state => "saved",
+            .load_state => "loaded",
+            .delete_state => "deleted",
+            else => unreachable,
+        };
+        core.windows.lock();
+        defer core.windows.unlock();
+        if (slot == 0) try core.fmtTitle(app.window_id, "{s} · Quick state {s}", .{ game.title, status }) else try core.fmtTitle(app.window_id, "{s} · Slot {d} {s}", .{ game.title, slot, status });
+    }
+
     fn openRom(app: *App, path: []const u8) !void {
         const core = app.core;
-        var next = try Game.load(core.allocator, core.io, path, app.options, app.audio);
+        var next = try Game.load(core.allocator, core.io, path, app.options, app.audio, app.state_root);
         errdefer next.deinit(core.io);
 
         app.game_mutex.lockUncancelable(core.io);
@@ -174,10 +217,11 @@ const App = struct {
         {
             core.windows.lock();
             defer core.windows.unlock();
-            core.windows.set(app.window_id, .title, next.title);
+            try core.fmtTitle(app.window_id, "{s}", .{next.title});
         }
         if (app.game) |*current| current.deinit(core.io);
         app.game = next;
+        app.menu.updateStates(next.states.occupied);
         app.menu.updatePause(true, false);
         // Explicit save options belong to the first successfully opened cartridge.
         app.options.save = .{};
@@ -214,6 +258,16 @@ const App = struct {
         app.game_mutex.lockUncancelable(io);
         defer app.game_mutex.unlock(io);
         const game = if (app.game) |*current| current else return;
+        if (game.refresh_frame) {
+            game.refresh_frame = false;
+            app.keys.pressed_since_sample = 0;
+            var restored: video.Frame = undefined;
+            game.machine.snapshotFrame(&restored) catch {
+                restored = @splat(@splat(black));
+            };
+            app.pending = restored;
+            return;
+        }
         if (game.paused) return;
         if (game.first_frame) {
             app.keys = .{};

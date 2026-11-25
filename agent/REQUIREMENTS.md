@@ -17,7 +17,7 @@ open box can mean partial support or an unverified acceptance criterion.
 - The Mach desktop player and the CLI for scripted replay and persistent agent sessions both consume the public Zig module `libzaza`. Sessions accept button inputs and return framebuffer observations on demand. All modes share the machine, ROM loader, BIOS selection and save handling. The player adds keyboard input, integer-scaled Mach presentation and stereo playback. The runner adds frame-indexed input and BMP/WAV capture.
 - Zeleste reaches gameplay and has been played on macOS. This is one homebrew compatibility result. Commercial coverage, Linux desktop support and prolonged stability remain open.
 - The recorded fresh-boot mGBA suite runs passed memory (1552/1552), timing (2020/2020), DMA (1244/1244), timer IRQ (90/90) and timer count-up (936/936). Miscellaneous edge cases scored 8/12 in that run. Visual tests were inspected manually. These are historical results, not a per-build certification.
-- All four PSG channels and both Direct Sound FIFOs produce samples. Audio accuracy, device selection and synchronization across playback speeds remain open. The GPU presents the software framebuffer. Enhanced rendering, debugger UI, save states and linked multiplayer remain open.
+- All four PSG channels and both Direct Sound FIFOs produce samples. Audio accuracy, device selection and synchronization across playback speeds remain open. The GPU presents the software framebuffer. The macOS player supports persistent quick states and three numbered slots. Enhanced rendering, debugger UI and linked multiplayer remain open.
 
 ## 1. Project Objectives
 
