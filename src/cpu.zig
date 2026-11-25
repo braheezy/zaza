@@ -1303,16 +1303,14 @@ inline fn executeThumbLowAlu(self: *Cpu, opcode: u16, instruction: u16) error{Un
                 self.writeGeneralRegister(destination, result.value);
                 self.writeFlags(result.flags);
             } else {
-                const shifted = self.shiftedRegisterOperand(.{
-                    .register = source,
-                    .kind = kind,
-                    .amount = .{ .immediate = @truncate(instruction >> 6) },
-                });
+                // Both operands are low registers, which share storage in every CPU mode.
+                const amount: u5 = @truncate(instruction >> 6);
+                const shifted = self.shiftByEncodedAmount(self.registers[source], kind, amount);
                 var flags = self.readFlags();
                 flags.negative = shifted.value >> 31 != 0;
                 flags.zero = shifted.value == 0;
                 flags.carry = shifted.carry;
-                self.writeGeneralRegister(destination, shifted.value);
+                self.registers[destination] = shifted.value;
                 self.writeFlags(flags);
             }
         },
@@ -1843,6 +1841,10 @@ inline fn shiftedOperand(self: *Cpu, comptime bank: ArmAluBank, shift: ArmDataPr
             };
         },
     };
+    return self.shiftByEncodedAmount(value, kind, amount);
+}
+
+inline fn shiftByEncodedAmount(self: *const Cpu, value: u32, kind: u2, amount: u5) ShifterResult {
     // Zero encodes 32 for LSR/ASR and rotate-through-carry for ROR.
     if (amount == 0) return switch (kind) {
         0 => .{ .value = value, .carry = self.readFlags().carry },
