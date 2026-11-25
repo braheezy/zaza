@@ -9,6 +9,7 @@ const text_entry_cutoff = 1007;
 const text_data_cutoff = 1004;
 const object_layer = 4;
 const backdrop_layer = 5;
+const backdrop_rank = 20;
 
 pub const VerticalWindows = struct {
     active: [2]bool = @splat(false),
@@ -67,16 +68,28 @@ pub const Display = struct {
             }
         }
 
-        var objects: [video.width]ObjectPixel = @splat(.{});
-        if (self.control & (1 << 12) != 0) self.drawObjects(y, mosaic, &objects);
         const effect = Effects.init(self.registers);
-        const backdrop: Pixel = .{ .color = readHalf(self.palette, 0), .rank = 20, .layer = backdrop_layer };
-        // Even with normal blending off, semitransparent objects can blend
-        // when BLDCNT selects a second target.
-        if (self.control & 0xE000 == 0 and self.bg_pixel_mask == null and effect.control & 0x3FC0 == 0) {
-            self.composeFront(row, backgrounds[0..text_count], &text_pixels, affine, &objects, backdrop);
+        // A semitransparent OBJ can still blend if BLDCNT enables a second target.
+        const front_only = self.control & 0xE000 == 0 and self.bg_pixel_mask == null and
+            effect.control & 0x3FC0 == 0;
+        var pixels: [video.width]PalettePixel = undefined;
+        const indexed = mode == 4 and front_only and self.fetchMode4Row(affine[0], &pixels);
+        if (!indexed) pixels = @splat(.{});
+        if (self.control & (1 << 12) != 0) self.drawObjects(y, mosaic, &pixels);
+
+        if (indexed) {
+            for (row, pixels) |*output, pixel| output.* = video.decodeColor(pixel.color(self.palette));
         } else {
-            self.composeEffects(row, backgrounds[0..text_count], &text_pixels, affine, &objects, backdrop, effect);
+            const backdrop: Pixel = .{
+                .color = readHalf(self.palette, 0),
+                .rank = backdrop_rank,
+                .layer = backdrop_layer,
+            };
+            if (front_only) {
+                self.composeFront(row, backgrounds[0..text_count], &text_pixels, affine, &pixels, backdrop);
+            } else {
+                self.composeEffects(row, backgrounds[0..text_count], &text_pixels, affine, &pixels, backdrop, effect);
+            }
         }
         if (self.green_swap) video.swapGreen(row);
     }
@@ -87,7 +100,7 @@ pub const Display = struct {
         backgrounds: []const ?Background,
         text_pixels: *const [4][video.width]u8,
         affine: [2]?AffineLine,
-        objects: *const [video.width]ObjectPixel,
+        objects: *const [video.width]PalettePixel,
         backdrop: Pixel,
     ) void {
         var ranks: [video.width]u8 = @splat(backdrop.rank);
@@ -112,12 +125,33 @@ pub const Display = struct {
             }
         }
         for (row, objects, ranks, colors) |*output, object, rank, color| {
-            var visible = color;
-            if (object.pixel) |pixel| {
-                if (pixel.rank < rank) visible = pixel.color;
-            }
-            output.* = video.decodeColor(visible);
+            output.* = video.decodeColor(if (object.rank < rank) object.color(self.palette) else color);
         }
+    }
+
+    // A horizontal affine span samples a single palette-indexed row. Check both
+    // ends once so negative steps and fractional scaling use the same inner loop.
+    fn fetchMode4Row(self: Display, background: ?AffineLine, pixels: *[video.width]PalettePixel) bool {
+        const bg = background orelse {
+            pixels.* = @splat(.{});
+            return true;
+        };
+        if (bg.dy != 0 or bg.mosaic_width != 1) return false;
+        const sy = bg.start_y >> 8;
+        const last_x = bg.start_x + @as(i32, bg.dx) * @as(i32, video.width - 1);
+        if (sy < 0 or sy >= video.height or @min(bg.start_x, last_x) < 0 or
+            @max(bg.start_x, last_x) >= video.width << 8) return false;
+
+        const page: usize = if (self.control & (1 << 4) != 0) 0xA000 else 0;
+        const offset = page + @as(usize, @intCast(sy)) * video.width;
+        const source = self.vram[offset..][0..video.width];
+        var sx = bg.start_x;
+        for (pixels) |*pixel| {
+            const index = source[@intCast(sx >> 8)];
+            pixel.* = .{ .index = index, .rank = if (index == 0) backdrop_rank else bg.rank };
+            sx += bg.dx;
+        }
+        return true;
     }
 
     fn composeEffects(
@@ -126,7 +160,7 @@ pub const Display = struct {
         backgrounds: []const ?Background,
         text_pixels: *const [4][video.width]u8,
         affine: [2]?AffineLine,
-        objects: *const [video.width]ObjectPixel,
+        objects: *const [video.width]PalettePixel,
         backdrop: Pixel,
         effect: Effects,
     ) void {
@@ -149,7 +183,12 @@ pub const Display = struct {
                 if (bg.pixel(self, x)) |color| layers.insert(.{ .color = color, .layer = index, .rank = bg.rank });
             }
             if (mask & (1 << object_layer) != 0) {
-                if (object.pixel) |pixel| layers.insert(pixel);
+                if (object.index != 0) layers.insert(.{
+                    .color = object.color(self.palette),
+                    .rank = object.rank,
+                    .layer = object_layer,
+                    .semitransparent = object.semitransparent,
+                });
             }
             const color = if (mask & (1 << 5) != 0) effect.apply(layers) else layers.front.color;
             output.* = video.decodeColor(color);
@@ -306,11 +345,11 @@ pub const Display = struct {
         return @truncate(if (self.control & 0x8000 != 0 and object_window) outside >> 8 else outside);
     }
 
-    fn drawObjects(self: Display, y: usize, mosaic: u16, row: *[video.width]ObjectPixel) void {
+    fn drawObjects(self: Display, y: usize, mosaic: u16, row: *[video.width]PalettePixel) void {
         var cycles: usize = if (self.control & (1 << 5) != 0) 954 else 1210;
-        for (0..128) |index| {
+        for (0..128) |oam_index| {
             if (cycles == 0) break;
-            const attributes = Object.read(self.oam, index) orelse continue;
+            const attributes = Object.read(self.oam, oam_index) orelse continue;
             const relative_y = (y -% @as(usize, @as(u8, @truncate(attributes.first)))) & 255;
             if (relative_y >= attributes.canvas_height) continue;
 
@@ -319,45 +358,50 @@ pub const Display = struct {
             cycles -|= overhead;
             const pixels = @min(attributes.canvas_width, cycles / pixel_cycles);
             cycles -|= attributes.canvas_width * pixel_cycles;
-            for (0..pixels) |relative_x| {
-                const x = (attributes.x + relative_x) & 511;
-                if (x >= video.width) continue;
-                const palette_index = self.objectPixel(attributes, relative_x, relative_y, mosaic) orelse continue;
-                if (attributes.mode == 2) {
-                    row[x].window = true;
-                    continue;
+            const use_mosaic = attributes.first & (1 << 12) != 0;
+            const sample_y = if (use_mosaic) relative_y - relative_y % mosaicSize(mosaic, 12) else relative_y;
+            const line = ObjectLine.init(attributes, sample_y);
+            const mosaic_width = if (use_mosaic) mosaicSize(mosaic, 8) else 1;
+            if (mosaic_width == 1) {
+                for (0..pixels) |relative_x| {
+                    const x = (attributes.x + relative_x) & 511;
+                    if (x >= video.width) continue;
+                    const index = self.objectLinePixel(attributes, line, relative_x) orelse continue;
+                    row[x].plot(attributes, index);
                 }
-                if (row[x].pixel) |current| {
-                    if (current.rank <= attributes.rank) continue;
+            } else {
+                var start: usize = 0;
+                while (start < pixels) : (start += mosaic_width) {
+                    const index = self.objectLinePixel(attributes, line, start) orelse continue;
+                    for (start..@min(pixels, start + mosaic_width)) |relative_x| {
+                        const x = (attributes.x + relative_x) & 511;
+                        if (x < video.width) row[x].plot(attributes, index);
+                    }
                 }
-                row[x].pixel = .{
-                    .color = readHalf(self.palette, 512 + palette_index * 2),
-                    .rank = attributes.rank,
-                    .layer = object_layer,
-                    .semitransparent = attributes.mode == 1,
-                };
             }
         }
     }
 
-    fn objectPixel(self: Display, object: Object, x: usize, y: usize, mosaic: u16) ?usize {
-        const use_mosaic = object.first & (1 << 12) != 0;
-        const sample_x = if (use_mosaic) x - x % mosaicSize(mosaic, 8) else x;
-        const sample_y = if (use_mosaic) y - y % mosaicSize(mosaic, 12) else y;
-        const texel = object.texel(sample_x, sample_y) orelse return null;
+    fn objectLinePixel(self: Display, object: Object, line: ObjectLine, x: usize) ?usize {
+        const column: i32 = @intCast(x);
+        const sx = (line.start_x + line.dx * column) >> 8;
+        const sy = (line.start_y + line.dy * column) >> 8;
+        if (sx < 0 or sy < 0 or sx >= object.width or sy >= object.height) return null;
+        const tx: usize = @intCast(sx);
+        const ty: usize = @intCast(sy);
         const tile_units: usize = if (object.eight_bit) 2 else 1;
         const one_dimensional = self.control & (1 << 6) != 0;
         const stride = if (one_dimensional) object.width / 8 * tile_units else 32;
         var tile: usize = object.third & 0x03FF;
         if (object.eight_bit and !one_dimensional) tile &= ~@as(usize, 1);
-        tile += texel.y / 8 * stride + texel.x / 8 * tile_units;
+        tile += ty / 8 * stride + tx / 8 * tile_units;
         // A 256-color tile spans two 32-byte character units, including at wraparound.
-        const tile_y = texel.y & 7;
+        const tile_y = ty & 7;
         if (object.eight_bit) tile += tile_y / 4;
         tile &= 0x3FF;
         if (self.control & 7 >= 3 and tile < 512) return null;
         const tile_base = background_vram_size + tile * 32;
-        const index = tilePixel(self.vram, tile_base, texel.x & 7, if (object.eight_bit) tile_y & 3 else tile_y, object.eight_bit);
+        const index = tilePixel(self.vram, tile_base, tx & 7, if (object.eight_bit) tile_y & 3 else tile_y, object.eight_bit);
         if (index == 0) return null;
         const bank: usize = if (object.eight_bit) 0 else (object.third >> 12) * 16;
         return bank + index;
@@ -493,25 +537,63 @@ const Object = struct {
             .mode = mode,
         };
     }
+};
 
-    fn texel(self: Object, x: usize, y: usize) ?struct { x: usize, y: usize } {
-        const matrix = self.matrix orelse return .{
-            .x = if (self.second & (1 << 12) != 0) self.width - 1 - x else x,
-            .y = if (self.second & (1 << 13) != 0) self.height - 1 - y else y,
+// Starting texel and horizontal steps use 8 fractional bits, including for flipped sprites.
+const ObjectLine = struct {
+    start_x: i32,
+    start_y: i32,
+    dx: i32,
+    dy: i32,
+
+    fn init(object: Object, sample_y: usize) ObjectLine {
+        const y: i32 = @intCast(sample_y);
+        const w: i32 = @intCast(object.width);
+        const h: i32 = @intCast(object.height);
+        if (object.matrix) |matrix| {
+            const left = -@as(i32, @intCast(object.canvas_width / 2));
+            const line_y = y - @as(i32, @intCast(object.canvas_height / 2));
+            const pa, const pb, const pc, const pd = matrix;
+            return .{
+                .start_x = w * 128 + pa * left + pb * line_y,
+                .start_y = h * 128 + pc * left + pd * line_y,
+                .dx = pa,
+                .dy = pc,
+            };
+        }
+        const flip_x = object.second & (1 << 12) != 0;
+        return .{
+            .start_x = if (flip_x) (w - 1) << 8 else 0,
+            .start_y = (if (object.second & (1 << 13) != 0) h - 1 - y else y) << 8,
+            .dx = if (flip_x) -256 else 256,
+            .dy = 0,
         };
-        const pa, const pb, const pc, const pd = matrix;
-        const dx = @as(i32, @intCast(x)) - @as(i32, @intCast(self.canvas_width / 2));
-        const dy = @as(i32, @intCast(y)) - @as(i32, @intCast(self.canvas_height / 2));
-        const local_x = ((pa * dx + pb * dy) >> 8) + @as(i32, @intCast(self.width / 2));
-        const local_y = ((pc * dx + pd * dy) >> 8) + @as(i32, @intCast(self.height / 2));
-        if (local_x < 0 or local_y < 0 or local_x >= self.width or local_y >= self.height) return null;
-        return .{ .x = @intCast(local_x), .y = @intCast(local_y) };
     }
 };
 
-const ObjectPixel = struct {
-    pixel: ?Pixel = null,
+// The two palette banks share a nine-bit index. Keep the winning index until composition.
+const PalettePixel = packed struct(u16) {
+    index: u9 = 0,
+    rank: u5 = backdrop_rank,
+    semitransparent: bool = false,
     window: bool = false,
+
+    fn plot(self: *PalettePixel, object: Object, index: usize) void {
+        if (object.mode == 2) {
+            self.window = true;
+        } else if (object.rank < self.rank) {
+            self.* = .{
+                .index = 0x100 | @as(u9, @intCast(index)),
+                .rank = object.rank,
+                .semitransparent = object.mode == 1,
+                .window = self.window,
+            };
+        }
+    }
+
+    fn color(self: PalettePixel, palette: *const [1024]u8) u16 {
+        return readHalf(palette, @as(usize, self.index) * 2);
+    }
 };
 
 const Pixel = struct {
@@ -633,5 +715,58 @@ test "tile row fetches match ordered bus slots through the end of the scanline" 
         display.fetchTextLine(&layers, &actual, &actual_latch);
         try std.testing.expectEqual(expected_latch, actual_latch);
         for (expected, actual) |a, b| try std.testing.expectEqualSlices(u8, &a, &b);
+    }
+}
+
+test "indexed Mode 4 rows match per-pixel composition at both page and priority boundaries" {
+    var random = std.Random.DefaultPrng.init(74);
+    var vram: [background_vram_size + object_vram_size]u8 = undefined;
+    var palette: [1024]u8 = undefined;
+    random.random().bytes(&vram);
+    random.random().bytes(&palette);
+    for (vram[0..0x14000], 0..) |*index, i| {
+        if (i % 3 == 0) index.* = 0;
+    }
+
+    var oam: [1024]u8 = @splat(0);
+    for (0..128) |i| std.mem.writeInt(u16, oam[8 * i ..][0..2], 0x0200, .little);
+    // Overlap translucent and ordinary sprites on the left; the first wins OBJ ties.
+    for (0..4) |i| {
+        const base = 8 * i;
+        std.mem.writeInt(u16, oam[base..][0..2], if (i == 0) 0x0400 else 0, .little);
+        std.mem.writeInt(u16, oam[base + 2 ..][0..2], @intCast(0x4000 + i * 4), .little);
+        std.mem.writeInt(u16, oam[base + 4 ..][0..2], @intCast(512 + i * 4 + (i / 2) * 1024), .little);
+    }
+    var regs: DisplayRegisters = .{};
+    var display: Display = .{
+        .control = 0x1404,
+        .green_swap = false,
+        .vertical_windows = .{},
+        .vram = &vram,
+        .palette = &palette,
+        .oam = &oam,
+        .registers = &regs,
+    };
+    const mask: [video.width]u8 = @splat(0x0F);
+    var latch: u16 = 0xABCD;
+    for ([_]u16{ 0x1404, 0x1414, 0x1004, 0x0404 }) |control| {
+        display.control = control;
+        for ([_]i16{ 0, 171, 256, -256 }) |step| {
+            regs.write(0x0400_0020, @bitCast(step));
+            regs.write(0x0400_0028, if (step < 0) 239 << 8 else 0);
+            for (0..4) |priority| {
+                regs.write(0x0400_000C, @intCast(priority));
+                display.green_swap = priority & 1 != 0;
+                var actual: [video.width]video.Rgb = undefined;
+                var expected: @TypeOf(actual) = undefined;
+                display.bg_pixel_mask = null;
+                display.renderLine(7, &actual, &latch);
+                // An all-visible mask selects the general compositor with the same layers.
+                display.bg_pixel_mask = &mask;
+                display.renderLine(7, &expected, &latch);
+                try std.testing.expectEqualSlices(video.Rgb, &expected, &actual);
+                try std.testing.expectEqual(@as(u16, 0xABCD), latch);
+            }
+        }
     }
 }
