@@ -863,6 +863,130 @@ test "batched ARM halfword and signed transfers match timed steps in both work R
     }
 }
 
+test "IWRAM ARM shifts and multiplies preserve register banks, PC operands and internal cycles" {
+    const words = [_]u32{
+        0xE28D_8001, // ADD r8, sp, #1
+        0xE1B0_911F, // MOVS r9, pc, LSL r1 (sees PC + 12)
+        0xE004_029F, // MUL r4, pc, r2 (also sees PC + 12)
+        0xE0F7_6294, // SMLALS r6, r7, r4, r2
+        0xE089_A008, // ADD r10, r9, r8
+    };
+    const std = @import("std");
+    for ([_]u32{ 0x10, 0x1F, 0x12, 0x11 }) |mode| {
+        var batched: Machine = undefined;
+        batched.initCartridge(&.{});
+        batched.cpu.cpsr = mode;
+        batched.cpu.registers[13] = 8;
+        batched.cpu.banked.irq[0] = 20;
+        batched.cpu.banked.fiq[5] = 32;
+        batched.cpu.registers[1] = 1;
+        batched.cpu.registers[2] = 0x1234_5678;
+        for (words, 0..) |word, i| batched.bus.writeData(u32, Bus.iwram_base + @as(u32, @intCast(i * 4)), word);
+        batched.cpu.instruction_address = Bus.iwram_base;
+        batched.cpu.refillArmPipeline(&batched.bus);
+        var reference = batched;
+        const run = batched.cpu.runArmIwram(&batched.bus, words.len, 32);
+        try std.testing.expectEqual(words.len, run.steps);
+        for (words) |_| try reference.stepTimed();
+        try std.testing.expectEqual(reference.elapsed_cycles, run.cycles);
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqual(reference.bus.bus_cycles, batched.bus.bus_cycles);
+        try std.testing.expectEqual(reference.bus.cpu_internal_cycles, batched.bus.cpu_internal_cycles);
+    }
+}
+
+test "IWRAM ARM block transfers respect device budgets, physical RAM boundaries and VRAM holes" {
+    const std = @import("std");
+    const words = [_]u32{
+        0xE8A1_0105, // STMIA r1!, {r0,r2,r8}
+        0xE931_0218, // LDMDB r1!, {r3,r4,r9}
+        0xE581_2000, // STR r2, [r1]
+        0xE1D1_A0F1, // LDRSH r10, [r1, #1]
+    };
+    const cases = [_]struct { address: u32, contiguous: bool = true }{
+        .{ .address = Bus.iwram_base + 0x101 },
+        .{ .address = Bus.ewram_base + 0x101 },
+        .{ .address = Bus.vram_base + 0x101 },
+        .{ .address = Bus.iwram_base + 0x7FFC, .contiguous = false },
+        .{ .address = Bus.vram_base + 0x17FFC, .contiguous = false },
+        .{ .address = Bus.vram_base + 0x18000, .contiguous = false },
+        .{ .address = Bus.vram_base + 0x1C000 },
+    };
+    for (cases) |case| {
+        const address = case.address;
+        var batched: Machine = undefined;
+        batched.initCartridge(&.{});
+        batched.bus.dispcnt = 4;
+        batched.cpu.registers[0] = 0x1234_5678;
+        batched.cpu.registers[2] = 0xFF80_8000;
+        batched.cpu.registers[8] = 0xAABB_CCDD;
+        batched.cpu.registers[1] = address;
+        // Keep code clear of the physical mirror that the wrapping STM writes.
+        const code = Bus.iwram_base + 0x1000;
+        for (words, 0..) |word, i| batched.bus.writeData(u32, code + @as(u32, @intCast(i * 4)), word);
+        batched.cpu.instruction_address = code;
+        batched.cpu.refillArmPipeline(&batched.bus);
+        var reference = batched;
+        const data_cycles = 3 * @as(u64, timing.ramAccessCycles(u32, @truncate(address >> 24)));
+        const short = batched.cpu.runArmIwram(&batched.bus, 1, data_cycles);
+        try std.testing.expectEqual(@as(usize, 0), short.steps);
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+        const complete = batched.cpu.runArmIwram(&batched.bus, 1, data_cycles + 1);
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.contiguous)), complete.steps);
+        batched = reference;
+        try std.testing.expectEqual(words.len, try batched.stepBatch(words.len));
+        for (words) |_| try reference.stepTimed();
+        try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+        try std.testing.expectEqualDeep(reference.bus, batched.bus);
+        try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+    }
+}
+
+test "IWRAM BX refills an ARM target and hands a Thumb target to timed stepping" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const code = Bus.iwram_base;
+    machine.bus.writeData(u32, code, 0xE12F_FF10); // BX r0
+    machine.bus.writeData(u32, code + 8, 0xE12F_FF11); // BX r1
+    machine.cpu.instruction_address = code;
+    machine.cpu.refillArmPipeline(&machine.bus);
+    machine.cpu.registers[0] = code + 10;
+    machine.cpu.registers[1] = code + 17;
+    var reference = machine;
+    const short = machine.cpu.runArmIwram(&machine.bus, 1, 2);
+    try std.testing.expectEqual(@as(usize, 0), short.steps);
+    const branch = machine.cpu.runArmIwram(&machine.bus, 2, 12);
+    try std.testing.expectEqual(@as(usize, 1), branch.steps);
+    try std.testing.expectEqual(@as(u64, 3), branch.cycles);
+    try reference.stepTimed();
+    try std.testing.expectEqualDeep(reference.cpu, machine.cpu);
+    try std.testing.expectEqual(code + 8, machine.cpu.instruction_address);
+}
+
+test "IWRAM block store replaces code after its prefetched words retire" {
+    const std = @import("std");
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const words = [_]u32{
+        0xE8A1_000C, // STMIA r1!, {r2,r3} replaces both following instructions
+        0xE3A0_0001, // MOV r0, #1
+        0xE280_0001, // ADD r0, r0, #1
+        0xEAFF_FFFC, // B to the replaced MOV
+    };
+    for (words, 0..) |word, i| machine.bus.writeData(u32, Bus.iwram_base + @as(u32, @intCast(i * 4)), word);
+    machine.cpu.instruction_address = Bus.iwram_base;
+    machine.cpu.refillArmPipeline(&machine.bus);
+    machine.cpu.registers[1] = Bus.iwram_base + 4;
+    machine.cpu.registers[2] = 0xE3A0_0007; // MOV r0, #7
+    machine.cpu.registers[3] = 0xE280_0004; // ADD r0, r0, #4
+    try std.testing.expectEqual(@as(usize, 3), try machine.stepBatch(3));
+    try std.testing.expectEqual(@as(u32, 2), machine.cpu.registers[0]);
+    try std.testing.expectEqual(@as(usize, 3), try machine.stepBatch(3));
+    try std.testing.expectEqual(@as(u32, 11), machine.cpu.registers[0]);
+}
+
 test "batched timer reads and IRQ propagation agree with individual timed steps" {
     const std = @import("std");
     const rom = [_]u8{

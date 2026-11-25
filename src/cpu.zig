@@ -174,7 +174,7 @@ noinline fn stepArmMisc(self: *Cpu, bus: anytype, instruction: u32) error{Unsupp
         return;
     }
     // Multiply encodings overlap the data-processing space.
-    if (instruction & 0x0FC0_00F0 == 0x0000_0090 or instruction & 0x0F80_00F0 == 0x0080_0090) {
+    if (isArmMultiply(instruction)) {
         if (instruction >> 28 == 15) return error.UnsupportedInstruction;
         // The multiplier samples operands after the sequential fetch (R15 = PC + 12).
         _ = self.advanceArmPipeline(bus);
@@ -252,6 +252,15 @@ fn executeArmSwap(self: *Cpu, bus: anytype, instruction: u32) error{UnsupportedI
     }
 }
 
+fn blockTransferRange(word: u32, base: u32, count: u32) struct { address: u32, updated_base: u32 } {
+    const increment = word & (1 << 23) != 0;
+    const before = word & (1 << 24) != 0;
+    const updated_base = if (increment) base +% (count * 4) else base -% (count * 4);
+    // Even decrementing modes transfer the lowest register at the lowest address.
+    const start = if (increment) base else updated_base;
+    return .{ .address = start +% @as(u32, if (before == increment) 4 else 0), .updated_base = updated_base };
+}
+
 fn executeArmBlockTransfer(
     self: *Cpu,
     bus: anytype,
@@ -264,8 +273,6 @@ fn executeArmBlockTransfer(
         return;
     }
 
-    const before = instruction & (1 << 24) != 0;
-    const increment = instruction & (1 << 23) != 0;
     const special = instruction & (1 << 22) != 0;
     const writeback = instruction & (1 << 21) != 0;
     const load = instruction & (1 << 20) != 0;
@@ -280,10 +287,9 @@ fn executeArmBlockTransfer(
     const user_bank = special and !loads_pc;
 
     const base = self.readRegister(base_register);
-    const updated_base = if (increment) base +% (count * 4) else base -% (count * 4);
-    // Even decrementing modes transfer the lowest register at the lowest address.
-    var address = if (increment) base else updated_base;
-    if (before == increment) address +%= 4;
+    const range = blockTransferRange(instruction, base, count);
+    const updated_base = range.updated_base;
+    var address = range.address;
     const base_in_list = registers & (@as(u16, 1) << base_register) != 0;
     const first_register: u4 = @intCast(@ctz(registers));
     _ = self.advanceArmPipeline(bus);
@@ -352,6 +358,10 @@ fn executeArmTransfer(
     const transfer = try self.decodeArmTransfer(instruction, extra);
     _ = self.advanceArmPipeline(bus);
     self.finishArmTransfer(bus, transfer);
+}
+
+fn isArmMultiply(word: u32) bool {
+    return word & 0x0FC0_00F0 == 0x0000_0090 or word & 0x0F80_00F0 == 0x0080_0090;
 }
 
 fn isArmExtraTransfer(word: u32) bool {
@@ -517,11 +527,35 @@ fn ThumbDispatch(comptime BusPtr: type) type {
 
 const InstructionRun = struct { steps: usize = 0, cycles: u64 = 0 };
 
+// Each opcode shares the scalar ALU rules with its operation and flag behavior fixed.
+const IwramAlu = struct {
+    const Handler = *const fn (*Cpu, u32) void;
+    const table = blk: {
+        var entries: [64]Handler = undefined;
+        for (&entries, 0..) |*slot, key| slot.* = handler(@intCast(key));
+        break :blk entries;
+    };
+
+    fn handler(comptime key: u6) Handler {
+        return &struct {
+            fn execute(cpu: *Cpu, word: u32) void {
+                var decoded: ArmDataProcessing = @bitCast(word);
+                decoded.immediate = key & 0x20 != 0;
+                decoded.operation = @enumFromInt(@as(u4, @truncate(key >> 1)));
+                decoded.set_flags = key & 1 != 0;
+                _ = cpu.executeArmAlu(decoded, .unbanked);
+            }
+        }.execute;
+    }
+};
+
 /// In IWRAM each instruction fetch costs one cycle, including both words of a branch refill.
 pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) InstructionRun {
     var queue = self.pipeline orelse return .{};
     var run: InstructionRun = .{};
     const internal_before = self.internal_cycles;
+    // Instructions that switch modes leave the runner before changing CPSR.
+    const unbanked = self.mode() == .system or self.mode() == .user;
     while (run.steps < limit and run.cycles < budget) {
         const pc = self.instruction_address;
         const fetch = pc +% 8;
@@ -532,11 +566,16 @@ pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) Instruct
         const execute = condition == 0xE or conditionPassed(condition, self.readFlags());
         // A store may replace the word being fetched. The pipeline sees its old contents.
         const next = bus.iwramWord(fetch);
-        if (word & 0x0E00_0000 == 0x0A00_0000) {
+        const immediate_branch = word & 0x0E00_0000 == 0x0A00_0000;
+        if (immediate_branch or word & 0x0FFF_FFF0 == 0x012F_FF10) {
             if (execute) {
-                const target = armBranchTarget(pc, word);
+                const target = if (immediate_branch) armBranchTarget(pc, word) else target: {
+                    const address = self.readRegister(@truncate(word));
+                    if (address & 1 != 0) break;
+                    break :target address & ~@as(u32, 3);
+                };
                 if (target >> 24 != 3 or (target +% 4) >> 24 != 3 or budget - run.cycles < 3) break;
-                if (word & (1 << 24) != 0) self.writeGeneralRegister(link_register, pc + 4);
+                if (immediate_branch and word & (1 << 24) != 0) self.writeGeneralRegister(link_register, pc + 4);
                 queue = .{ bus.iwramWord(target), bus.iwramWord(target + 4) };
                 self.instruction_address = target;
                 run.cycles += 3;
@@ -552,8 +591,29 @@ pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) Instruct
                 run.cycles += cycles orelse break;
             }
         } else if (decodeArmDataProcessing(word) catch break) |decoded| {
-            if (decoded.registerShift() or decoded.destination == program_counter) break;
-            if (execute) _ = self.executeArmDataProcessing(decoded);
+            if (execute) {
+                if (decoded.destination == program_counter) break;
+                const extra: u64 = @intFromBool(decoded.registerShift());
+                if (budget - run.cycles <= extra) break;
+                if (unbanked) {
+                    const key: u6 = @truncate(word >> 20);
+                    IwramAlu.table[key](self, word);
+                } else _ = self.executeArmDataProcessing(decoded);
+                run.cycles += extra;
+            }
+        } else if (word & 0x0E00_0000 == 0x0800_0000) {
+            if (execute) run.cycles += self.runArmRamBlock(bus, word, budget - run.cycles - 1) orelse break;
+        } else if (isArmMultiply(word)) {
+            if (execute) {
+                // The multiplier samples PC after the fetch. Leave redirects and device
+                // boundaries to the timed step. Six internal cycles cover even UMLAL.
+                if (budget - run.cycles < 7 or (word >> 16) & 15 == program_counter or
+                    (word & (1 << 23) != 0 and (word >> 12) & 15 == program_counter)) break;
+                self.instruction_address = pc + 4;
+                const before = self.internal_cycles;
+                _ = self.executeArmMultiply(word);
+                run.cycles += self.internal_cycles - before;
+            }
         } else if (isArmExtraTransfer(word)) {
             if (execute) {
                 const data_budget = budget - run.cycles - 1;
@@ -577,6 +637,37 @@ pub fn runArmIwram(self: *Cpu, bus: anytype, limit: usize, budget: u64) Instruct
     return run;
 }
 
+// All bus beats must fit within one mapped bank and before the next device event.
+noinline fn runArmRamBlock(self: *Cpu, bus: anytype, word: u32, budget: u64) ?u64 {
+    const base: u4 = @truncate(word >> 16);
+    var registers: u16 = @truncate(word);
+    if (word & (1 << 22) != 0 or base == program_counter or registers == 0 or
+        registers & ((@as(u16, 1) << base) | (1 << program_counter)) != 0) return null;
+    const count: u32 = @popCount(registers);
+    const range = blockTransferRange(word, self.readRegister(base), count);
+    const bytes = bus.ramWordSpan(range.address, count) orelse return null;
+    const region: u8 = @truncate(range.address >> 24);
+    const data_cycles = count * timing.ramAccessCycles(u32, region);
+    const load = word & (1 << 20) != 0;
+    const cycles = data_cycles + @intFromBool(load);
+    if (cycles > budget) return null;
+
+    for (0..count) |i| {
+        const register: u4 = @intCast(@ctz(registers));
+        registers &= registers - 1;
+        const location = bytes[i * 4 ..][0..4];
+        if (load) {
+            self.writeGeneralRegister(register, std.mem.readInt(u32, location, .little));
+        } else {
+            std.mem.writeInt(u32, location, self.readRegister(register), .little);
+        }
+    }
+    if (word & (1 << 21) != 0) self.writeGeneralRegister(base, range.updated_base);
+    if (region == 3) bus.iwram_data_cycles += data_cycles;
+    self.internal_cycles += @intFromBool(load);
+    return cycles;
+}
+
 fn runArmRamTransfer(
     self: *Cpu,
     bus: anytype,
@@ -588,18 +679,18 @@ fn runArmRamTransfer(
     if (transfer.data_register == program_counter or
         (transfer.writeback and transfer.base_register == program_counter)) return null;
     const cycles = switch (transfer.operation) {
-        inline else => |op| self.accessWorkRam(bus, op, transfer.address, transfer.data_register, transfer.load, budget) orelse return null,
+        inline else => |op| self.accessRam(bus, .work_and_video, op, transfer.address, transfer.data_register, transfer.load, budget) orelse return null,
     };
     if (transfer.writeback and (!transfer.load or transfer.base_register != transfer.data_register))
         self.writeGeneralRegister(transfer.base_register, transfer.updated_base);
     return cycles;
 }
 
-// Only work RAM can be accessed here without synchronizing devices. Check the
-// mapping and budget before committing either a register or a memory write.
-inline fn accessWorkRam(
+// Check the mapping and budget before committing either a register or a memory write.
+inline fn accessRam(
     self: *Cpu,
     bus: anytype,
+    comptime memory: enum { work, work_and_video },
     comptime op: ArmTransfer.Operation,
     address: u32,
     register: u4,
@@ -608,8 +699,12 @@ inline fn accessWorkRam(
 ) ?u8 {
     const T = op.Data();
     const aligned = address & ~@as(u32, @sizeOf(T) - 1);
-    const bytes = bus.workRamBytes(T, aligned) orelse return null;
     const region: u8 = @truncate(address >> 24);
+    const bytes = bus.workRamBytes(T, aligned) orelse blk: {
+        // A byte store to VRAM has mode-dependent duplication and OBJ rules.
+        if (memory == .work or T == u8 or region != 6) return null;
+        break :blk bus.videoRamBytes(T, aligned) orelse return null;
+    };
     const data_cycles = timing.ramAccessCycles(T, region);
     const internal: u8 = @intFromBool(load);
     const cycles = data_cycles + internal;
@@ -715,7 +810,7 @@ inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u1
             else => true,
         };
         const cycles = switch (kind) {
-            inline else => |width| self.accessWorkRam(bus, width, transfer.address, transfer.register, load, std.math.maxInt(u8)) orelse return .{ .flow = .handoff },
+            inline else => |width| self.accessRam(bus, .work, width, transfer.address, transfer.register, load, std.math.maxInt(u8)) orelse return .{ .flow = .handoff },
         };
         const internal: u3 = @intFromBool(load);
         return .{ .data_cycles = @intCast(cycles - internal), .internal_cycles = internal };
@@ -1588,6 +1683,12 @@ inline fn decodeArmDataProcessing(instruction: u32) error{UnsupportedInstruction
 
 // Return a redirect instead of writing PC so step can preserve fetch ordering.
 inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 {
+    return self.executeArmAlu(decoded, .current);
+}
+
+const ArmAluBank = enum { current, unbanked };
+
+inline fn executeArmAlu(self: *Cpu, decoded: ArmDataProcessing, comptime bank: ArmAluBank) ?u32 {
     const old_flags = self.readFlags();
     const register_shift = decoded.registerShift();
     const operand: ShifterResult = if (decoded.immediate) blk: {
@@ -1595,9 +1696,9 @@ inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 
         break :blk .{ .value = value, .carry = if (decoded.operand >> 8 == 0) old_flags.carry else value >> 31 != 0 };
     } else if (decoded.operand >> 4 == 0) .{
         // LSL #0 is the encoding for a plain register operand.
-        .value = self.readArmAluRegister(@truncate(decoded.operand), false),
+        .value = self.aluRegister(bank, @truncate(decoded.operand), false),
         .carry = old_flags.carry,
-    } else self.shiftedRegisterOperand(.{
+    } else self.shiftedOperand(bank, .{
         .register = @truncate(decoded.operand),
         .kind = @truncate(decoded.operand >> 5),
         .amount = if (register_shift)
@@ -1615,10 +1716,10 @@ inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 
             const result = switch (decoded.operation) {
                 .mov => value,
                 .mvn => ~value,
-                .and_, .tst => self.readArmAluRegister(source, register_shift) & value,
-                .eor, .teq => self.readArmAluRegister(source, register_shift) ^ value,
-                .orr => self.readArmAluRegister(source, register_shift) | value,
-                .bic => self.readArmAluRegister(source, register_shift) & ~value,
+                .and_, .tst => self.aluRegister(bank, source, register_shift) & value,
+                .eor, .teq => self.aluRegister(bank, source, register_shift) ^ value,
+                .orr => self.aluRegister(bank, source, register_shift) | value,
+                .bic => self.aluRegister(bank, source, register_shift) & ~value,
                 else => unreachable,
             };
             switch (decoded.operation) {
@@ -1626,7 +1727,7 @@ inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 
                 else => {
                     if (destination == program_counter) {
                         redirect = result;
-                    } else self.writeGeneralRegister(destination, result);
+                    } else self.writeAluRegister(bank, destination, result);
                 },
             }
             if (decoded.set_flags) self.writeFlags(.{
@@ -1637,7 +1738,7 @@ inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 
             });
         },
         .add, .adc, .sub, .sbc, .rsb, .rsc, .cmp, .cmn => {
-            const left = self.readArmAluRegister(source, register_shift);
+            const left = self.aluRegister(bank, source, register_shift);
             const result = switch (decoded.operation) {
                 .add, .cmn => addWithCarry(left, value, false),
                 .adc => addWithCarry(left, value, old_flags.carry),
@@ -1652,7 +1753,7 @@ inline fn executeArmDataProcessing(self: *Cpu, decoded: ArmDataProcessing) ?u32 
                 else => {
                     if (destination == program_counter) {
                         redirect = result.value;
-                    } else self.writeGeneralRegister(destination, result.value);
+                    } else self.writeAluRegister(bank, destination, result.value);
                 },
             }
             if (decoded.set_flags) self.writeFlags(result.flags);
@@ -1678,16 +1779,20 @@ fn addWithCarry(left: u32, right: u32, carry_in: bool) struct { value: u32, flag
 const ShifterResult = struct { value: u32, carry: bool };
 
 fn shiftedRegisterOperand(self: *Cpu, shift: ArmDataProcessing.RegisterShift) ShifterResult {
+    return self.shiftedOperand(.current, shift);
+}
+
+inline fn shiftedOperand(self: *Cpu, comptime bank: ArmAluBank, shift: ArmDataProcessing.RegisterShift) ShifterResult {
     const register_shift = switch (shift.amount) {
         .immediate => false,
         .register => true,
     };
-    const value = self.readArmAluRegister(shift.register, register_shift);
+    const value = self.aluRegister(bank, shift.register, register_shift);
     const kind = shift.kind;
     const amount = switch (shift.amount) {
         .immediate => |count| count,
         .register => |register| blk: {
-            const count: u8 = @truncate(self.readRegister(register));
+            const count: u8 = @truncate(self.aluRegister(bank, register, false));
             // Register shifts by zero preserve carry; they never encode RRX or #32.
             if (count == 0) return .{ .value = value, .carry = self.readFlags().carry };
             if (count < 32) break :blk @as(u5, @intCast(count));
@@ -1776,18 +1881,26 @@ fn activeBank(self: *Cpu) ?[]u32 {
     };
 }
 
-fn readArmAluRegister(self: *Cpu, index: u4, register_shift: bool) u32 {
+inline fn writeAluRegister(self: *Cpu, comptime bank: ArmAluBank, index: u4, value: u32) void {
+    if (bank == .unbanked) self.registers[index] = value else self.writeGeneralRegister(index, value);
+}
+
+inline fn aluRegister(self: *Cpu, comptime bank: ArmAluBank, index: u4, register_shift: bool) u32 {
+    if (bank == .unbanked) {
+        if (index != program_counter) return self.registers[index];
+        return self.instruction_address +% @as(u32, if (register_shift) 12 else 8);
+    }
     // Register-controlled shifts read ALU operands one pipeline cycle later.
     if (index == program_counter and register_shift) return self.instruction_address +% 12;
     return self.readRegister(index);
 }
 
-pub fn readRegister(self: *Cpu, index: u4) u32 {
+pub inline fn readRegister(self: *Cpu, index: u4) u32 {
     if (index == program_counter) {
         const offset: u32 = if (self.cpsr & thumb_bit != 0) 4 else 8;
         return self.instruction_address +% offset;
     }
-    if (index >= 8) {
+    if (index >= 8 and self.mode() != .system) {
         const bank = self.activeBank() orelse return 0;
         const first = 15 - bank.len;
         if (index >= first) return bank[index - first];
@@ -1795,10 +1908,10 @@ pub fn readRegister(self: *Cpu, index: u4) u32 {
     return self.registers[index];
 }
 
-fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
+inline fn writeGeneralRegister(self: *Cpu, index: u4, value: u32) void {
     // PC writes must go through the control-flow path.
     std.debug.assert(index < program_counter);
-    if (index >= 8) {
+    if (index >= 8 and self.mode() != .system) {
         const bank = self.activeBank() orelse return;
         const first = 15 - bank.len;
         if (index >= first) {

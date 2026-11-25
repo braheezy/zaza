@@ -603,6 +603,25 @@ pub inline fn workRamBytes(self: *Bus, comptime T: type, address: u32) ?*[@sizeO
     };
 }
 
+pub inline fn videoRamBytes(self: *Bus, comptime T: type, aligned: u32) ?*[@sizeOf(T)]u8 {
+    const offset = self.vramOffset(aligned) orelse return null;
+    return self.vram[offset..][0..@sizeOf(T)];
+}
+
+/// Contiguous aligned words for a CPU block transfer within a single mapped RAM bank.
+pub fn ramWordSpan(self: *Bus, address: u32, count: u32) ?[]u8 {
+    const aligned = address & ~@as(u32, 3);
+    const tail = switch (aligned >> 24) {
+        0x02 => self.ewram[aligned % ewram_size_bytes ..],
+        0x03 => self.iwram[aligned % iwram_size_bytes ..],
+        0x06 => self.vram[self.vramOffset(aligned) orelse return null ..],
+        else => return null,
+    };
+    const length = count * 4;
+    if (length > tail.len) return null;
+    return tail[0..length];
+}
+
 pub fn readData(self: *Bus, comptime T: type, address: u32) T {
     // The CPU uses the original address to rotate or sign-extend the aligned value.
     const aligned_address = alignDataAddress(T, address);
@@ -668,8 +687,8 @@ pub fn readData(self: *Bus, comptime T: type, address: u32) T {
         return std.mem.readInt(T, self.palette[offset..][0..@sizeOf(T)], .little);
     }
     if (aligned_address >> 24 == vram_base >> 24) {
-        const offset = self.vramOffset(aligned_address) orelse return 0;
-        return std.mem.readInt(T, self.vram[offset..][0..@sizeOf(T)], .little);
+        const bytes = self.videoRamBytes(T, aligned_address) orelse return 0;
+        return std.mem.readInt(T, bytes, .little);
     }
     if (oamOffset(aligned_address)) |offset| {
         return std.mem.readInt(T, self.oam[offset..][0..@sizeOf(T)], .little);
