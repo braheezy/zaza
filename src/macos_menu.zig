@@ -8,7 +8,7 @@ const Selector = *opaque {};
 const send = objc.objc.msgSend;
 const string = ns.String.stringWithUTF8String;
 
-pub const Action = enum(isize) { open_rom, quit };
+pub const Action = enum(isize) { open_rom, toggle_pause, quit };
 
 extern "objc" fn sel_registerName(name: [*:0]const u8) Selector;
 extern "objc" fn objc_allocateClassPair(super: *Class, name: [*:0]const u8, extra: usize) ?*Class;
@@ -21,7 +21,9 @@ fn class(comptime name: []const u8) *Class {
     return objc.objc.ExternClass(name, Id, ns.ObjectInterface, &.{}).class();
 }
 
-pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action) void) !void {
+pause_item: *Id,
+
+pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action) void) !@This() {
     // Register one target for the application's lifetime. Each item's tag selects its action.
     const Target = struct {
         fn invoke(block: *ns.BlockLiteral(@TypeOf(context)), _: *Class, item: *Id) callconv(.c) void {
@@ -39,10 +41,19 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action)
     const bar = send(class("NSMenu"), "new", *Id, .{});
     defer bar.release();
     const application_menu = addSubmenu(bar, "Zaza");
-    addCommand(application_menu, target, action, .quit, "Quit Zaza", "q");
+    _ = addCommand(application_menu, target, action, .quit, "Quit Zaza", "q");
     const file_menu = addSubmenu(bar, "File");
-    addCommand(file_menu, target, action, .open_rom, "Open ROM…", "o");
+    _ = addCommand(file_menu, target, action, .open_rom, "Open ROM…", "o");
+    const emulation = addSubmenu(bar, "Emulation");
+    send(emulation, "setAutoenablesItems:", void, .{false});
+    const pause_item = addCommand(emulation, target, action, .toggle_pause, "Pause", "p");
     send(objc.app_kit.Application.sharedApplication(), "setMainMenu:", void, .{bar});
+    return .{ .pause_item = pause_item };
+}
+
+pub fn updatePause(menu: @This(), loaded: bool, paused: bool) void {
+    send(menu.pause_item, "setEnabled:", void, .{loaded});
+    send(menu.pause_item, "setTitle:", void, .{string(if (paused) "Resume" else "Pause")});
 }
 
 fn addSubmenu(bar: *Id, title: [:0]const u8) *Id {
@@ -55,12 +66,13 @@ fn addSubmenu(bar: *Id, title: [:0]const u8) *Id {
     return menu;
 }
 
-fn addCommand(menu: *Id, target: *Class, selector: Selector, action: Action, title: [:0]const u8, key: [:0]const u8) void {
+fn addCommand(menu: *Id, target: *Class, selector: Selector, action: Action, title: [:0]const u8, key: [:0]const u8) *Id {
     const item = send(menu, "addItemWithTitle:action:keyEquivalent:", *Id, .{
         string(title), selector, string(key),
     });
     send(item, "setTarget:", void, .{target});
     send(item, "setTag:", void, .{@intFromEnum(action)});
+    return item;
 }
 
 /// The selected URL is autoreleased. Consume its filesystem path in the menu callback.

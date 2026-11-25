@@ -55,6 +55,7 @@ const Game = struct {
     machine: *Machine,
     save: ?SaveSession,
     title: [:0]const u8,
+    paused: bool = false,
     first_frame: bool = true,
 
     fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, options: cartridge.Options, audio: ?*Playback) !Game {
@@ -95,6 +96,7 @@ const App = struct {
         .{ mach.Core, .snapshotEnd },
     });
 
+    menu: Menu = undefined,
     config: Config,
     options: cartridge.Options,
     game: ?Game = null,
@@ -139,13 +141,21 @@ const App = struct {
         };
         app.window_id = window_id;
         lockWindowSize(window);
-        try Menu.install(app, performCommand);
+        app.menu = try Menu.install(app, performCommand);
+        app.menu.updatePause(app.game != null, false);
         app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
     }
 
     fn performCommand(app: *App, action: Menu.Action) void {
         switch (action) {
             .quit => app.core.exit(),
+            .toggle_pause => {
+                app.game_mutex.lockUncancelable(app.core.io);
+                defer app.game_mutex.unlock(app.core.io);
+                const game = if (app.game) |*current| current else return;
+                game.paused = !game.paused;
+                app.menu.updatePause(true, game.paused);
+            },
             .open_rom => {
                 const path = Menu.chooseRom() orelse return;
                 app.openRom(path) catch |err| Menu.showOpenError(path, err);
@@ -168,6 +178,7 @@ const App = struct {
         }
         if (app.game) |*current| current.deinit(core.io);
         app.game = next;
+        app.menu.updatePause(true, false);
         // Explicit save options belong to the first successfully opened cartridge.
         app.options.save = .{};
     }
@@ -203,6 +214,7 @@ const App = struct {
         app.game_mutex.lockUncancelable(io);
         defer app.game_mutex.unlock(io);
         const game = if (app.game) |*current| current else return;
+        if (game.paused) return;
         if (game.first_frame) {
             app.keys = .{};
             game.first_frame = false;

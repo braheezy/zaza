@@ -12,6 +12,10 @@ also pass a ROM path at launch. Opening another ROM starts it in the same
 window. Canceling the picker or selecting a file that fails to load keeps the
 current cartridge running.
 
+Choose **Emulation → Pause** or press **⌘P** to freeze the game. Choose
+**Resume** or press **⌘P** again to continue from the same frame. Opening a
+new cartridge starts it running.
+
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
 Live mode plays through the default audio device at 30% volume. Put
