@@ -1436,9 +1436,13 @@ test "frontmost pixel composition matches a fully visible window in every mode" 
     random.random().bytes(&bus.palette);
     // Select every layer and effects outside WIN0. Its vertical range stays inactive.
     bus.writeData(u16, 0x0400_004A, 0x003F);
-    bus.writeData(u16, 0x0400_004C, 0x0023);
     bus.writeData(u16, 0x0400_0050, 0x003F);
-    for (0..4) |bg| bus.writeData(u16, 0x0400_0008 + @as(u32, @intCast(bg * 2)), @intCast(0xC0 | (3 - bg)));
+    // Overlap sprites with all four BG priorities, including across an eight-pixel boundary.
+    for (0..4) |i| {
+        const oam = Bus.oam_base + @as(u32, @intCast(i * 8));
+        bus.writeData(u16, oam + 2, @intCast(4 + i * 6));
+        bus.writeData(u16, oam + 4, @intCast(i * 1024 + i));
+    }
     for (0..6) |mode| {
         bus.writeData(u16, Bus.dispcnt_address, @intCast(0x1F00 | mode));
         var plain = machine.currentDisplay();
@@ -1447,13 +1451,21 @@ test "frontmost pixel composition matches a fully visible window in every mode" 
         windowed.control |= 1 << 13;
         var plain_latch: u16 = 0;
         var windowed_latch: u16 = 0;
-        for ([_]usize{ 0, 5, 47, 159 }) |y| {
-            var actual: [video.width]video.Rgb = undefined;
-            var expected: [video.width]video.Rgb = undefined;
-            plain.renderLine(y, &actual, &plain_latch);
-            windowed.renderLine(y, &expected, &windowed_latch);
-            try std.testing.expectEqualSlices(video.Rgb, &expected, &actual);
-            try std.testing.expectEqual(windowed_latch, plain_latch);
+        for ([_]u16{ 1, 4, 7 }) |mosaic_width| {
+            bus.writeData(u16, 0x0400_004C, 0x0020 | (mosaic_width - 1));
+            for (0..4) |bg| {
+                const address = 0x0400_0008 + @as(u32, @intCast(bg * 2));
+                const priority = if (mosaic_width == 7) 0 else 3 - bg;
+                bus.writeData(u16, address, @intCast(0xC0 | priority | (bg << 8)));
+            }
+            for ([_]usize{ 0, 5, 47, 159 }) |y| {
+                var actual: [video.width]video.Rgb = undefined;
+                var expected: [video.width]video.Rgb = undefined;
+                plain.renderLine(y, &actual, &plain_latch);
+                windowed.renderLine(y, &expected, &windowed_latch);
+                try std.testing.expectEqualSlices(video.Rgb, &expected, &actual);
+                try std.testing.expectEqual(windowed_latch, plain_latch);
+            }
         }
     }
 }

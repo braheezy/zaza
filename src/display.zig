@@ -73,59 +73,87 @@ pub const Display = struct {
         const front_only = self.control & 0xE000 == 0 and self.bg_pixel_mask == null and
             effect.control & 0x3FC0 == 0;
         var pixels: [video.width]PalettePixel = undefined;
-        const indexed = mode == 4 and front_only and self.fetchMode4Row(affine[0], &pixels);
-        if (!indexed) pixels = @splat(.{});
+        const bitmap_row = mode == 4 and front_only and self.fetchMode4Row(affine[0], &pixels);
+        if (!bitmap_row) {
+            pixels = @splat(.{});
+            if (front_only) {
+                for (backgrounds[0..text_count], 0..) |layer, i| {
+                    if (layer) |bg| composeTextRow(&pixels, &text_pixels[i], bg);
+                }
+            }
+        }
         if (self.control & (1 << 12) != 0) self.drawObjects(y, mosaic, &pixels);
 
-        if (indexed) {
-            for (row, pixels) |*output, pixel| output.* = video.decodeColor(pixel.color(self.palette));
+        if (front_only) {
+            if (bitmap_row or (affine[0] == null and affine[1] == null)) {
+                for (row, pixels) |*output, pixel| {
+                    output.* = video.decodeColor(pixel.color(self.palette));
+                }
+            } else {
+                self.composeAffineRow(row, &pixels, affine);
+            }
         } else {
             const backdrop: Pixel = .{
                 .color = readHalf(self.palette, 0),
                 .rank = backdrop_rank,
                 .layer = backdrop_layer,
             };
-            if (front_only) {
-                self.composeFront(row, backgrounds[0..text_count], &text_pixels, affine, &pixels, backdrop);
-            } else {
-                self.composeEffects(row, backgrounds[0..text_count], &text_pixels, affine, &pixels, backdrop, effect);
-            }
+            self.composeEffects(row, backgrounds[0..text_count], &text_pixels, affine, &pixels, backdrop, effect);
         }
         if (self.green_swap) video.swapGreen(row);
     }
 
-    fn composeFront(
+    // Text backgrounds and sprites share a palette address space. Carry the winning
+    // index through both passes so each output pixel needs just one palette lookup.
+    fn composeTextRow(
+        pixels: *[video.width]PalettePixel,
+        indices: *const [video.width]u8,
+        bg: Background,
+    ) void {
+        if (bg.mosaic_width == 1) {
+            // Before sprites are drawn the high bits contain only the BG rank.
+            // Ranks are distinct across layers, so the smaller packed pixel wins.
+            const lanes = 8;
+            const Words = @Vector(lanes, u16);
+            const rank: Words = @splat(@as(u16, @bitCast(PalettePixel{ .rank = bg.rank })));
+            const backdrop: Words = @splat(@as(u16, @bitCast(PalettePixel{})));
+            for (0..@divExact(video.width, lanes)) |group| {
+                const x = group * lanes;
+                const bytes: @Vector(lanes, u8) = indices[x..][0..lanes].*;
+                const index: Words = bytes;
+                const transparent = index == @as(Words, @splat(0));
+                const candidates = @select(u16, transparent, backdrop, rank | index);
+                const previous: Words = @bitCast(pixels[x..][0..lanes].*);
+                pixels[x..][0..lanes].* = @bitCast(@min(previous, candidates));
+            }
+        } else {
+            var x: usize = 0;
+            while (x < video.width) : (x += bg.mosaic_width) {
+                const index = indices[x];
+                if (index == 0) continue;
+                for (pixels[x..@min(video.width, x + bg.mosaic_width)]) |*pixel| {
+                    if (bg.rank < pixel.rank) pixel.* = .{ .index = index, .rank = bg.rank };
+                }
+            }
+        }
+    }
+
+    fn composeAffineRow(
         self: Display,
         row: *[video.width]video.Rgb,
-        backgrounds: []const ?Background,
-        text_pixels: *const [4][video.width]u8,
+        pixels: *const [video.width]PalettePixel,
         affine: [2]?AffineLine,
-        objects: *const [video.width]PalettePixel,
-        backdrop: Pixel,
     ) void {
-        var ranks: [video.width]u8 = @splat(backdrop.rank);
-        var colors: [video.width]u16 = @splat(backdrop.color);
-        for (backgrounds, 0..) |layer, i| {
-            const bg = layer orelse continue;
-            for (&ranks, &colors, 0..) |*rank, *color, x| {
-                if (bg.rank >= rank.*) continue;
-                const sample_x = if (bg.mosaic_width == 1) x else x - x % bg.mosaic_width;
-                const index = text_pixels[i][sample_x];
-                if (index == 0) continue;
-                rank.* = bg.rank;
-                color.* = readHalf(self.palette, @as(usize, index) * 2);
+        for (row, pixels, 0..) |*output, pixel, x| {
+            var rank = pixel.rank;
+            var color = pixel.color(self.palette);
+            for (affine) |layer| {
+                const bg = layer orelse continue;
+                if (bg.rank >= rank) continue;
+                color = bg.pixel(self, x) orelse continue;
+                rank = bg.rank;
             }
-        }
-        for (affine) |layer| {
-            const bg = layer orelse continue;
-            for (&ranks, &colors, 0..) |*rank, *color, x| {
-                if (bg.rank >= rank.*) continue;
-                color.* = bg.pixel(self, x) orelse continue;
-                rank.* = bg.rank;
-            }
-        }
-        for (row, objects, ranks, colors) |*output, object, rank, color| {
-            output.* = video.decodeColor(if (object.rank < rank) object.color(self.palette) else color);
+            output.* = video.decodeColor(color);
         }
     }
 
