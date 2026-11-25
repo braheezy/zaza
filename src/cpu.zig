@@ -1847,7 +1847,24 @@ fn writeFlags(self: *Cpu, flags: Flags) void {
     self.cpsr = (self.cpsr & ~flags_mask) | (@as(u32, bits) << flags_shift);
 }
 
-fn conditionPassed(condition: u4, flags: Flags) bool {
+// Each condition has one bit for each possible NZCV value.
+const condition_masks = blk: {
+    var masks: [16]u16 = @splat(0);
+    for (&masks, 0..) |*mask, condition| {
+        for (0..16) |bits| {
+            const nzcv: u4 = @intCast(bits);
+            if (evaluateCondition(@intCast(condition), @bitCast(nzcv))) mask.* |= @as(u16, 1) << nzcv;
+        }
+    }
+    break :blk masks;
+};
+
+inline fn conditionPassed(condition: u4, flags: Flags) bool {
+    const nzcv: u4 = @bitCast(flags);
+    return (condition_masks[condition] >> nzcv) & 1 != 0;
+}
+
+fn evaluateCondition(condition: u4, flags: Flags) bool {
     return switch (condition) {
         0x0 => flags.zero, // EQ
         0x1 => !flags.zero, // NE
