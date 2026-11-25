@@ -79,6 +79,7 @@ bg_enable_previous: u4 = 0,
 bg_enable_ready: u4 = 0,
 greenswap: u16 = 0,
 display_phase: u64 = 0,
+vblank_irq_delay: u8 = 0,
 // Completed CPU cycles still owed to the devices during a frame run.
 deferred_cycles: u64 = 0,
 // Absolute machine cycle. Zero ends a batch at the current instruction.
@@ -249,6 +250,7 @@ fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
 }
 
 fn advancePeripherals(self: *Bus, cycles: u64) void {
+    self.vblank_irq_delay = @intCast(self.vblank_irq_delay -| cycles);
     self.save.advance(cycles);
     self.advanceTimers(cycles - self.timer_elapsed);
     self.timer_elapsed = 0;
@@ -277,7 +279,12 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
 
     // Detect crossed event boundaries even if the batch ends after the flag fell.
     var events: u14 = 0;
-    if (cycles >= timing.cyclesUntil(old_phase, timing.vblank_start, timing.cycles_per_frame)) {
+    const until_vblank = timing.cyclesUntil(old_phase, timing.vblank_start, timing.cycles_per_frame);
+    if (cycles >= until_vblank) {
+        if (self.dispstat & 8 != 0 and self.irq_flags & 1 == 0) {
+            // IF latches at line 160. IRQ entry follows later, as in mGBA.
+            self.vblank_irq_delay = @intCast(7 -| (cycles - until_vblank));
+        }
         events |= 1;
         self.runDma(.vblank);
     }
@@ -339,7 +346,7 @@ pub fn haltWakeLine(self: *const Bus) bool {
 }
 
 pub fn irqLine(self: *const Bus) bool {
-    const synchronizing = self.peripheral_irq_new | self.peripheral_irq_sync;
+    const synchronizing = self.peripheral_irq_new | self.peripheral_irq_sync | @as(u14, @intFromBool(self.vblank_irq_delay != 0));
     return self.ime_enabled and self.irq_enable & self.irq_flags & ~@as(u16, synchronizing) != 0;
 }
 
@@ -1447,6 +1454,28 @@ test "timed display reads sample both HBlank edges on the data beat" {
     bus.advanceDevices(timing.hblank_start - 2, timing.cycles_per_line - timing.hblank_start + 1);
     bus.instruction_bus_origin = bus.bus_cycles;
     try std.testing.expectEqual(@as(u32, 1 << 16), bus.readData(u32, dispstat_address));
+}
+
+test "VBlank latches IF before IRQ delivery without delaying other sources" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u16, dispstat_address, 8);
+    bus.writeData(u16, ie_address, 3);
+    bus.writeData(u16, ime_address, 1);
+    bus.advanceDevices(timing.vblank_start - 1, 4);
+    try std.testing.expectEqual(@as(u16, 160), bus.readData(u16, vcount_address));
+    try std.testing.expectEqual(@as(u16, 1), bus.irq_flags);
+    try std.testing.expect(!bus.irqLine());
+    bus.requestInterrupt(2);
+    try std.testing.expect(bus.irqLine());
+    bus.writeData(u16, if_address, 2);
+    bus.advanceWithinDisplayInterval(3);
+    try std.testing.expect(!bus.irqLine());
+    bus.advanceWithinDisplayInterval(1);
+    try std.testing.expect(bus.irqLine());
+
+    // An unacknowledged VBlank stays asserted across the following frame.
+    bus.advanceDevices(bus.display_phase, timing.cycles_per_frame - 7);
+    try std.testing.expect(bus.irqLine());
 }
 
 test "display timing updates scanline status and latches each enabled IRQ" {

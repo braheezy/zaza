@@ -193,7 +193,7 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
 // Defer device updates only while every elapsed cycle precedes the first event.
 fn stepBatch(self: *Machine, limit: usize) !usize {
     const bus = &self.bus;
-    if (self.dma_cycles_pending != 0 or bus.halted or bus.immediate_dma_at != null or
+    if (bus.vblank_irq_delay != 0 or self.dma_cycles_pending != 0 or bus.halted or bus.immediate_dma_at != null or
         bus.pending_timer_write != null or bus.peripheral_irq_pending | bus.peripheral_irq_new | bus.peripheral_irq_sync != 0)
     {
         try self.stepTimed();
