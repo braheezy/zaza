@@ -33,6 +33,10 @@ fn buildRom() [right_source_offset + 512]u8 {
     pair(&bytes, &cursor, 0x040000D0, 0xB2000001);
     pair(&bytes, &cursor, 0x04000100, 0x0080FE00); // One sample every 512 clocks.
     pair(&bytes, &cursor, 0x04000104, 0x0080FC00); // Every 1024 clocks.
+    // Stall the CPU long enough for both sound channels to need multiple refills.
+    pair(&bytes, &cursor, 0x040000D4, 0x02000000);
+    pair(&bytes, &cursor, 0x040000D8, 0x06000000);
+    pair(&bytes, &cursor, 0x040000DC, 0x84001000);
     // Zero-initialized table terminator. The ramp continues into the DMA source.
     for (bytes[source_offset..right_source_offset], 0..) |*byte, i| byte.* = @truncate(i + 33);
     for (bytes[right_source_offset..], 0..) |*byte, i| byte.* = 0 -% @as(u8, @truncate(i + 34));

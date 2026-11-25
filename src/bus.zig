@@ -234,7 +234,12 @@ fn advanceTimersAndSerial(self: *Bus, cycles: u64) void {
         self.requestInterrupt(self.peripheral_irq_pending);
         self.peripheral_irq_pending = self.timers.advance(batch) | self.serial.advance(batch);
         if (self.audio.master_enabled) self.audio.psg.advance(batch);
-        if (self.timers.overflowed != 0) self.sound_dma_requests |= self.audio.clockFifos(self.timers.overflowed);
+        if (self.timers.overflowed != 0) {
+            self.sound_dma_requests |= self.audio.clockFifos(self.timers.overflowed);
+            // A long DMA stall can span several FIFO refills before the CPU runs again.
+            if (self.sound_dma_requests != 0 and self.instruction_bus_origin == null and !self.dma_active)
+                self.serviceSoundDma();
+        }
         self.audio.sample_phase +%= @truncate(batch);
         if (self.audio.sample_phase == 0) {
             if (self.audio.capture) |capture| capture.sample(&self.audio);
@@ -247,10 +252,12 @@ fn advancePeripherals(self: *Bus, cycles: u64) void {
     self.save.advance(cycles);
     self.advanceTimers(cycles - self.timer_elapsed);
     self.timer_elapsed = 0;
-    if (self.sound_dma_requests != 0) {
-        self.runDma(.special);
-        self.sound_dma_requests = 0;
-    }
+    if (self.sound_dma_requests != 0) self.serviceSoundDma();
+}
+
+fn serviceSoundDma(self: *Bus) void {
+    self.runDma(.special);
+    self.sound_dma_requests = 0;
 }
 
 // Before the next display edge, VCOUNT and DISPSTAT stay valid.
