@@ -94,6 +94,20 @@ pub const Session = struct {
         self.lock.close(io);
     }
 
+    /// Load the same save under the lock already held by the active cartridge.
+    pub fn reload(
+        self: Session,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        save: *SaveMemory,
+    ) !Session {
+        std.debug.assert(std.mem.eql(u8, self.path, path));
+        if (save.kind == .none) return error.NoSaveMemory;
+        const exists = try Options.readInitial(io, allocator, save, path);
+        return .{ .path = path, .lock = self.lock, .exists = exists };
+    }
+
     pub fn flush(self: *Session, io: std.Io, save: *SaveMemory) !void {
         if (!save.dirty) return;
         var file = try std.Io.Dir.cwd().createFileAtomic(io, self.path, .{

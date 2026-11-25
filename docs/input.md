@@ -189,9 +189,15 @@ Zaza detects save hardware from the ROM's save-type signature. Use
 `eeprom8k`, or `none` to override detection. The `eeprom` setting infers
 capacity from the game's DMA commands or the size of an existing save.
 
-Add `--save /path/to/game.sav` to load and persist the cartridge's raw save
-data. Supply the save options before the command or ROM. Without a save path,
-the cartridge's save data stays in memory for the session.
+The macOS player automatically loads and saves battery data for cartridges
+with save hardware. Files live under
+`~/Library/Application Support/Zaza/Saves/` and are named by the BLAKE3 hash
+of the ROM bytes. Renaming or moving a ROM keeps its save. A changed ROM
+gets a separate file. Cartridges without save hardware skip this storage.
+
+Use `--save /path/to/game.sav` to choose a specific raw save file. Supply
+save options before the command or ROM. In the headless CLI, cartridge save
+data stays in memory unless you supply `--save`.
 
 ```sh
 ./zig-out/bin/zaza --save /path/to/game.sav /path/to/game.gba
@@ -200,7 +206,7 @@ the cartridge's save data stays in memory for the session.
 Zaza writes changed data after a successful capture or on normal window
 exit, and before switching cartridges in the player. The first successfully
 opened ROM uses any `--save` and `--save-type` launch options. Later ROMs use
-automatic save-type detection and keep their saves in memory. Zaza rejects a
+automatic save-type detection and the default save directory. Zaza rejects a
 save whose size does not match the cartridge and uses an adjacent `.lock` file
 to prevent two Zaza sessions from writing the same save.
 
