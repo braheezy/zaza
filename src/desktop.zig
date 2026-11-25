@@ -66,6 +66,7 @@ const Game = struct {
     save: ?SaveSession,
     title: [:0]const u8,
     paused: bool = false,
+    frames_to_advance: u32 = 0,
     states: Store,
     refresh_frame: bool = false,
     first_frame: bool = true,
@@ -215,7 +216,14 @@ const App = struct {
                 defer app.game_mutex.unlock(app.core.io);
                 const game = if (app.game) |*current| current else return;
                 game.paused = !game.paused;
+                if (!game.paused) game.frames_to_advance = 0;
                 app.menu.updatePause(true, game.paused);
+            },
+            .advance_frame => {
+                app.game_mutex.lockUncancelable(app.core.io);
+                defer app.game_mutex.unlock(app.core.io);
+                const game = if (app.game) |*current| current else return;
+                if (game.paused) game.frames_to_advance +|= 1;
             },
             .open_rom => {
                 const path = Menu.chooseRom() orelse return;
@@ -233,6 +241,7 @@ const App = struct {
             .save_state => try game.states.save(core.allocator, core.io, slot, game.machine),
             .load_state => {
                 try game.states.load(core.allocator, core.io, slot, game.machine);
+                game.frames_to_advance = 0;
                 if (app.audio) |audio| audio.discardQueued();
                 game.refresh_frame = true;
             },
@@ -329,7 +338,10 @@ const App = struct {
             app.pending = restored;
             return;
         }
-        if (game.paused) return;
+        if (game.paused) {
+            if (game.frames_to_advance == 0) return;
+            game.frames_to_advance -= 1;
+        }
         if (game.first_frame) {
             app.keys = .{};
             game.first_frame = false;

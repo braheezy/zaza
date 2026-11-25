@@ -263,7 +263,7 @@ The emulator shall support configurable real-time rewind with a navigable histor
 
 Users shall be able to adjust emulation speed independently of the host display refresh rate.
 
-- [ ] **REQ-058 — Frame advance**
+- [x] **REQ-058 — Frame advance**
 
 The emulator shall support advancing execution by individual frames while paused.
 

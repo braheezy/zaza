@@ -8,7 +8,15 @@ const Selector = *opaque {};
 const send = objc.objc.msgSend;
 const string = ns.String.stringWithUTF8String;
 
-pub const Action = enum(isize) { open_rom, toggle_pause, quit, save_state, load_state, delete_state };
+pub const Action = enum(isize) {
+    open_rom,
+    toggle_pause,
+    advance_frame,
+    quit,
+    save_state,
+    load_state,
+    delete_state,
+};
 
 extern "objc" fn sel_registerName(name: [*:0]const u8) Selector;
 extern "objc" fn objc_allocateClassPair(super: *Class, name: [*:0]const u8, extra: usize) ?*Class;
@@ -24,6 +32,7 @@ fn class(comptime name: []const u8) *Class {
 const slots = @import("state_file.zig").slots;
 const SlotItems = struct { save: *Id, load: *Id, delete: ?*Id = null };
 pause_item: *Id,
+advance_frame_item: *Id,
 state_items: [slots]SlotItems,
 
 pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action, usize) void) !@This() {
@@ -52,6 +61,14 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action,
     const emulation = addSubmenu(bar, "Emulation");
     send(emulation, "setAutoenablesItems:", void, .{false});
     const pause_item = addCommand(emulation, target, action, .toggle_pause, "Pause", "p");
+    const advance_frame_item = addCommand(
+        emulation,
+        target,
+        action,
+        .advance_frame,
+        "Advance One Frame",
+        "]",
+    );
     const states = addSubmenu(bar, "States");
     send(states, "setAutoenablesItems:", void, .{false});
     var items: [slots]SlotItems = undefined;
@@ -72,7 +89,7 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action,
             send(item, "setRepresentedObject:", void, .{number});
     }
     send(objc.app_kit.Application.sharedApplication(), "setMainMenu:", void, .{bar});
-    return .{ .pause_item = pause_item, .state_items = items };
+    return .{ .pause_item = pause_item, .advance_frame_item = advance_frame_item, .state_items = items };
 }
 
 pub fn updateStates(menu: *const @This(), occupied: ?[slots]bool) void {
@@ -104,6 +121,7 @@ pub fn confirmChange(comptime verb: [:0]const u8, slot: usize) bool {
 pub fn updatePause(menu: @This(), loaded: bool, paused: bool) void {
     send(menu.pause_item, "setEnabled:", void, .{loaded});
     send(menu.pause_item, "setTitle:", void, .{string(if (paused) "Resume" else "Pause")});
+    send(menu.advance_frame_item, "setEnabled:", void, .{loaded and paused});
 }
 
 fn addSubmenu(bar: *Id, title: [:0]const u8) *Id {

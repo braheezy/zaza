@@ -16,6 +16,10 @@ Choose **Emulation → Pause** or press **⌘P** to freeze the game. Choose
 **Resume** or press **⌘P** again to continue from the same frame. Opening a
 new cartridge starts it running.
 
+While paused, choose **Emulation → Advance One Frame** or press **⌘]**.
+Each command advances one frame, samples the game controls, and leaves the
+game paused on the resulting frame.
+
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
 Live mode plays through the default audio device at 30% volume. Put
