@@ -364,6 +364,7 @@ fn scheduleImmediateDma(self: *Bus, ready: u64) void {
 pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
     self.dma_active = true;
     defer self.dma_active = false;
+    var owns_bus = false;
     for (0..self.dma.channels.len) |index| {
         var channel = self.dma.channels[index];
         if (channel.control & DMA.enable == 0 or channel.trigger() != trigger) continue;
@@ -383,6 +384,12 @@ pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
             self.scheduleImmediateDma(channel.ready_at);
             continue;
         }
+        // Pending channels share one bus takeover before the CPU resumes.
+        if (!owns_bus) {
+            self.bus_cycles += 1;
+            self.cartridge_prefetch.advance(1);
+            owns_bus = true;
+        }
         if (trigger == .immediate or channel.control & (1 << 9) == 0) {
             self.dma.channels[index].control &= ~DMA.enable;
         }
@@ -394,6 +401,10 @@ pub fn runDma(self: *Bus, trigger: DMA.Trigger) void {
         if (channel.control & (1 << 14) != 0) {
             self.requestInterrupt(@as(u14, 1) << @intCast(8 + index));
         }
+    }
+    if (owns_bus) {
+        self.bus_cycles += 1;
+        self.cartridge_prefetch.advance(1);
     }
 }
 
@@ -415,9 +426,6 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
     const eeprom_input = T == u16 and index == 3 and self.hasEepromAt(destination);
     const eeprom_output = T == u16 and index == 3 and self.hasEepromAt(source);
     if (eeprom_input) self.save.beginEepromCommand();
-    // The cartridge can continue prefetching during the DMA entry and exit clocks.
-    self.bus_cycles += 1;
-    self.cartridge_prefetch.advance(1);
     for (0..count) |beat| {
         self.dma_sequential = beat != 0;
         const value: T = if (source < ewram_base) blk: {
@@ -440,8 +448,6 @@ fn transferDma(self: *Bus, comptime T: type, index: usize, channel: DMA.Channel)
         source = (source +% (if (romWindow(source) != null) @sizeOf(T) else source_step)) & DMA.sourceMask(index);
         destination = (destination +% destination_step) & DMA.destinationMask(index);
     }
-    self.bus_cycles += 1;
-    self.cartridge_prefetch.advance(1);
     if (eeprom_input) self.save.finishEepromCommand(count);
     self.dma_bus_word = self.dma.channels[index].data_latch;
     self.dma.channels[index].latched_count = self.dma.channels[index].count;
@@ -1454,6 +1460,26 @@ test "timed display reads sample both HBlank edges on the data beat" {
     bus.advanceDevices(timing.hblank_start - 2, timing.cycles_per_line - timing.hblank_start + 1);
     bus.instruction_bus_origin = bus.bus_cycles;
     try std.testing.expectEqual(@as(u32, 1 << 16), bus.readData(u32, dispstat_address));
+}
+
+test "simultaneous FIFO DMA refills share the bus entry and exit clocks" {
+    var bus: Bus = .{ .rom = &.{} };
+    bus.writeData(u32, DMA.base + 12, ewram_base);
+    bus.writeData(u32, DMA.base + 16, Audio.base + 0x40);
+    bus.writeData(u32, DMA.base + 20, 0xB600_0004);
+    bus.writeData(u32, DMA.base + 24, ewram_base + 16);
+    bus.writeData(u32, DMA.base + 28, Audio.base + 0x44);
+    bus.writeData(u32, DMA.base + 32, 0xB600_0004);
+
+    for ([_]u2{ 0, 1, 3 }, [_]u64{ 0, 30, 58 }) |requests, expected| {
+        const before = bus.bus_cycles;
+        bus.sound_dma_requests = requests;
+        bus.runDma(.special);
+        // Each word takes six EWRAM clocks and one I/O clock.
+        try std.testing.expectEqual(expected, bus.bus_cycles - before);
+    }
+    try std.testing.expectEqual(ewram_base + 32, bus.dma.channels[1].next_source);
+    try std.testing.expectEqual(ewram_base + 32, bus.dma.channels[2].next_source);
 }
 
 test "VBlank latches IF before IRQ delivery without delaying other sources" {
