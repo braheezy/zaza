@@ -88,7 +88,9 @@ fn addDesktop(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opt
     const mach = dep.module("mach");
     const app = frontendModule(b, target, optimize, "src/app.zig", imports);
     app.addImport("mach", mach);
-    app.addImport("objc", mach.import_table.get("objc").?);
+    // Mach adds its Objective-C bridge after Zig fetches the lazy desktop dependencies.
+    app.addImport("objc", mach.import_table.get("objc") orelse return);
+    app.linkFramework("UniformTypeIdentifiers", .{});
     const player = installFrontend(b, desktop, "zaza", app, check);
     runStep(b, "run", "Run the desktop player", b.addRunArtifact(player));
 }

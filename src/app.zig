@@ -18,10 +18,10 @@ pub fn main(init: std.process.Init) !void {
             args = args[2..];
         } else break;
     }
-    if (args.len != 1 or std.mem.startsWith(u8, args[0], "-")) {
-        std.debug.print("Usage: zaza [--bios file] [--boot] [--save file] [--save-type type] [--mute | --volume 0..100] <game.gba>\n", .{});
+    if (args.len > 1 or (args.len == 1 and std.mem.startsWith(u8, args[0], "-"))) {
+        std.debug.print("Usage: zaza [--bios file] [--boot] [--save file] [--save-type type] [--mute | --volume 0..100] [game.gba]\n", .{});
         if (args.len == 1 and std.mem.eql(u8, args[0], "--help")) return;
         return error.InvalidArguments;
     }
-    try @import("desktop.zig").play(init, options, args[0], volume);
+    try @import("desktop.zig").play(init, options, if (args.len == 1) args[0] else null, volume);
 }

@@ -4,8 +4,13 @@ On macOS, build the player and open a cartridge.
 
 ```sh
 zig build desktop -Doptimize=ReleaseFast
-./zig-out/bin/zaza /path/to/game.gba
+./zig-out/bin/zaza
 ```
+
+Choose **File → Open ROM…** or press **⌘O** to pick a `.gba` file. You can
+also pass a ROM path at launch. Opening another ROM starts it in the same
+window. Canceling the picker or selecting a file that fails to load keeps the
+current cartridge running.
 
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
@@ -128,8 +133,11 @@ the cartridge's save data stays in memory for the session.
 ```
 
 Zaza writes changed data after a successful capture or on normal window
-exit. It rejects a save whose size does not match the cartridge and uses
-an adjacent `.lock` file to prevent two Zaza sessions from writing the same save.
+exit, and before switching cartridges in the player. The first successfully
+opened ROM uses any `--save` and `--save-type` launch options. Later ROMs use
+automatic save-type detection and keep their saves in memory. Zaza rejects a
+save whose size does not match the cartridge and uses an adjacent `.lock` file
+to prevent two Zaza sessions from writing the same save.
 
 ## Silent audio testing
 

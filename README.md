@@ -21,8 +21,10 @@ Only requirement is Zig and this project uses [Mach](https://machengine.org/) so
 
 ```
 zig build desktop
-./zig-out/bin/zaza <path to rom>
+./zig-out/bin/zaza
 ```
+
+Choose **File → Open ROM…** (⌘O), or pass a ROM path when launching the player.
 
 For servers and agents, build with `zig build cli` and run
 `./zig-out/bin/zaza-cli session <rom>`. See [headless commands](docs/input.md).
