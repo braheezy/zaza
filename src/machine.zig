@@ -709,6 +709,56 @@ test "Thumb literal loads preserve Game Pak data timing at the end of a cartridg
     }
 }
 
+test "streamed Thumb copy instructions match timed bus and register updates" {
+    const std = @import("std");
+    const rom = [_]u8{
+        0x40, 0xCA, // LDMIA r2!, {r6}
+        0xAE, 0x70, // STRB r6, [r5, #2]
+        0x04, 0xCA, // LDMIA r2!, {r2}: the loaded base wins.
+        0x03, 0xCB, // LDMIA r3!, {r0, r1}
+        0x00, 0xCC, // An empty list loads PC.
+        0,    0, // Align the source words.
+        0x11, 0x22,
+        0x33, 0x44,
+        0x55, 0x66,
+        0x77, 0x88,
+    };
+    const sources = [_]u32{
+        Bus.iwram_base + 1, Bus.ewram_base + 3, Bus.rom_base + 13,
+        Bus.rom_base + 17,  0x0A00_000D,        Bus.ie_address,
+    };
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        for (sources) |address| {
+            var batched: Machine = undefined;
+            batched.initCartridge(&rom);
+            const bus = &batched.bus;
+            bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+            if (address >> 24 == 2 or address >> 24 == 3) {
+                bus.writeData(u32, address, 0x4433_2211);
+                bus.writeData(u32, address + 4, 0x8877_6655);
+            }
+            batched.cpu.cpsr |= 1 << 5;
+            batched.cpu.registers[2] = address;
+            batched.cpu.registers[3] = Bus.rom_base + 12;
+            batched.cpu.registers[4] = Bus.iwram_base + 16;
+            batched.cpu.registers[5] = if (address == Bus.rom_base + 17)
+                Bus.vram_base
+            else
+                Bus.ewram_base + 32;
+            bus.writeData(u32, Bus.iwram_base + 16, Bus.rom_base);
+            batched.cpu.pipeline = bus.fetchThumbPair(Bus.rom_base);
+            var reference = batched;
+            for (0..5) |_| {
+                try std.testing.expectEqual(@as(usize, 1), try batched.stepBatch(1));
+                try reference.stepTimed();
+                try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+                try std.testing.expectEqualDeep(reference.bus, batched.bus);
+                try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+            }
+        }
+    }
+}
+
 test "Thumb decode fault preserves timing of earlier instructions in the batch" {
     const std = @import("std");
     const rom = [_]u8{
