@@ -1383,6 +1383,23 @@ test "Mode 0 composites sprites through window masks, alpha and affine sampling"
     try std.testing.expectEqual(video.decodeColor(0x7C00), frame[4][4]);
 }
 
+test "offscreen sprite columns spend the scanline budget before a sprite wraps into view" {
+    var machine: Machine = undefined;
+    machine.initCartridge(&.{});
+    const bus = &machine.bus;
+    bus.writeData(u16, Bus.dispcnt_address, 0x1020); // OBJ enabled, 954 cycles per line.
+    @memset(bus.vram[0x10000..0x10020], 0x11);
+    bus.writeData(u16, Bus.palette_base + 514, 0x001F);
+
+    // 119 invisible eight-pixel sprites leave two columns for sprite 119.
+    for (0..119) |i| bus.writeData(u32, Bus.oam_base + @as(u32, @intCast(i * 8)), 0x0100_00FF);
+    bus.writeData(u32, Bus.oam_base + 119 * 8, 0x01FF_00FF);
+    var row: [video.width]video.Rgb = undefined;
+    machine.currentDisplay().renderLine(0, &row, &machine.text_bg_latch);
+    try @import("std").testing.expectEqual(video.decodeColor(0x001F), row[0]);
+    for (row[1..]) |pixel| try @import("std").testing.expectEqual(video.decodeColor(0), pixel);
+}
+
 test "frontmost pixel composition matches a fully visible window in every mode" {
     const std = @import("std");
     var machine: Machine = undefined;

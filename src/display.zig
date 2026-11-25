@@ -347,36 +347,55 @@ pub const Display = struct {
 
     fn drawObjects(self: Display, y: usize, mosaic: u16, row: *[video.width]PalettePixel) void {
         var cycles: usize = if (self.control & (1 << 5) != 0) 954 else 1210;
-        for (0..128) |oam_index| {
-            if (cycles == 0) break;
-            const attributes = Object.read(self.oam, oam_index) orelse continue;
-            const relative_y = (y -% @as(usize, @as(u8, @truncate(attributes.first)))) & 255;
-            if (relative_y >= attributes.canvas_height) continue;
+        for (0..16) |group| {
+            var mask = objectCandidates(self.oam, group * 8, @intCast(y));
+            while (mask != 0) : (mask &= mask - 1) {
+                if (cycles == 0) return;
+                const oam_index = group * 8 + @as(usize, @ctz(mask));
+                const attributes = Object.onLine(self.oam, oam_index, y) orelse continue;
+                // Invisible columns still consume the hardware scanline budget.
+                const overhead: usize = if (attributes.matrix != null) 10 else 0;
+                const pixel_cycles: usize = if (attributes.matrix != null) 2 else 1;
+                cycles -|= overhead;
+                const pixels = @min(attributes.canvas_width, cycles / pixel_cycles);
+                cycles -|= attributes.canvas_width * pixel_cycles;
+                self.drawObjectRow(attributes, mosaic, pixels, row);
+            }
+        }
+    }
 
-            const overhead: usize = if (attributes.matrix != null) 10 else 0;
-            const pixel_cycles: usize = if (attributes.matrix != null) 2 else 1;
-            cycles -|= overhead;
-            const pixels = @min(attributes.canvas_width, cycles / pixel_cycles);
-            cycles -|= attributes.canvas_width * pixel_cycles;
-            const use_mosaic = attributes.first & (1 << 12) != 0;
-            const sample_y = if (use_mosaic) relative_y - relative_y % mosaicSize(mosaic, 12) else relative_y;
-            const line = ObjectLine.init(attributes, sample_y);
-            const mosaic_width = if (use_mosaic) mosaicSize(mosaic, 8) else 1;
-            if (mosaic_width == 1) {
-                for (0..pixels) |relative_x| {
+    fn drawObjectRow(self: Display, attributes: Object, mosaic: u16, pixels: usize, row: *[video.width]PalettePixel) void {
+        const relative_y = attributes.line_y;
+        const use_mosaic = attributes.first & (1 << 12) != 0;
+        const sample_y = if (use_mosaic) relative_y - relative_y % mosaicSize(mosaic, 12) else relative_y;
+        const line = ObjectLine.init(attributes, sample_y);
+        const mosaic_width = if (use_mosaic) mosaicSize(mosaic, 8) else 1;
+        if (mosaic_width == 1) {
+            // A sprite is at most 128 pixels wide, so only one visible span can wrap in.
+            var span: ObjectSpan = if (attributes.x < video.width)
+                .{ .first = 0, .end = @min(pixels, video.width - attributes.x) }
+            else
+                .{ .first = 512 - attributes.x, .end = pixels };
+            if (span.first >= span.end) return;
+            if (attributes.matrix != null) {
+                if (!span.clipAxis(line.start_x, line.dx, attributes.width)) return;
+                if (!span.clipAxis(line.start_y, line.dy, attributes.height)) return;
+            }
+            const dest = (attributes.x + span.first) & 511;
+            for (span.first..span.end, row[dest..][0 .. span.end - span.first]) |column, *pixel| {
+                const x: i32 = @intCast(column);
+                const tx: usize = @intCast((line.start_x + line.dx * x) >> 8);
+                const ty: usize = @intCast((line.start_y + line.dy * x) >> 8);
+                const index = self.objectTexel(attributes, tx, ty) orelse continue;
+                pixel.plot(attributes, index);
+            }
+        } else {
+            var start: usize = 0;
+            while (start < pixels) : (start += mosaic_width) {
+                const index = self.objectLinePixel(attributes, line, start) orelse continue;
+                for (start..@min(pixels, start + mosaic_width)) |relative_x| {
                     const x = (attributes.x + relative_x) & 511;
-                    if (x >= video.width) continue;
-                    const index = self.objectLinePixel(attributes, line, relative_x) orelse continue;
-                    row[x].plot(attributes, index);
-                }
-            } else {
-                var start: usize = 0;
-                while (start < pixels) : (start += mosaic_width) {
-                    const index = self.objectLinePixel(attributes, line, start) orelse continue;
-                    for (start..@min(pixels, start + mosaic_width)) |relative_x| {
-                        const x = (attributes.x + relative_x) & 511;
-                        if (x < video.width) row[x].plot(attributes, index);
-                    }
+                    if (x < video.width) row[x].plot(attributes, index);
                 }
             }
         }
@@ -387,8 +406,10 @@ pub const Display = struct {
         const sx = (line.start_x + line.dx * column) >> 8;
         const sy = (line.start_y + line.dy * column) >> 8;
         if (sx < 0 or sy < 0 or sx >= object.width or sy >= object.height) return null;
-        const tx: usize = @intCast(sx);
-        const ty: usize = @intCast(sy);
+        return self.objectTexel(object, @intCast(sx), @intCast(sy));
+    }
+
+    fn objectTexel(self: Display, object: Object, tx: usize, ty: usize) ?usize {
         const tile_units: usize = if (object.eight_bit) 2 else 1;
         const one_dimensional = self.control & (1 << 6) != 0;
         const stride = if (one_dimensional) object.width / 8 * tile_units else 32;
@@ -486,6 +507,20 @@ const Background = struct {
     }
 };
 
+// A regular sprite can cover at most 64 lines, a double-size affine sprite 128.
+// Test eight Y coordinates together. Bit zero is the earliest sprite in OAM.
+fn objectCandidates(oam: *const [1024]u8, first: usize, y: u8) u8 {
+    const Lanes = @Vector(8, u16);
+    var attr: Lanes = undefined;
+    inline for (0..8) |i| attr[i] = readHalf(oam, (first + i) * 8);
+    const style = (attr >> @splat(8)) & @as(Lanes, @splat(3));
+    const distance = (@as(Lanes, @splat(y)) -% attr) & @as(Lanes, @splat(255));
+    const bound = @select(u16, style == @as(Lanes, @splat(3)), @as(Lanes, @splat(128)), @as(Lanes, @splat(64)));
+    const height = @select(u16, style == @as(Lanes, @splat(2)), @as(Lanes, @splat(0)), bound);
+    const bits: Lanes = .{ 1, 2, 4, 8, 16, 32, 64, 128 };
+    return @intCast(@reduce(.Or, @select(u16, distance < height, bits, @as(Lanes, @splat(0)))));
+}
+
 const Object = struct {
     first: u16,
     second: u16,
@@ -495,12 +530,13 @@ const Object = struct {
     height: usize,
     canvas_width: usize,
     canvas_height: usize,
+    line_y: usize,
     rank: u5,
     matrix: ?[4]i16,
     eight_bit: bool,
     mode: u2,
 
-    fn read(oam: []const u8, index: usize) ?Object {
+    fn onLine(oam: []const u8, index: usize, y: usize) ?Object {
         const first = readHalf(oam, index * 8);
         const second = readHalf(oam, index * 8 + 2);
         const third = readHalf(oam, index * 8 + 4);
@@ -516,9 +552,12 @@ const Object = struct {
         };
         const width, const height = sizes[shape][second >> 14];
         const scale: usize = if (double_or_hidden) 2 else 1;
+        const relative_y = (y -% @as(usize, @as(u8, @truncate(first)))) & 255;
+        if (relative_y >= height * scale) return null;
         const matrix_offset = @as(usize, (second >> 9) & 31) * 32;
         return .{
             .first = first,
+            .line_y = relative_y,
             .second = second,
             .third = third,
             .x = second & 511,
@@ -536,6 +575,25 @@ const Object = struct {
             .eight_bit = first & (1 << 13) != 0,
             .mode = mode,
         };
+    }
+};
+
+const ObjectSpan = struct {
+    first: usize,
+    end: usize,
+
+    // Intersect the half-open column span with 0 <= origin + step * column < size * 256.
+    fn clipAxis(span: *ObjectSpan, origin: i32, step: i32, size: usize) bool {
+        const limit = @as(i32, @intCast(size)) << 8;
+        // Reflect negative steps so both endpoints can use the same inequalities.
+        const start = if (step < 0) limit - 1 - origin else origin;
+        const delta: i32 = @intCast(@abs(step));
+        const left = start + delta * @as(i32, @intCast(span.first));
+        const right = start + delta * @as(i32, @intCast(span.end - 1));
+        if (right < 0 or left >= limit) return false;
+        if (left < 0) span.first += @intCast(1 + @divTrunc(-1 - left, delta));
+        if (right >= limit) span.end -= @intCast(1 + @divTrunc(right - limit, delta));
+        return span.first < span.end;
     }
 };
 
@@ -677,6 +735,21 @@ fn tilePixel(vram: []const u8, base: usize, x: usize, y: usize, eight_bit: bool)
     if (eight_bit) return vram[base + y * 8 + x];
     const packed_pixels = vram[base + y * 4 + x / 2];
     return (packed_pixels >> @intCast((x & 1) * 4)) & 15;
+}
+
+test "affine sprite clipping keeps exactly the columns inside the source axis" {
+    const origins = [_]i32{ -16385, -2048, -1, 0, 1, 2047, 2048, 16384 };
+    const steps = [_]i32{ -32768, -257, -256, -1, 0, 1, 255, 256, 32767 };
+    for (origins) |origin| {
+        for (steps) |step| {
+            var span: ObjectSpan = .{ .first = 3, .end = 67 };
+            const visible = span.clipAxis(origin, step, 8);
+            for (3..67) |x| {
+                const source = origin + step * @as(i32, @intCast(x));
+                try std.testing.expectEqual(source >= 0 and source < 8 * 256, visible and x >= span.first and x < span.end);
+            }
+        }
+    }
 }
 
 test "tile row fetches match ordered bus slots through the end of the scanline" {
