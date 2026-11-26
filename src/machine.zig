@@ -702,6 +702,46 @@ test "streamed Thumb execution matches single steps across Game Pak pages and de
     }
 }
 
+test "streamed Thumb calls and stack returns match timed execution" {
+    const std = @import("std");
+    const rom = comptime blk: {
+        var data = [_]u8{0} ** 0x1010;
+        std.mem.writeInt(u16, data[0xFFE..0x1000], 0x46B6, .little); // MOV LR, r6
+        for ([_]u16{ 0xB510, 0xF7FF, 0xF805, 0xBC10, 0xBC01, 0x4700 }, 0..) |op, i| {
+            // Save r4 and LR, call backwards to 0x10, restore, then BX r0.
+            std.mem.writeInt(u16, data[0x1000 + 2 * i ..][0..2], op, .little);
+        }
+        for ([_]u16{ 0xB5FF, 0x242A, 0xBCFF, 0xBC08, 0x4718 }, 0..) |op, i| {
+            // Save all low registers and LR, change r4, then return through r3.
+            std.mem.writeInt(u16, data[0x10 + 2 * i ..][0..2], op, .little);
+        }
+        break :blk data;
+    };
+    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+        // Include a misaligned SP and a stack frame that wraps through an IWRAM mirror.
+        for ([_]u32{ Bus.ewram_base + 0x82, Bus.iwram_base + 0x80, Bus.iwram_base + 0x8010 }) |sp| {
+            var batched: Machine = undefined;
+            batched.initCartridge(&rom);
+            batched.bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+            batched.cpu.cpsr = 0xF2; // Thumb IRQ mode exercises banked SP and LR.
+            batched.cpu.banked.irq[0] = sp;
+            batched.cpu.registers[6] = Bus.rom_base + 0xFFF;
+            batched.cpu.registers[4] = 0x12345678;
+            batched.cpu.instruction_address = Bus.rom_base + 0xFFE;
+            batched.cpu.pipeline = batched.bus.fetchThumbPair(batched.cpu.instruction_address);
+            var reference = batched;
+            // Compare at each instruction first, then let calls span device deadlines.
+            for (0..48) |i| {
+                const count = try batched.stepBatch(if (i < 12) 1 else 17);
+                for (0..count) |_| try reference.stepTimed();
+                try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+                try std.testing.expectEqualDeep(reference.bus, batched.bus);
+                try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+            }
+        }
+    }
+}
+
 test "Thumb literal loads preserve Game Pak data timing at the end of a cartridge" {
     const std = @import("std");
     const rom = [_]u8{

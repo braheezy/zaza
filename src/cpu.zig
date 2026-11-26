@@ -791,13 +791,25 @@ inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u1
     if (opcode >= 0xD000 and opcode < 0xDF00 or opcode == 0xE000) {
         if (opcode != 0xE000 and !conditionPassed(@truncate(opcode >> 8), self.readFlags())) return .{};
         const target = thumbBranchTarget(self.instruction_address + 4, op, opcode == 0xE000);
-        // A window change, unbacked target or refill straddling a Game Pak page
-        // needs the two ordinary bus fetches and their individual wait states.
-        if ((target ^ self.instruction_address) >> 25 != 0 or
-            (target & 0x01FF_FFFF) + 4 > bus.rom.len or target & 0x1_FFFF == 0x1_FFFE)
-            return .{ .flow = .handoff };
-        self.instruction_address = target;
-        return .{ .flow = .branch };
+        return self.branchRomThumb(bus, target);
+    }
+    if (opcode == 0xF000) {
+        self.thumbLinkPrefix(op);
+        return .{};
+    }
+    if (opcode == 0xF800) {
+        const link = (self.instruction_address +% 2) | 1;
+        const branch = self.branchRomThumb(bus, self.thumbLinkTarget(op));
+        if (branch.flow == .branch) self.writeGeneralRegister(link_register, link);
+        return branch;
+    }
+    if (opcode == 0x4700) {
+        const target = self.readRegister(@truncate(op >> 3));
+        if (target & 1 == 0) return .{ .flow = .handoff };
+        return self.branchRomThumb(bus, target & ~@as(u32, 1));
+    }
+    if (opcode == 0xB400 or opcode == 0xB500 or opcode == 0xBC00) {
+        return self.romThumbStack(bus, op, opcode == 0xBC00);
     }
     if (opcode >= 0x4400 and opcode < 0x4700) {
         // High-register ADD and MOV may write PC. CMP only updates flags.
@@ -831,7 +843,7 @@ inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u1
         if (result.flow != .handoff and base != destination) self.registers[base] = address +% 4;
         return result;
     }
-    if (opcode == 0x4700 or opcode >= 0xB100) return .{ .flow = .handoff };
+    if (opcode >= 0xB100) return .{ .flow = .handoff };
     if (opcode == 0x4800) {
         const address = thumbLiteralAddress(self.instruction_address + 4, op);
         return self.loadCartridgeWord(bus, address, @truncate(op >> 8));
@@ -864,6 +876,44 @@ inline fn executeRomThumb(self: *Cpu, bus: anytype, comptime opcode: u16, op: u1
     const before = self.internal_cycles;
     self.executeThumbLowAlu(opcode, op) catch return .{ .flow = .handoff };
     return .{ .extra_cycles = @intCast(self.internal_cycles - before) };
+}
+
+inline fn branchRomThumb(self: *Cpu, bus: anytype, target: u32) ThumbStep {
+    // The streamed refill needs two backed halfwords with the same wait states.
+    if ((target ^ self.instruction_address) >> 25 != 0 or
+        (target & 0x01FF_FFFF) + 4 > bus.rom.len or target & 0x1_FFFF == 0x1_FFFE)
+        return .{ .flow = .handoff };
+    self.instruction_address = target;
+    return .{ .flow = .branch };
+}
+
+fn romThumbStack(self: *Cpu, bus: anytype, op: u16, comptime load: bool) ThumbStep {
+    var list: u8 = @truncate(op);
+    const link = op & 0x100 != 0;
+    const count: u32 = @as(u32, @popCount(list)) + @intFromBool(link);
+    if (count == 0) return .{ .flow = .handoff };
+    const sp = self.readRegister(stack_pointer);
+    const start = if (load) sp else sp -% (count * 4);
+    const region: u8 = @truncate(start >> 24);
+    if (region != 2 and region != 3) return .{ .flow = .handoff };
+    const bytes = bus.ramWordSpan(start, count) orelse return .{ .flow = .handoff };
+    var offset: usize = 0;
+    while (list != 0) : (list &= list - 1) {
+        const reg = @ctz(list);
+        const word = bytes[offset..][0..4];
+        if (load) {
+            self.registers[reg] = std.mem.readInt(u32, word, .little);
+        } else {
+            std.mem.writeInt(u32, word, self.registers[reg], .little);
+        }
+        offset += 4;
+    }
+    if (link) std.mem.writeInt(u32, bytes[offset..][0..4], self.readRegister(link_register), .little);
+    self.writeGeneralRegister(stack_pointer, if (load) sp +% (count * 4) else start);
+    const data_cycles = count * timing.ramAccessCycles(u32, region);
+    if (region == 3) bus.iwram_data_cycles += data_cycles;
+    self.internal_cycles += @intFromBool(load);
+    return .{ .extra_cycles = @intCast(data_cycles + @intFromBool(load)) };
 }
 
 inline fn loadCartridgeWord(self: *Cpu, bus: anytype, address: u32, destination: u3) ThumbStep {
@@ -1158,6 +1208,16 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     return ThumbDispatch(@TypeOf(bus)).table[instruction >> 6](self, bus, instruction);
 }
 
+inline fn thumbLinkPrefix(self: *Cpu, op: u16) void {
+    const displacement: i11 = @bitCast(@as(u11, @truncate(op)));
+    const high: u32 = @bitCast(@as(i32, displacement) * 4096);
+    self.writeGeneralRegister(link_register, self.instruction_address +% 4 +% high);
+}
+
+inline fn thumbLinkTarget(self: *Cpu, op: u16) u32 {
+    return (self.readRegister(link_register) +% (@as(u32, op & 0x7FF) * 2)) & ~@as(u32, 1);
+}
+
 inline fn thumbBranchTarget(pc: u32, instruction: u16, unconditional: bool) u32 {
     const displacement: i32 = if (unconditional)
         @as(i11, @bitCast(@as(u11, @truncate(instruction))))
@@ -1179,8 +1239,6 @@ inline fn stepThumbDecoded(self: *Cpu, bus: anytype, comptime opcode: u16, instr
         self.executeThumbBlockTransfer(bus, instruction, stack_transfer);
         return;
     }
-    const immediate: u11 = @truncate(instruction);
-    const signed_immediate: i32 = @as(i11, @bitCast(immediate));
     var target: ?u32 = null;
     const software_interrupt = opcode >> 8 == 0xDF;
     // BX consumes only the source register field in the Thumb high-register format.
@@ -1200,14 +1258,9 @@ inline fn stepThumbDecoded(self: *Cpu, bus: anytype, comptime opcode: u16, instr
         }
     } else switch (opcode >> 11) {
         0b11100 => target = thumbBranchTarget(pc, instruction, true),
-        0b11110 => {
-            // BL's prefix stores the signed high displacement in the active LR bank.
-            const base = pc +% @as(u32, @bitCast(signed_immediate * 4096));
-            self.writeGeneralRegister(link_register, base);
-        },
+        0b11110 => self.thumbLinkPrefix(instruction),
         0b11111 => {
-            target = (self.readRegister(link_register) +% (@as(u32, immediate) * 2)) &
-                ~@as(u32, 1);
+            target = self.thumbLinkTarget(instruction);
             // Bit zero marks the return address as Thumb for BX.
             self.writeGeneralRegister(link_register, (self.instruction_address +% 2) | 1);
         },
