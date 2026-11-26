@@ -804,19 +804,20 @@ const Effects = struct {
         const alpha = top.rank != below.rank and second_target and
             (top.semitransparent or (mode == 1 and first_target));
         if (!alpha and (!first_target or mode < 2)) return top.color;
-        var result: u16 = 0;
-        for ([_]u4{ 0, 5, 10 }) |shift| {
-            const channel = (top.color >> shift) & 31;
-            const value = if (alpha) blk: {
-                const other = (below.color >> shift) & 31;
-                break :blk @min(31, (channel * self.first + other * self.second) >> 4);
-            } else if (mode == 2)
-                channel + (((31 - channel) * self.brightness) >> 4)
-            else
-                channel - ((channel * self.brightness) >> 4);
-            result |= value << shift;
-        }
-        return result;
+        const Channels = @Vector(4, u16);
+        const shifts: @Vector(4, u4) = .{ 0, 5, 10, 0 };
+        const channels = (@as(Channels, @splat(top.color)) >> shifts) & @as(Channels, @splat(31));
+        const maximum: Channels = @splat(31);
+        const fraction_shift: @Vector(4, u4) = @splat(4);
+        const brightness: Channels = @splat(self.brightness);
+        const values = if (alpha) blk: {
+            const other = (@as(Channels, @splat(below.color)) >> shifts) & @as(Channels, @splat(31));
+            break :blk @min(maximum, (channels * @as(Channels, @splat(self.first)) + other * @as(Channels, @splat(self.second))) >> fraction_shift);
+        } else if (mode == 2)
+            channels + (((maximum - channels) * brightness) >> fraction_shift)
+        else
+            channels - ((channels * brightness) >> fraction_shift);
+        return values[0] | (values[1] << 5) | (values[2] << 10);
     }
 };
 
