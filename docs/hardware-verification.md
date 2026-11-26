@@ -14,3 +14,5 @@ For each result, record the console model, exact ROM build, and observed output.
   clang --target=armv4t-none-eabi -DHEADER_ROM='"test/roms/first.gba"' -c test/vblank-poll/probe.S -o /tmp/vblank-poll.o
   zig objcopy -O binary -j .text /tmp/vblank-poll.o /tmp/vblank-poll.gba
   ```
+
+- [ ] **CPU bus ownership during stereo FIFO DMA.** Bad Apple refills both sound FIFOs from EWRAM on the same timer overflow. Zaza and mGBA each budget 58 clocks for the eight words, but they resume the polling loop at different times when the request arrives partway through an instruction. For a hardware probe, use a free-running timer to timestamp a fixed Thumb instruction sequence with DMA disabled, then repeat with both channels armed and vary the overflow phase. Include a multi-beat load and a register-only instruction to distinguish a stall at the next bus access from a stall at the instruction boundary. Record the timer deltas and disassembly for each phase.
