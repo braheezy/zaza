@@ -978,10 +978,13 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
     var cycles: u64 = 0;
     var last: u64 = 0;
     while (count < limit and cycles < deadline) {
-        // Leave room for either branch displacement and its pipeline refill.
-        if (self.instruction_address < 0x0800_0800 or self.instruction_address >= 0x0DFF_F7FC) break;
+        const pc = self.instruction_address;
+        if (pc < 0x0800_0000 or pc >= 0x0DFF_F7FC) break;
         const queued = self.pipeline orelse break;
         const op: u16 = @truncate(queued[0]);
+        // Near the cartridge entry, leave branches out of ROM to the timed interpreter.
+        if (pc < 0x0800_0800 and (op >> 12 == 0xD or op >> 11 == 28) and
+            thumbBranchTarget(pc + 4, op, op >> 11 == 28) < 0x0800_0000) break;
         if ((queued[0] | queued[1]) < 0x4000) {
             const span = self.runRomAluSpan(bus, u16, limit - count, deadline - cycles - 1);
             if (span.steps != 0) {
@@ -1045,9 +1048,14 @@ inline fn stepReadOnlyThumb(self: *Cpu, bus: anytype, op: u16, cycles_left: u64)
                 self.advanceThumbPipeline(bus, self.instruction_address + 4);
                 self.executeThumbTransfer(bus, transfer);
             } else {
-                if (transfer.operation != .ldrh or !@TypeOf(bus.*).canReadStableDisplay(transfer.address, cycles_left)) return false;
+                if (transfer.operation != .ldrh and transfer.operation != .ldrb) return false;
+                if (!@TypeOf(bus.*).canReadStableDisplay(transfer.address, cycles_left)) return false;
                 self.advanceThumbPipeline(bus, self.instruction_address + 4);
-                self.finishThumbLoad(transfer.register, bus.readStableDisplay(transfer.address));
+                const value = if (transfer.operation == .ldrb)
+                    bus.readStableDisplay(u8, transfer.address)
+                else
+                    bus.readStableDisplay(u16, transfer.address);
+                self.finishThumbLoad(transfer.register, value);
             }
         },
         else => return false,
@@ -1059,7 +1067,7 @@ fn stepThumb(self: *Cpu, bus: anytype, instruction: u16) error{UnsupportedInstru
     return ThumbDispatch(@TypeOf(bus)).table[instruction >> 6](self, bus, instruction);
 }
 
-inline fn thumbBranchTarget(pc: u32, instruction: u16, comptime unconditional: bool) u32 {
+inline fn thumbBranchTarget(pc: u32, instruction: u16, unconditional: bool) u32 {
     const displacement: i32 = if (unconditional)
         @as(i11, @bitCast(@as(u11, @truncate(instruction))))
     else

@@ -554,19 +554,21 @@ test "Thumb polling observes HBlank DMA at the same instruction as single steppi
 
 test "Thumb display polling samples the correct bus beat across display edges" {
     const std = @import("std");
-    const rom = [_]u8{
+    var rom = [_]u8{
         0x08, 0x88, // LDRH r0, [r1]
         0x10, 0x42, // TST r0, r2
         0xFC, 0xD0, // BEQ to LDRH
         0x2A, 0x24, // MOV r4, #42
         0xFE, 0xE7, // B to self
     };
-    const cases = [_]struct { address: u32, mask: u32, edge: u64 }{
+    const cases = [_]struct { address: u32, mask: u32, edge: u64, byte: bool = false }{
         .{ .address = Bus.dispstat_address, .mask = 2, .edge = timing.hblank_start },
         .{ .address = Bus.vcount_address, .mask = 1, .edge = timing.cycles_per_line },
         .{ .address = Bus.dispstat_address, .mask = 1, .edge = timing.vblank_start },
+        .{ .address = Bus.vcount_address, .mask = 0x20, .edge = timing.vblank_start, .byte = true },
     };
     for (cases) |case| {
+        rom[1] = if (case.byte) 0x78 else 0x88; // LDRB or LDRH r0, [r1]
         for ([_]u64{ 2, 11, 13, 200 }) |distance| {
             var batched: Machine = undefined;
             batched.initCartridge(&rom);
@@ -575,7 +577,7 @@ test "Thumb display polling samples the correct bus beat across display edges" {
             batched.next_display_edge = case.edge;
             batched.cpu.registers[1] = case.address;
             batched.cpu.registers[2] = case.mask;
-            const pc = Bus.rom_base + 0x0200_0000;
+            const pc = if (case.byte) Bus.rom_base else Bus.rom_base + 0x0200_0000;
             batched.cpu.cpsr |= 1 << 5;
             batched.cpu.instruction_address = pc;
             batched.cpu.pipeline = .{ batched.bus.fetch16(pc, .nonsequential), batched.bus.fetch16(pc + 2, .sequential) };

@@ -304,17 +304,17 @@ pub fn advanceDevices(self: *Bus, old_phase: u64, cycles: u64) void {
 
 // DISPSTAT and VCOUNT share a word and must describe the same bus beat.
 pub fn canReadStableDisplay(address: u32, cycles_left: u64) bool {
-    // A Thumb LDRH takes at most 9 Game Pak clocks, one prefetch stop
+    // A Thumb status load takes at most 9 Game Pak clocks, one prefetch stop
     // clock, one I/O clock and one internal clock.
     return (address == dispstat_address or address == vcount_address) and cycles_left > 12;
 }
 
-/// Called inside a CPU run only when the entire halfword load precedes the
+/// Called inside a CPU run only when the entire load precedes the
 /// next event. DISPSTAT and VCOUNT are constant throughout that interval.
-pub fn readStableDisplay(self: *Bus, address: u32) u16 {
+pub fn readStableDisplay(self: *Bus, comptime T: type, address: u32) T {
     std.debug.assert(address == dispstat_address or address == vcount_address);
-    self.chargeDataAccess(u16, address);
-    return wordLane(u16, self.displayStatusAt(self.display_phase), address);
+    self.chargeDataAccess(T, address);
+    return wordLane(T, self.displayStatusAt(self.display_phase), address);
 }
 
 fn displayStatusAt(self: *const Bus, phase: u64) u32 {
