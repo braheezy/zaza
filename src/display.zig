@@ -411,14 +411,26 @@ pub const Display = struct {
             const first = 8 -| dot;
             const dest = dot -| 8;
             if (dest >= pixels.len) continue;
-            var indices: [8]u8 = undefined;
-            inline for (0..8) |x| {
-                const raw = if (bits == 8) bytes[x] else (bytes[x / 2] >> (x % 2 * 4)) & 15;
-                const bank: u8 = if (bits == 4 and raw != 0) @truncate(entry >> 8 & 0xF0) else 0;
-                indices[if (flip) 7 - x else x] = raw | bank;
+            var indices: @Vector(8, u8) = undefined;
+            if (bits == 8) {
+                indices = bytes.*;
+            } else {
+                const packed_bytes: @Vector(4, u8) = bytes.*;
+                const repeated = @shuffle(u8, packed_bytes, undefined, [8]i32{ 0, 0, 1, 1, 2, 2, 3, 3 });
+                const raw = (repeated >> @as(@Vector(8, u3), .{ 0, 4, 0, 4, 0, 4, 0, 4 })) & @as(@Vector(8, u8), @splat(15));
+                const bank: @Vector(8, u8) = @splat(@truncate(entry >> 8 & 0xF0));
+                indices = @select(u8, raw == @as(@Vector(8, u8), @splat(0)), raw, raw | bank);
             }
-            const count = @min(8 - first, pixels.len - dest);
-            @memcpy(pixels[dest..][0..count], indices[first..][0..count]);
+            if (flip) indices = @shuffle(u8, indices, undefined, [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 });
+            const decoded: [8]u8 = indices;
+            // Interior tiles always write eight pixels. Only the two screen
+            // edges need clipping, keeping variable-length copies out of the row.
+            if (first == 0 and dest + 8 <= pixels.len) {
+                pixels[dest..][0..8].* = decoded;
+            } else {
+                const count = @min(8 - first, pixels.len - dest);
+                for (0..count) |x| pixels[dest + x] = decoded[first + x];
+            }
         }
         return true;
     }
