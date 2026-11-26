@@ -65,12 +65,9 @@ pub fn clockFifos(self: *Audio, overflowed: u4) u2 {
         if (control & 3 == 0) continue;
         const timer: u1 = @truncate(control >> 2);
         if (overflowed & (@as(u4, 1) << timer) == 0) continue;
-        if (fifo.count != 0) {
-            fifo.sample = @bitCast(fifo.bytes[fifo.head]);
-            fifo.head +%= 1;
-            fifo.count -= 1;
-        }
-        if (fifo.count <= 16) requests |= @as(u2, 1) << @intCast(i);
+        // The refill decision sees queued words before the output stage takes one.
+        if (fifo.count <= 3 * @sizeOf(u32)) requests |= @as(u2, 1) << @intCast(i);
+        fifo.clock();
     }
     return requests;
 }
@@ -80,6 +77,25 @@ const Fifo = struct {
     sample: i8 = 0,
     bytes: [32]u8 = @splat(0),
     count: u8 = 0,
+
+    output_word: u32 = 0,
+    output_bytes: u3 = 0,
+
+    fn clock(self: *Fifo) void {
+        if (self.output_bytes == 0) {
+            self.output_bytes = @intCast(@min(self.count, @sizeOf(u32)));
+            for (0..self.output_bytes) |i| {
+                self.output_word |= @as(u32, self.bytes[self.head]) << @intCast(i * 8);
+                self.head +%= 1;
+            }
+            self.count -= self.output_bytes;
+        }
+        if (self.output_bytes != 0) {
+            self.sample = @bitCast(@as(u8, @truncate(self.output_word)));
+            self.output_word >>= 8;
+            self.output_bytes -= 1;
+        }
+    }
 
     fn push(self: *Fifo, comptime T: type, value: T) void {
         for (0..@sizeOf(T)) |lane| {
@@ -293,5 +309,26 @@ test "noise feedback repeats at 127 or 32767 clocks and retrigger reseeds it" {
         audio.psg.advance(96);
         audio.write(u8, base + 29, 0x80);
         try std.testing.expectEqual(@as(u15, 0x7FFF), audio.psg.lfsr);
+    }
+}
+
+test "Direct Sound requests DMA before fetching the next output word" {
+    var audio: Audio = .{ .master_enabled = true, .direct_control = 0x0300 };
+    const fifo_address = base + fifo_start;
+    for (0..35) |tick| {
+        const request = audio.clockFifos(1);
+        const refill = tick == 0 or tick == 2 or tick == 18 or tick == 34;
+        try std.testing.expectEqual(@intFromBool(refill), request);
+        if (refill) {
+            const start: u8 = switch (tick) {
+                0 => 1,
+                2 => 17,
+                18 => 33,
+                34 => 49,
+                else => unreachable,
+            };
+            for (0..16) |offset| audio.write(u8, fifo_address, start + @as(u8, @intCast(offset)));
+        }
+        try std.testing.expectEqual(@as(i8, @intCast(tick)), audio.fifos[0].sample);
     }
 }
