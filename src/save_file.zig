@@ -73,7 +73,7 @@ pub const Options = struct {
             io,
             path,
             allocator,
-            .limited(SaveMemory.Kind.flash128.size()),
+            .limited(SaveMemory.Kind.flash128.size() + 1),
         ) catch |err| switch (err) {
             error.FileNotFound => return false,
             error.StreamTooLong => return error.InvalidSaveSize,
