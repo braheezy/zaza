@@ -9,6 +9,7 @@ const send = objc.objc.msgSend;
 const string = ns.String.stringWithUTF8String;
 
 pub const Action = enum(isize) {
+    toggle_mute,
     open_rom,
     save_screenshot,
     toggle_pause,
@@ -36,6 +37,7 @@ pause_item: *Id,
 advance_frame_item: *Id,
 screenshot_item: *Id,
 state_items: [slots]SlotItems,
+mute_item: *Id,
 
 pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action, usize) void) !@This() {
     // Register one target for the application's lifetime. Each item's tag selects its action.
@@ -80,6 +82,9 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action,
         "Advance One Frame",
         "]",
     );
+    const audio = addSubmenu(bar, "Audio");
+    send(audio, "setAutoenablesItems:", void, .{false});
+    const mute_item = addCommand(audio, target, action, .toggle_mute, "Mute Audio", "");
     const states = addSubmenu(bar, "States");
     send(states, "setAutoenablesItems:", void, .{false});
     var items: [slots]SlotItems = undefined;
@@ -105,7 +110,13 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action,
         .advance_frame_item = advance_frame_item,
         .screenshot_item = screenshot_item,
         .state_items = items,
+        .mute_item = mute_item,
     };
+}
+
+pub fn updateMute(menu: @This(), muted: ?bool) void {
+    send(menu.mute_item, "setEnabled:", void, .{muted != null});
+    send(menu.mute_item, "setState:", void, .{@as(isize, @intFromBool(muted orelse false))});
 }
 
 pub fn updateStates(menu: *const @This(), occupied: ?[slots]bool) void {

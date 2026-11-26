@@ -27,7 +27,9 @@ contains the game pixels without the FPS overlay or window scaling.
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
 Live mode plays through the default audio device at 30% volume. Put
-`--volume 5` before the ROM path for a quiet sound test, or `--mute` for silence.
+`--volume 5` before the ROM path for a quiet sound test, or `--mute` to start
+muted. Choose **Audio → Mute Audio** to toggle sound during play. Unmuting
+restores the configured volume, or 30% if the player started muted.
 
 | GBA button | Keyboard |
 | --- | --- |

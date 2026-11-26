@@ -33,11 +33,9 @@ pub fn play(init: std.process.Init, options: cartridge.Options, path: ?[]const u
     var playback: Playback = undefined;
     var live_audio: ?*Playback = null;
     defer if (live_audio) |audio| audio.deinit();
-    if (volume != 0) {
-        if (playback.init(init.gpa, volume)) {
-            live_audio = &playback;
-        } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
-    }
+    if (playback.init(init.gpa, volume)) {
+        live_audio = &playback;
+    } else |err| std.log.warn("audio output unavailable ({s}), continuing muted", .{@errorName(err)});
 
     var modules: Modules = undefined;
     try modules.init(init.gpa, init.io);
@@ -197,6 +195,7 @@ const App = struct {
         app.window_id = window_id;
         lockWindowSize(window);
         app.menu = try Menu.install(app, performCommand);
+        app.menu.updateMute(if (app.audio) |audio| audio.muted.load(.monotonic) else null);
         app.menu.updateStates(if (app.game) |game| game.states.occupied else null);
         app.menu.updateGameControls(app.game != null, false);
         app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
@@ -204,6 +203,12 @@ const App = struct {
 
     fn performCommand(app: *App, action: Menu.Action, slot: usize) void {
         switch (action) {
+            .toggle_mute => {
+                const audio = app.audio orelse return;
+                const muted = !audio.muted.load(.monotonic);
+                audio.muted.store(muted, .monotonic);
+                app.menu.updateMute(muted);
+            },
             .save_state, .load_state, .delete_state => {
                 const game = if (app.game) |*current| current else return;
                 if (action == .delete_state and !Menu.confirmChange("Delete", slot)) return;
