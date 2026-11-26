@@ -10,6 +10,7 @@ const string = ns.String.stringWithUTF8String;
 
 pub const Action = enum(isize) {
     open_rom,
+    save_screenshot,
     toggle_pause,
     advance_frame,
     quit,
@@ -33,6 +34,7 @@ const slots = @import("state_file.zig").slots;
 const SlotItems = struct { save: *Id, load: *Id, delete: ?*Id = null };
 pause_item: *Id,
 advance_frame_item: *Id,
+screenshot_item: *Id,
 state_items: [slots]SlotItems,
 
 pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action, usize) void) !@This() {
@@ -58,6 +60,15 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action,
     _ = addCommand(application_menu, target, action, .quit, "Quit Zaza", "q");
     const file_menu = addSubmenu(bar, "File");
     _ = addCommand(file_menu, target, action, .open_rom, "Open ROM…", "o");
+    send(file_menu, "setAutoenablesItems:", void, .{false});
+    const screenshot_item = addCommand(
+        file_menu,
+        target,
+        action,
+        .save_screenshot,
+        "Save Screenshot…",
+        "",
+    );
     const emulation = addSubmenu(bar, "Emulation");
     send(emulation, "setAutoenablesItems:", void, .{false});
     const pause_item = addCommand(emulation, target, action, .toggle_pause, "Pause", "p");
@@ -89,7 +100,12 @@ pub fn install(context: anytype, comptime perform: fn (@TypeOf(context), Action,
             send(item, "setRepresentedObject:", void, .{number});
     }
     send(objc.app_kit.Application.sharedApplication(), "setMainMenu:", void, .{bar});
-    return .{ .pause_item = pause_item, .advance_frame_item = advance_frame_item, .state_items = items };
+    return .{
+        .pause_item = pause_item,
+        .advance_frame_item = advance_frame_item,
+        .screenshot_item = screenshot_item,
+        .state_items = items,
+    };
 }
 
 pub fn updateStates(menu: *const @This(), occupied: ?[slots]bool) void {
@@ -118,10 +134,11 @@ pub fn confirmChange(comptime verb: [:0]const u8, slot: usize) bool {
     return send(alert, "runModal", isize, .{}) == 1001;
 }
 
-pub fn updatePause(menu: @This(), loaded: bool, paused: bool) void {
+pub fn updateGameControls(menu: @This(), loaded: bool, paused: bool) void {
     send(menu.pause_item, "setEnabled:", void, .{loaded});
     send(menu.pause_item, "setTitle:", void, .{string(if (paused) "Resume" else "Pause")});
     send(menu.advance_frame_item, "setEnabled:", void, .{loaded and paused});
+    send(menu.screenshot_item, "setEnabled:", void, .{loaded});
 }
 
 fn addSubmenu(bar: *Id, title: [:0]const u8) *Id {
@@ -149,6 +166,20 @@ pub fn chooseRom() ?[]const u8 {
     send(panel, "setTitle:", void, .{string("Open ROM")});
     const gba = send(class("UTType"), "typeWithFilenameExtension:", *Id, .{string("gba")});
     send(panel, "setAllowedContentTypes:", void, .{send(class("NSArray"), "arrayWithObject:", *Id, .{gba})});
+    if (send(panel, "runModal", isize, .{}) != 1) return null;
+    const url = send(panel, "URL", *ns.URL, .{});
+    return std.mem.span(url.fileSystemRepresentation());
+}
+
+/// The save panel confirms replacements and restricts the destination to PNG.
+pub fn chooseScreenshotPath() ?[]const u8 {
+    const panel = send(class("NSSavePanel"), "savePanel", *Id, .{});
+    send(panel, "setTitle:", void, .{string("Save Screenshot")});
+    send(panel, "setNameFieldStringValue:", void, .{string("Screenshot.png")});
+    send(panel, "setAllowsOtherFileTypes:", void, .{false});
+    const png = send(class("UTType"), "typeWithFilenameExtension:", *Id, .{string("png")});
+    const types = send(class("NSArray"), "arrayWithObject:", *Id, .{png});
+    send(panel, "setAllowedContentTypes:", void, .{types});
     if (send(panel, "runModal", isize, .{}) != 1) return null;
     const url = send(panel, "URL", *ns.URL, .{});
     return std.mem.span(url.fileSystemRepresentation());

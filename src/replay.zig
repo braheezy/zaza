@@ -3,18 +3,9 @@ const zaza = @import("libzaza");
 const wav = @import("wav.zig");
 const Machine = @import("libzaza").Emulator;
 const video = @import("libzaza").video;
-const bmp = @import("bmp.zig");
+const screenshot = @import("screenshot.zig");
 const input = @import("libzaza").input;
 const cartridge = @import("cartridge.zig");
-
-pub fn writeBitmap(io: std.Io, path: []const u8, frame: *const video.Frame) !void {
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
-    defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var file_writer = file.writer(io, &buffer);
-    try bmp.write(&file_writer.interface, frame);
-    try file_writer.interface.flush();
-}
 
 pub fn replayInput(
     io: std.Io,
@@ -70,7 +61,7 @@ pub fn replayInput(
     }
     var frame: video.Frame = undefined;
     try machine.snapshotFrame(&frame);
-    try writeBitmap(io, args[2], &frame);
+    try screenshot.write(io, arena, args[2], &frame, .exclusive);
     if (wav_file) |*file| {
         try writer.interface.flush();
         try file.file.writePositionalAll(io, &wav.header(capture.bytes), 0);

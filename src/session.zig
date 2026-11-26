@@ -3,7 +3,7 @@ const cartridge = @import("cartridge.zig");
 const zaza = @import("libzaza");
 const input = zaza.input;
 const video = zaza.video;
-const replay = @import("replay.zig");
+const screenshot = @import("screenshot.zig");
 
 const transcript_version = "zaza-session 1";
 const Digest = [32]u8;
@@ -67,7 +67,7 @@ pub fn run(
                     try replyError(&writer.interface, err);
                     continue;
                 };
-                replay.writeBitmap(init.io, output, &pixels) catch |err| {
+                screenshot.write(init.io, init.gpa, output, &pixels, .exclusive) catch |err| {
                     try replyError(&writer.interface, err);
                     continue;
                 };
@@ -92,7 +92,7 @@ pub fn replayTranscript(
     init: std.process.Init,
     options: cartridge.Options,
     rom_path: []const u8,
-    paths: struct { transcript: []const u8, bitmap: ?[]const u8 },
+    paths: struct { transcript: []const u8, image: ?[]const u8 },
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(init.io, paths.transcript, .{});
     defer file.close(init.io);
@@ -122,9 +122,9 @@ pub fn replayTranscript(
             const expected_footer = try transcriptFooter(&footer_buffer, state.frame, digest);
             if (!std.mem.eql(u8, line, expected_footer)) return error.TranscriptResultMismatch;
             if (try reader.takeDelimiter('\n') != null) return error.TrailingTranscriptData;
-            if (paths.bitmap) |output| {
+            if (paths.image) |output| {
                 if (digest == null) return error.UnsupportedDisplayMode;
-                try replay.writeBitmap(init.io, output, &pixels);
+                try screenshot.write(init.io, init.gpa, output, &pixels, .exclusive);
             }
             var stdout_buffer: [256]u8 = undefined;
             var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);

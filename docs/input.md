@@ -20,6 +20,10 @@ While paused, choose **Emulation → Advance One Frame** or press **⌘]**.
 Each command advances one frame, samples the game controls, and leaves the
 game paused on the resulting frame.
 
+Choose **File → Save Screenshot…** to capture the current game frame as a
+240×160 PNG. Zaza captures the frame before opening the save dialog. The image
+contains the game pixels without the FPS overlay or window scaling.
+
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
 Live mode plays through the default audio device at 30% volume. Put
@@ -100,7 +104,7 @@ screen or chooses an action. Send one newline-terminated command at a time.
 | --- | --- |
 | `step 60 none` | Advance 60 frames with all buttons released. |
 | `step 4 Right A` | Hold exactly Right and A for four frames. |
-| `screen /tmp/turn-1.bmp` | Write the current 240×160 framebuffer to a fresh path without advancing. |
+| `screen /tmp/turn-1.png` | Write the current 240×160 framebuffer to a fresh path without advancing. Use `.bmp` for BMP. |
 | `checkpoint` | Remember the machine and frame number in the session’s single in-memory slot. A later checkpoint replaces it. |
 | `restore` | Return to the remembered frame. The checkpoint remains available until replaced or the session exits. |
 | `quit` or end of input | Flush any configured cartridge save and exit. |
@@ -119,13 +123,13 @@ then restores the checkpoint and tries another.
 ```sh
 printf 'step 2 none\ncheckpoint\nstep 4 Right A\nrestore\nstep 3 Left\nquit\n' |
   zig-out/bin/zaza-cli session game.gba --record attempt.zaza-session
-zig-out/bin/zaza-cli replay-session game.gba attempt.zaza-session final.bmp
+zig-out/bin/zaza-cli replay-session game.gba attempt.zaza-session final.png
 ```
 
 The transcript is published on `quit` or end of input and requires a fresh
 path. It contains successful `step`, `checkpoint`, and `restore` commands in
 order. `screen` commands and their output paths are omitted. Replay prints one
-`ok <current frame>` after verification. Omit the BMP path to verify without
+`ok <current frame>` after verification. Omit the image path to verify without
 writing an image.
 
 The transcript stores the boot mode, save type, and BLAKE3 digests of the ROM,
@@ -140,7 +144,7 @@ those fields in this order: boot mode, ROM digest, BIOS digest, save type, save
 digest. The final `end` line stores the frame number and a BLAKE3 digest of
 row-major RGB bytes, or `unavailable` if the display mode could not be captured.
 Replay checks the starting fields and final result before writing the optional
-BMP. ROM, BIOS, and save contents stay outside the transcript.
+image. ROM, BIOS, and save contents stay outside the transcript.
 
 ## Headless execution
 
@@ -167,7 +171,9 @@ everything and spaces to hold multiple buttons, such as `12 Right A`.
 Names are case-insensitive. Frame numbers must increase, and all rows must
 fall within the requested frame count. Blank lines and `#` comments are allowed.
 
-The runner writes a native-resolution BMP after the requested number of frames.
+The runner writes a native-resolution image after the requested number of frames.
+For `replay`, `replay-session`, `snapshot`, and `demo`, use a `.png` output path
+for PNG. Other extensions keep the default BMP format.
 Modes 0 through 5 capture each visible scanline before HBlank DMA. The instruction-count
 viewer instead renders the current register and memory values as one image.
 Give each run a fresh output path to avoid overwriting a previous capture. The

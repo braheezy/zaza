@@ -13,6 +13,7 @@ const Menu = @import("macos_menu.zig");
 const SaveFile = @import("save_file.zig");
 const SaveSession = SaveFile.Session;
 const Fps = @import("fps.zig");
+const screenshot = @import("screenshot.zig");
 
 const frame_period_ns = @import("libzaza").frame_period_ns;
 const window_scale = 3;
@@ -197,7 +198,7 @@ const App = struct {
         lockWindowSize(window);
         app.menu = try Menu.install(app, performCommand);
         app.menu.updateStates(if (app.game) |game| game.states.occupied else null);
-        app.menu.updatePause(app.game != null, false);
+        app.menu.updateGameControls(app.game != null, false);
         app.app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app);
     }
 
@@ -217,7 +218,7 @@ const App = struct {
                 const game = if (app.game) |*current| current else return;
                 game.paused = !game.paused;
                 if (!game.paused) game.frames_to_advance = 0;
-                app.menu.updatePause(true, game.paused);
+                app.menu.updateGameControls(true, game.paused);
             },
             .advance_frame => {
                 app.game_mutex.lockUncancelable(app.core.io);
@@ -229,7 +230,25 @@ const App = struct {
                 const path = Menu.chooseRom() orelse return;
                 app.openRom(path) catch |err| Menu.showError("Couldn’t open the ROM", path, err);
             },
+            .save_screenshot => {
+                var frame: video.Frame = undefined;
+                app.captureScreenshot(&frame) catch |err| {
+                    Menu.showError("Couldn’t capture the screenshot", "Screenshot.png", err);
+                    return;
+                };
+                const path = Menu.chooseScreenshotPath() orelse return;
+                screenshot.write(app.core.io, app.core.allocator, path, &frame, .replace) catch |err|
+                    Menu.showError("Couldn’t save the screenshot", path, err);
+            },
         }
+    }
+
+    fn captureScreenshot(app: *App, frame: *video.Frame) !void {
+        const io = app.core.io;
+        app.game_mutex.lockUncancelable(io);
+        defer app.game_mutex.unlock(io);
+        const game = if (app.game) |*current| current else return error.NoCartridge;
+        try game.machine.snapshotFrame(frame);
     }
 
     fn stateCommand(app: *App, action: Menu.Action, slot: usize) !void {
@@ -292,7 +311,7 @@ const App = struct {
         if (app.game) |*current| current.deinit(core.io);
         app.game = next;
         app.menu.updateStates(next.states.occupied);
-        app.menu.updatePause(true, false);
+        app.menu.updateGameControls(true, false);
         // Explicit save options belong to the first successfully opened cartridge.
         app.options.save = .{};
     }
