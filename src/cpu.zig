@@ -964,12 +964,12 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
     edge_cycles: u64,
 } {
     const start_pc = self.instruction_address;
-    const registers = self.registers[0..8].*;
-    const flags = self.cpsr;
-    const pipeline = self.pipeline;
-    const fifo = bus.cartridge_prefetch;
-    const latch = bus.prefetch_word;
-    const nonsequential = bus.next_fetch_nonsequential;
+    var registers = self.registers[0..8].*;
+    var flags = self.cpsr;
+    var pipeline = self.pipeline;
+    var fifo = bus.cartridge_prefetch;
+    var latch = bus.prefetch_word;
+    var nonsequential = bus.next_fetch_nonsequential;
     const start_bus = bus.bus_cycles;
     const start_internal = self.internal_cycles;
     const start_rom = bus.rom_fetch_cycles;
@@ -977,6 +977,12 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
     var count: usize = 0;
     var cycles: u64 = 0;
     var last: u64 = 0;
+    var loop_steps: usize = 0;
+    var loop_cycles: u64 = 0;
+    var loop_bus = start_bus;
+    var loop_internal = start_internal;
+    var loop_rom = start_rom;
+    var loop_iwram = start_iwram;
     while (count < limit and cycles < deadline) {
         const pc = self.instruction_address;
         if (pc < 0x0800_0000 or pc >= 0x0DFF_F7FC) break;
@@ -1012,13 +1018,30 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
             std.meta.eql(self.pipeline, pipeline) and std.meta.eql(bus.cartridge_prefetch, fifo) and
             bus.next_fetch_nonsequential == nonsequential and bus.prefetch_word == latch)
         {
-            const repeats = @min((deadline - 1 - cycles) / cycles, (limit - count) / count);
-            bus.bus_cycles += (bus.bus_cycles - start_bus) * repeats;
-            bus.rom_fetch_cycles += (bus.rom_fetch_cycles - start_rom) * repeats;
-            bus.iwram_data_cycles += (bus.iwram_data_cycles - start_iwram) * repeats;
-            self.internal_cycles += (self.internal_cycles - start_internal) * repeats;
-            count += count * repeats;
-            cycles += cycles * repeats;
+            const iteration_cycles = cycles - loop_cycles;
+            const iteration_steps = count - loop_steps;
+            const repeats = @min((deadline - 1 - cycles) / iteration_cycles, (limit - count) / iteration_steps);
+            bus.bus_cycles += (bus.bus_cycles - loop_bus) * repeats;
+            bus.rom_fetch_cycles += (bus.rom_fetch_cycles - loop_rom) * repeats;
+            bus.iwram_data_cycles += (bus.iwram_data_cycles - loop_iwram) * repeats;
+            self.internal_cycles += (self.internal_cycles - loop_internal) * repeats;
+            count += iteration_steps * repeats;
+            cycles += iteration_cycles * repeats;
+        }
+        if (self.instruction_address == start_pc) {
+            // Entry flags and prefetch state may settle during the first iteration.
+            registers = self.registers[0..8].*;
+            flags = self.cpsr;
+            pipeline = self.pipeline;
+            fifo = bus.cartridge_prefetch;
+            latch = bus.prefetch_word;
+            nonsequential = bus.next_fetch_nonsequential;
+            loop_steps = count;
+            loop_cycles = cycles;
+            loop_bus = bus.bus_cycles;
+            loop_internal = self.internal_cycles;
+            loop_rom = bus.rom_fetch_cycles;
+            loop_iwram = bus.iwram_data_cycles;
         }
     }
     if (count != 0) {

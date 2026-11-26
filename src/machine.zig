@@ -516,39 +516,54 @@ test "IWRAM ARM batch stops after switching to Thumb" {
 
 test "Thumb polling observes HBlank DMA at the same instruction as single stepping" {
     const std = @import("std");
-    const rom = [_]u8{
-        0x08, 0x68, // LDR r0, [r1]
-        0x00, 0x28, // CMP r0, #0
-        0xFC, 0xD0, // BEQ to LDR
-        0x2A, 0x24, // MOV r4, #42
-        0xFE, 0xE7, // B to self
+    const roms = [_][]const u8{
+        &.{
+            0x08, 0x68, // LDR r0, [r1]
+            0x00, 0x28, // CMP r0, #0
+            0xFC, 0xD0, // BEQ to LDR
+            0x2A, 0x24, // MOV r4, #42
+            0xFE, 0xE7, // B to self
+        },
+        &.{
+            0x91, 0x8B, // LDRH r1, [r2, #28]
+            0x18, 0x1C, // ADD r0, r3, #0
+            0x08, 0x40, // AND r0, r1
+            0x00, 0x28, // CMP r0, #0
+            0xFA, 0xD0, // BEQ to LDRH
+            0x2A, 0x24, // MOV r4, #42
+            0xFE, 0xE7, // B to self
+        },
     };
-    for ([_]u16{ 0, 0x4317 }) |waitcnt| {
-        var batched: Machine = undefined;
-        batched.initCartridge(&rom);
-        const bus = &batched.bus;
-        bus.writeData(u16, Bus.waitcnt_address, waitcnt);
-        bus.writeData(u32, Bus.iwram_base, 1);
-        bus.writeData(u32, 0x0400_00D4, Bus.iwram_base);
-        bus.writeData(u32, 0x0400_00D8, Bus.ewram_base);
-        bus.writeData(u32, 0x0400_00DC, 0xA400_0001);
-        batched.cpu.registers[1] = Bus.ewram_base;
-        const pc = Bus.rom_base + 0x0200_0000;
-        batched.cpu.cpsr |= 1 << 5;
-        batched.cpu.instruction_address = pc;
-        batched.cpu.pipeline = .{ bus.fetch16(pc, .nonsequential), bus.fetch16(pc + 2, .sequential) };
-        var reference = batched;
-        for (0..64) |i| {
-            const limit = [_]usize{ 1, 4, 17, 200 };
-            const count = try batched.stepBatch(limit[i % limit.len]);
-            try std.testing.expect(count > 0 and count <= limit[i % limit.len]);
-            for (0..count) |_| try reference.stepTimed();
-            try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
-            try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
-            try std.testing.expectEqual(reference.dma_cycles_pending, batched.dma_cycles_pending);
-            try std.testing.expectEqualDeep(reference.bus, batched.bus);
-            if (batched.cpu.registers[4] == 42) break;
-        } else return error.DmaNotObserved;
+    for (roms) |rom| {
+        for ([_]u16{ 0, 0x4317 }) |waitcnt| {
+            var batched: Machine = undefined;
+            batched.initCartridge(rom);
+            const bus = &batched.bus;
+            bus.writeData(u16, Bus.waitcnt_address, waitcnt);
+            bus.writeData(u32, Bus.iwram_base, 1);
+            bus.writeData(u32, 0x0400_00D4, Bus.iwram_base);
+            bus.writeData(u32, 0x0400_00D8, Bus.ewram_base);
+            bus.writeData(u32, 0x0400_00DC, 0xA400_0001);
+            batched.cpu.registers[1] = Bus.ewram_base;
+            batched.cpu.registers[2] = Bus.ewram_base - 28;
+            batched.cpu.registers[3] = 1;
+            const pc = Bus.rom_base + 0x0200_0000;
+            batched.cpu.cpsr |= 1 << 5;
+            batched.cpu.instruction_address = pc;
+            batched.cpu.pipeline = .{ bus.fetch16(pc, .nonsequential), bus.fetch16(pc + 2, .sequential) };
+            var reference = batched;
+            for (0..64) |i| {
+                const limit = [_]usize{ 1, 4, 17, 200 };
+                const count = try batched.stepBatch(limit[i % limit.len]);
+                try std.testing.expect(count > 0 and count <= limit[i % limit.len]);
+                for (0..count) |_| try reference.stepTimed();
+                try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
+                try std.testing.expectEqual(reference.elapsed_cycles, batched.elapsed_cycles);
+                try std.testing.expectEqual(reference.dma_cycles_pending, batched.dma_cycles_pending);
+                try std.testing.expectEqualDeep(reference.bus, batched.bus);
+                if (batched.cpu.registers[4] == 42) break;
+            } else return error.DmaNotObserved;
+        }
     }
 }
 
