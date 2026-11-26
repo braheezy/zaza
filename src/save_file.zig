@@ -26,10 +26,7 @@ pub const Options = struct {
         allocator: std.mem.Allocator,
         save: *SaveMemory,
     ) !?Session {
-        if (self.kind) |kind| save.kind = kind;
-        const path = self.path orelse return null;
-        if (save.kind == .none) return error.NoSaveMemory;
-        if (path.len == 0) return error.InvalidSaveOption;
+        const path = try self.prepare(save) orelse return null;
 
         const directory = std.Io.Dir.cwd();
         // Lock a stable inode since publishing a save replaces the data file's inode.
@@ -42,19 +39,49 @@ pub const Options = struct {
         });
         errdefer lock.close(io);
 
-        const data = directory.readFileAlloc(
+        const exists = try readInitial(io, allocator, save, path);
+        return .{ .path = path, .lock = lock, .exists = exists };
+    }
+
+    /// Load the starting contents without opening a session that can write them back.
+    pub fn loadInitial(
+        self: Options,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        save: *SaveMemory,
+    ) !void {
+        const path = try self.prepare(save) orelse return;
+        const exists = try readInitial(io, allocator, save, path);
+        if (!exists) return error.FileNotFound;
+    }
+
+    fn prepare(self: Options, save: *SaveMemory) !?[]const u8 {
+        if (self.kind) |kind| save.kind = kind;
+        const path = self.path orelse return null;
+        if (save.kind == .none) return error.NoSaveMemory;
+        if (path.len == 0) return error.InvalidSaveOption;
+        return path;
+    }
+
+    fn readInitial(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        save: *SaveMemory,
+        path: []const u8,
+    ) !bool {
+        const data = std.Io.Dir.cwd().readFileAlloc(
             io,
             path,
             allocator,
             .limited(SaveMemory.Kind.flash128.size()),
         ) catch |err| switch (err) {
-            error.FileNotFound => return .{ .path = path, .lock = lock, .exists = false },
+            error.FileNotFound => return false,
             error.StreamTooLong => return error.InvalidSaveSize,
             else => |failure| return failure,
         };
         defer allocator.free(data);
         try save.load(data);
-        return .{ .path = path, .lock = lock, .exists = true };
+        return true;
     }
 };
 
@@ -65,6 +92,20 @@ pub const Session = struct {
 
     pub fn close(self: Session, io: std.Io) void {
         self.lock.close(io);
+    }
+
+    /// Load the same save under the lock already held by the active cartridge.
+    pub fn reload(
+        self: Session,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        save: *SaveMemory,
+    ) !Session {
+        std.debug.assert(std.mem.eql(u8, self.path, path));
+        if (save.kind == .none) return error.NoSaveMemory;
+        const exists = try Options.readInitial(io, allocator, save, path);
+        return .{ .path = path, .lock = self.lock, .exists = exists };
     }
 
     pub fn flush(self: *Session, io: std.Io, save: *SaveMemory) !void {

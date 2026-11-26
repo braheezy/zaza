@@ -23,6 +23,7 @@ primed: bool = false,
 rate: u32,
 channels: usize,
 volume: u8,
+muted: std.atomic.Value(bool),
 
 // The callback retains this address until player.deinit stops the stream.
 pub fn init(self: *Playback, allocator: std.mem.Allocator, volume: u8) !void {
@@ -44,7 +45,8 @@ pub fn init(self: *Playback, allocator: std.mem.Allocator, volume: u8) !void {
         .capture = .{ .writer = &self.pcm.writer },
         .rate = player.sampleRate(),
         .channels = player.channels().len,
-        .volume = volume,
+        .volume = if (volume == 0) 30 else volume,
+        .muted = .init(volume == 0),
     };
     try self.player.start();
 }
@@ -93,6 +95,8 @@ fn render(user_data: ?*anyopaque, output: []u8) void {
     // Accumulate two video frames of source audio after startup or an underrun.
     if (!self.primed and head -% tail < 1100) return;
     self.primed = true;
+    // Consume muted audio on schedule so unmuting picks up at the current frame.
+    const volume = if (self.muted.load(.monotonic)) 0 else self.volume;
     const frame_size = self.channels * 2;
     for (0..output.len / frame_size) |i| {
         const advance = (self.fraction + zaza.sample_rate) / self.rate;
@@ -106,7 +110,7 @@ fn render(user_data: ?*anyopaque, output: []u8) void {
         for (&pair, a, b) |*out, first, second| {
             const delta = @as(i64, second) - first;
             const sample = first + @divTrunc(delta * self.fraction, self.rate);
-            out.* = @intCast(@divTrunc(sample * self.volume, 100));
+            out.* = @intCast(@divTrunc(sample * volume, 100));
         }
         const offset = i * frame_size;
         if (self.channels == 1) {

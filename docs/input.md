@@ -16,10 +16,20 @@ Choose **Emulation → Pause** or press **⌘P** to freeze the game. Choose
 **Resume** or press **⌘P** again to continue from the same frame. Opening a
 new cartridge starts it running.
 
+While paused, choose **Emulation → Advance One Frame** or press **⌘]**.
+Each command advances one frame, samples the game controls, and leaves the
+game paused on the resulting frame.
+
+Choose **File → Save Screenshot…** to capture the current game frame as a
+240×160 PNG. Zaza captures the frame before opening the save dialog. The image
+contains the game pixels without the FPS overlay or window scaling.
+
 For headless automation, build with `zig build cli` and run `zaza-cli`.
 
 Live mode plays through the default audio device at 30% volume. Put
-`--volume 5` before the ROM path for a quiet sound test, or `--mute` for silence.
+`--volume 5` before the ROM path for a quiet sound test, or `--mute` to start
+muted. Choose **Audio → Mute Audio** to toggle sound during play. Unmuting
+restores the configured volume, or 30% if the player started muted.
 
 | GBA button | Keyboard |
 | --- | --- |
@@ -96,7 +106,7 @@ screen or chooses an action. Send one newline-terminated command at a time.
 | --- | --- |
 | `step 60 none` | Advance 60 frames with all buttons released. |
 | `step 4 Right A` | Hold exactly Right and A for four frames. |
-| `screen /tmp/turn-1.bmp` | Write the current 240×160 framebuffer to a fresh path without advancing. |
+| `screen /tmp/turn-1.png` | Write the current 240×160 framebuffer to a fresh path without advancing. Use `.bmp` for BMP. |
 | `checkpoint` | Remember the machine and frame number in the session’s single in-memory slot. A later checkpoint replaces it. |
 | `restore` | Return to the remembered frame. The checkpoint remains available until replaced or the session exits. |
 | `quit` or end of input | Flush any configured cartridge save and exit. |
@@ -105,7 +115,38 @@ Step, screen, checkpoint, and restore reply on stdout with `ok <current frame>`.
 Restoring before the first checkpoint returns `error NoCheckpoint` and leaves the game running.
 Invalid commands and capture errors reply with `error <reason>`; the session
 stays open. Quit closes stdout. Guest logs and fatal errors go to stderr.
-To reproduce a run, keep the initial ROM, BIOS, save, and sequence of step, checkpoint, and restore commands.
+
+### Recording and replaying a session
+
+Add `--record` after the ROM to save the session's execution commands to a new
+transcript. For example, this session takes a checkpoint, tries one branch,
+then restores the checkpoint and tries another.
+
+```sh
+printf 'step 2 none\ncheckpoint\nstep 4 Right A\nrestore\nstep 3 Left\nquit\n' |
+  zig-out/bin/zaza-cli session game.gba --record attempt.zaza-session
+zig-out/bin/zaza-cli replay-session game.gba attempt.zaza-session final.png
+```
+
+The transcript is published on `quit` or end of input and requires a fresh
+path. It contains successful `step`, `checkpoint`, and `restore` commands in
+order. `screen` commands and their output paths are omitted. Replay prints one
+`ok <current frame>` after verification. Omit the image path to verify without
+writing an image.
+
+The transcript stores the boot mode, save type, and BLAKE3 digests of the ROM,
+BIOS, and starting battery save. Use the same starting data and boot mode when
+replaying. If recording can change an existing save, keep a copy from before
+the session and pass that copy as `--save` before `replay-session`. If the
+session began with empty save memory, omit `--save` for replay and repeat any
+`--save-type` override. Replay reads a supplied save without writing back to it.
+
+The format starts with `zaza-session 1`, followed by a `start` line carrying
+those fields in this order: boot mode, ROM digest, BIOS digest, save type, save
+digest. The final `end` line stores the frame number and a BLAKE3 digest of
+row-major RGB bytes, or `unavailable` if the display mode could not be captured.
+Replay checks the starting fields and final result before writing the optional
+image. ROM, BIOS, and save contents stay outside the transcript.
 
 ## Headless execution
 
@@ -132,7 +173,9 @@ everything and spaces to hold multiple buttons, such as `12 Right A`.
 Names are case-insensitive. Frame numbers must increase, and all rows must
 fall within the requested frame count. Blank lines and `#` comments are allowed.
 
-The runner writes a native-resolution BMP after the requested number of frames.
+The runner writes a native-resolution image after the requested number of frames.
+For `replay`, `replay-session`, `snapshot`, and `demo`, use a `.png` output path
+for PNG. Other extensions keep the default BMP format.
 Modes 0 through 5 capture each visible scanline before HBlank DMA. The instruction-count
 viewer instead renders the current register and memory values as one image.
 Give each run a fresh output path to avoid overwriting a previous capture. The
@@ -158,9 +201,15 @@ Zaza detects save hardware from the ROM's save-type signature. Use
 `eeprom8k`, or `none` to override detection. The `eeprom` setting infers
 capacity from the game's DMA commands or the size of an existing save.
 
-Add `--save /path/to/game.sav` to load and persist the cartridge's raw save
-data. Supply the save options before the command or ROM. Without a save path,
-the cartridge's save data stays in memory for the session.
+The macOS player automatically loads and saves battery data for cartridges
+with save hardware. Files live under
+`~/Library/Application Support/Zaza/Saves/` and are named by the BLAKE3 hash
+of the ROM bytes. Renaming or moving a ROM keeps its save. A changed ROM
+gets a separate file. Cartridges without save hardware skip this storage.
+
+Use `--save /path/to/game.sav` to choose a specific raw save file. Supply
+save options before the command or ROM. In the headless CLI, cartridge save
+data stays in memory unless you supply `--save`.
 
 ```sh
 ./zig-out/bin/zaza --save /path/to/game.sav /path/to/game.gba
@@ -169,7 +218,7 @@ the cartridge's save data stays in memory for the session.
 Zaza writes changed data after a successful capture or on normal window
 exit, and before switching cartridges in the player. The first successfully
 opened ROM uses any `--save` and `--save-type` launch options. Later ROMs use
-automatic save-type detection and keep their saves in memory. Zaza rejects a
+automatic save-type detection and the default save directory. Zaza rejects a
 save whose size does not match the cartridge and uses an adjacent `.lock` file
 to prevent two Zaza sessions from writing the same save.
 
