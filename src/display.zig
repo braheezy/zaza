@@ -192,6 +192,16 @@ pub const Display = struct {
         backdrop: Pixel,
         effect: Effects,
     ) void {
+        if (backgrounds.len == 4) {
+            for (backgrounds) |layer| {
+                if (layer) |bg| {
+                    if (bg.mosaic_width != 1) break;
+                }
+            } else {
+                self.composeTextEffects(row, backgrounds, text_pixels, objects, backdrop, effect);
+                return;
+            }
+        }
         for (row, objects, 0..) |*output, object, x| {
             var mask = self.windowMask(x, object.window);
             if (self.bg_pixel_mask) |pixels| mask &= 0xF0 | pixels[x];
@@ -210,17 +220,71 @@ pub const Display = struct {
                 if (mask & (@as(u8, 1) << index) == 0) continue;
                 if (bg.pixel(self, x)) |color| layers.insert(.{ .color = color, .layer = index, .rank = bg.rank });
             }
-            if (mask & (1 << object_layer) != 0) {
-                if (object.index != 0) layers.insert(.{
-                    .color = object.color(self.palette),
-                    .rank = object.rank,
-                    .layer = object_layer,
-                    .semitransparent = object.semitransparent,
-                });
-            }
-            const color = if (mask & (1 << 5) != 0) effect.apply(layers) else layers.front.color;
-            output.* = video.decodeColor(color);
+            output.* = self.finishEffects(layers, object, mask, effect);
         }
+    }
+
+    // Sort palette indices by BG rank eight pixels at a time. Only the two
+    // visible layers need palette reads when resolving OBJ and color effects.
+    fn composeTextEffects(
+        self: Display,
+        row: *[video.width]video.Rgb,
+        backgrounds: []const ?Background,
+        text_pixels: *const [4][video.width]u8,
+        objects: *const [video.width]PalettePixel,
+        backdrop: Pixel,
+        effect: Effects,
+    ) void {
+        const Bytes = @Vector(8, u8);
+        const Words = @Vector(8, u16);
+        var masks: [video.width]u8 = undefined;
+        for (&masks, objects, 0..) |*mask, obj, x| {
+            mask.* = self.windowMask(x, obj.window);
+            if (self.bg_pixel_mask) |pixels| mask.* &= 0xF0 | pixels[x];
+        }
+
+        const empty = (@as(u16, backdrop_rank) << 11) | (backdrop_layer << 8);
+        var front: [video.width / 8]Words = @splat(@splat(empty));
+        var behind = front;
+        for (backgrounds, 0..) |layer, i| {
+            const bg = layer orelse continue;
+            const rank: Words = @splat((@as(u16, bg.rank) << 11) | (@as(u16, @intCast(i)) << 8));
+            const enable: Bytes = @splat(@as(u8, 1) << @intCast(i));
+            for (&front, &behind, 0..) |*top, *second, group| {
+                const x = group * 8;
+                const mask: Bytes = masks[x..][0..8].*;
+                const indices: Bytes = text_pixels[i][x..][0..8].*;
+                const visible = (mask & enable) != @as(Bytes, @splat(0));
+                const index = @select(u8, visible, indices, @as(Bytes, @splat(0)));
+                const candidate = @select(u16, index != @as(Bytes, @splat(0)), rank | @as(Words, index), @as(Words, @splat(empty)));
+                second.* = @min(second.*, @max(top.*, candidate));
+                top.* = @min(top.*, candidate);
+            }
+        }
+        for (row, objects, masks, 0..) |*output, obj, mask, x| {
+            var layers: Layers = .{ .front = backdrop, .behind = backdrop };
+            inline for (.{ &front, &behind }, .{ &layers.front, &layers.behind }) |packed_row, pixel| {
+                const entries: [8]u16 = packed_row[x / 8];
+                const entry = entries[x % 8];
+                pixel.* = .{
+                    .color = readHalf(self.palette, (entry & 255) * 2),
+                    .rank = @truncate(entry >> 11),
+                    .layer = @truncate(entry >> 8),
+                };
+            }
+            output.* = self.finishEffects(layers, obj, mask, effect);
+        }
+    }
+
+    inline fn finishEffects(self: Display, backgrounds: Layers, object: PalettePixel, mask: u8, effect: Effects) video.Rgb {
+        var layers = backgrounds;
+        if (mask & (1 << object_layer) != 0 and object.index != 0) layers.insert(.{
+            .color = object.color(self.palette),
+            .rank = object.rank,
+            .layer = object_layer,
+            .semitransparent = object.semitransparent,
+        });
+        return video.decodeColor(if (mask & (1 << 5) != 0) effect.apply(layers) else layers.front.color);
     }
 
     fn backgroundForLine(self: Display, index: usize, y: usize, mosaic: u16) Background {
