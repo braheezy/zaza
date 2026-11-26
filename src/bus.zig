@@ -342,7 +342,8 @@ pub fn hasEnabledInterrupt(self: *const Bus) bool {
 
 pub fn haltWakeLine(self: *const Bus) bool {
     // A new timer IF bit reaches HALT wake one clock before it reaches the CPU IRQ line.
-    return self.irq_enable & self.irq_flags & ~@as(u16, self.peripheral_irq_new) != 0;
+    const synchronizing = self.peripheral_irq_new | @as(u14, @intFromBool(self.vblank_irq_delay != 0));
+    return self.irq_enable & self.irq_flags & ~@as(u16, synchronizing) != 0;
 }
 
 pub fn irqLine(self: *const Bus) bool {
@@ -1491,13 +1492,16 @@ test "VBlank latches IF before IRQ delivery without delaying other sources" {
     try std.testing.expectEqual(@as(u16, 160), bus.readData(u16, vcount_address));
     try std.testing.expectEqual(@as(u16, 1), bus.irq_flags);
     try std.testing.expect(!bus.irqLine());
+    try std.testing.expect(!bus.haltWakeLine());
     bus.requestInterrupt(2);
+    try std.testing.expect(bus.haltWakeLine());
     try std.testing.expect(bus.irqLine());
     bus.writeData(u16, if_address, 2);
     bus.advanceWithinDisplayInterval(3);
     try std.testing.expect(!bus.irqLine());
     bus.advanceWithinDisplayInterval(1);
     try std.testing.expect(bus.irqLine());
+    try std.testing.expect(bus.haltWakeLine());
 
     // An unacknowledged VBlank stays asserted across the following frame.
     bus.advanceDevices(bus.display_phase, timing.cycles_per_frame - 7);
