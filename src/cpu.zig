@@ -956,14 +956,59 @@ pub fn runRomThumb(self: *Cpu, bus: anytype, limit: usize, deadline: u64) ThumbR
     return run;
 }
 
+// Local to one frame run so the ROM and the watched RAM cannot be replaced.
+pub const PollCache = struct {
+    entries: [8]Entry = @splat(.{}),
+
+    const Entry = struct {
+        pc: u32 = 0,
+        registers: [8]u32 = undefined,
+        flags: u32 = undefined,
+        pipeline: ?[2]u32 = undefined,
+        fifo: timing.CartridgePrefetch = undefined,
+        latch: u32 = undefined,
+        nonsequential: bool = undefined,
+        waitcnt: u16 = undefined,
+        address: u32 = undefined,
+        value: u32 = undefined,
+        steps: usize = undefined,
+        cycles: u64 = undefined,
+        internal: u64 = undefined,
+        rom: u64 = undefined,
+        iwram: u64 = undefined,
+    };
+};
+
 /// Run Thumb arithmetic, stable reads and short branches up to a device event.
 /// The admitted instructions can change PC, the pipeline, flags and low registers.
-pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u64) struct {
+pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u64, cache: *PollCache) struct {
     instructions: usize,
     cycles: u64,
     edge_cycles: u64,
 } {
     const start_pc = self.instruction_address;
+    const entry = &cache.entries[(start_pc >> 1) % cache.entries.len];
+    if (entry.pc == start_pc and self.cpsr == entry.flags and bus.waitcnt == entry.waitcnt and
+        bus.next_fetch_nonsequential == entry.nonsequential and bus.prefetch_word == entry.latch and
+        std.meta.eql(self.pipeline, entry.pipeline) and std.meta.eql(bus.cartridge_prefetch, entry.fifo) and
+        std.mem.eql(u32, self.registers[0..8], &entry.registers) and
+        bus.iwramWord(entry.address) == entry.value)
+    {
+        const n = @min(limit / entry.steps, (deadline - 1) / entry.cycles);
+        if (n != 0) {
+            const internal = entry.internal * n;
+            self.internal_cycles += internal;
+            bus.cpu_internal_cycles += internal;
+            bus.bus_cycles += entry.cycles * n - internal;
+            bus.rom_fetch_cycles += entry.rom * n;
+            bus.iwram_data_cycles += entry.iwram * n;
+            bus.dma_bus_word = null;
+            bus.next_rom_data_address = null;
+            return .{ .instructions = entry.steps * n, .cycles = entry.cycles * n, .edge_cycles = 0 };
+        }
+    }
+    // Reuse only loops whose data reads all come from one aligned IWRAM word.
+    var watched: ?u32 = null;
     var registers = self.registers[0..8].*;
     var flags = self.cpsr;
     var pipeline = self.pipeline;
@@ -1000,7 +1045,7 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
             }
         }
         const before = self.internal_cycles;
-        if (!self.stepReadOnlyThumb(bus, op, deadline - cycles)) break;
+        if (!self.stepReadOnlyThumb(bus, op, deadline - cycles, &watched)) break;
         const internal = self.internal_cycles - before;
         if (internal != 0) {
             bus.next_fetch_nonsequential = true;
@@ -1021,6 +1066,25 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
             const iteration_cycles = cycles - loop_cycles;
             const iteration_steps = count - loop_steps;
             const repeats = @min((deadline - 1 - cycles) / iteration_cycles, (limit - count) / iteration_steps);
+            if (repeats != 0 and (watched orelse 0) != 0) {
+                entry.* = .{
+                    .pc = start_pc,
+                    .registers = registers,
+                    .flags = flags,
+                    .pipeline = pipeline,
+                    .fifo = fifo,
+                    .latch = latch,
+                    .nonsequential = nonsequential,
+                    .waitcnt = bus.waitcnt,
+                    .address = watched.?,
+                    .value = bus.iwramWord(watched.?),
+                    .steps = iteration_steps,
+                    .cycles = iteration_cycles,
+                    .internal = self.internal_cycles - loop_internal,
+                    .rom = bus.rom_fetch_cycles - loop_rom,
+                    .iwram = bus.iwram_data_cycles - loop_iwram,
+                };
+            }
             bus.bus_cycles += (bus.bus_cycles - loop_bus) * repeats;
             bus.rom_fetch_cycles += (bus.rom_fetch_cycles - loop_rom) * repeats;
             bus.iwram_data_cycles += (bus.iwram_data_cycles - loop_iwram) * repeats;
@@ -1053,7 +1117,7 @@ pub fn runReadOnlyThumbUntil(self: *Cpu, bus: anytype, limit: usize, deadline: u
 
 // RAM and display status remain stable until the deadline in this read-only run.
 // A rejected instruction is left queued for the normal timed interpreter.
-inline fn stepReadOnlyThumb(self: *Cpu, bus: anytype, op: u16, cycles_left: u64) bool {
+inline fn stepReadOnlyThumb(self: *Cpu, bus: anytype, op: u16, cycles_left: u64, watched: *?u32) bool {
     switch (op >> 11) {
         0...7, 28 => self.stepThumb(bus, op) catch unreachable,
         8 => {
@@ -1067,6 +1131,10 @@ inline fn stepReadOnlyThumb(self: *Cpu, bus: anytype, op: u16, cycles_left: u64)
         13, 15, 17 => {
             const transfer = self.decodeThumbTransfer(op, op).?;
             const region = transfer.address >> 24;
+            const address = transfer.address & ~@as(u32, 3);
+            if (region != 3 or (watched.* != null and watched.* != address)) {
+                watched.* = 0;
+            } else watched.* = address;
             if (region == 2 or region == 3) {
                 self.advanceThumbPipeline(bus, self.instruction_address + 4);
                 self.executeThumbTransfer(bus, transfer);

@@ -182,9 +182,10 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
         timing.vblank_start,
         timing.cycles_per_frame,
     );
+    var cache: Cpu.PollCache = .{};
     var remaining = instruction_budget;
     while (remaining != 0) {
-        remaining -= try self.stepBatch(remaining);
+        remaining -= try self.stepBatchCached(remaining, &cache);
         if (self.elapsed_cycles >= target) return;
     }
     return error.InstructionBudgetExceeded;
@@ -192,6 +193,11 @@ pub fn runToVBlank(self: *Machine, instruction_budget: usize) !void {
 
 // Defer device updates only while every elapsed cycle precedes the first event.
 fn stepBatch(self: *Machine, limit: usize) !usize {
+    var cache: Cpu.PollCache = .{};
+    return self.stepBatchCached(limit, &cache);
+}
+
+fn stepBatchCached(self: *Machine, limit: usize, cache: *Cpu.PollCache) !usize {
     const bus = &self.bus;
     if (bus.vblank_irq_delay != 0 or self.dma_cycles_pending != 0 or bus.halted or bus.immediate_dma_at != null or
         bus.pending_timer_write != null or bus.peripheral_irq_pending | bus.peripheral_irq_new | bus.peripheral_irq_sync != 0)
@@ -211,15 +217,15 @@ fn stepBatch(self: *Machine, limit: usize) !usize {
     if ((region == 0x03 or (region >= 0x08 and region <= 0x0D)) and self.cpu.inArmState() and !bus.irqLine())
         return if (region == 3) self.runBatch(limit, .iwram) else self.runBatch(limit, .rom);
     if (!self.cpu.inArmState() and region >= 0x08 and region <= 0x0D and !bus.irqLine())
-        return self.runThumbBatch(limit, interval);
+        return self.runThumbBatch(limit, interval, cache);
     return self.runBatch(limit, .generic);
 }
 
 // Skip stable polling iterations, then stream cartridge code up to a device event.
 // The ordinary handler executes any instruction that needs the full bus.
-fn runThumbBatch(self: *Machine, limit: usize, interval: u64) !usize {
+fn runThumbBatch(self: *Machine, limit: usize, interval: u64, cache: *Cpu.PollCache) !usize {
     const bus = &self.bus;
-    const prefix = self.cpu.runReadOnlyThumbUntil(bus, limit, interval);
+    const prefix = self.cpu.runReadOnlyThumbUntil(bus, limit, interval, cache);
     var count = prefix.instructions;
     var edge_cycles = prefix.edge_cycles;
     var elapsed = prefix.cycles - edge_cycles;
@@ -534,7 +540,7 @@ test "Thumb polling observes HBlank DMA at the same instruction as single steppi
             0xFE, 0xE7, // B to self
         },
     };
-    for (roms) |rom| {
+    for (roms, [_]u32{ Bus.ewram_base, Bus.iwram_base + 0x100 }) |rom, flag_address| {
         for ([_]u16{ 0, 0x4317 }) |waitcnt| {
             var batched: Machine = undefined;
             batched.initCartridge(rom);
@@ -542,19 +548,20 @@ test "Thumb polling observes HBlank DMA at the same instruction as single steppi
             bus.writeData(u16, Bus.waitcnt_address, waitcnt);
             bus.writeData(u32, Bus.iwram_base, 1);
             bus.writeData(u32, 0x0400_00D4, Bus.iwram_base);
-            bus.writeData(u32, 0x0400_00D8, Bus.ewram_base);
+            bus.writeData(u32, 0x0400_00D8, flag_address);
             bus.writeData(u32, 0x0400_00DC, 0xA400_0001);
-            batched.cpu.registers[1] = Bus.ewram_base;
-            batched.cpu.registers[2] = Bus.ewram_base - 28;
+            batched.cpu.registers[1] = flag_address;
+            batched.cpu.registers[2] = flag_address - 28;
             batched.cpu.registers[3] = 1;
             const pc = Bus.rom_base + 0x0200_0000;
             batched.cpu.cpsr |= 1 << 5;
             batched.cpu.instruction_address = pc;
             batched.cpu.pipeline = .{ bus.fetch16(pc, .nonsequential), bus.fetch16(pc + 2, .sequential) };
+            var cache: Cpu.PollCache = .{};
             var reference = batched;
             for (0..64) |i| {
                 const limit = [_]usize{ 1, 4, 17, 200 };
-                const count = try batched.stepBatch(limit[i % limit.len]);
+                const count = try batched.stepBatchCached(limit[i % limit.len], &cache);
                 try std.testing.expect(count > 0 and count <= limit[i % limit.len]);
                 for (0..count) |_| try reference.stepTimed();
                 try std.testing.expectEqualDeep(reference.cpu, batched.cpu);
@@ -563,6 +570,11 @@ test "Thumb polling observes HBlank DMA at the same instruction as single steppi
                 try std.testing.expectEqualDeep(reference.bus, batched.bus);
                 if (batched.cpu.registers[4] == 42) break;
             } else return error.DmaNotObserved;
+            if (flag_address >> 24 == 3) {
+                for (cache.entries) |entry| {
+                    if (entry.pc != 0 and entry.address == flag_address) break;
+                } else return error.PollLoopNotCached;
+            }
         }
     }
 }
