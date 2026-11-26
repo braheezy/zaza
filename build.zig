@@ -6,9 +6,7 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // TODO: If this is accepted, then we can depend on zig build graph to fetch the bios
-    // https://github.com/coolbho3k/emibios/issues/18
-    const bios = bundledBios(b);
+    const bios = b.dependency("emibios", .{}).path("gba_bios.bin");
 
     const lib = b.addModule("libzaza", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -48,13 +46,6 @@ pub fn build(b: *Build) void {
     } else if (target.result.os.tag != .macos) {
         desktop.dependOn(&b.addFail("Desktop playback currently requires macOS.").step);
     }
-}
-
-fn bundledBios(b: *Build) Build.LazyPath {
-    // A declared output lets Zig reuse the downloaded image across builds.
-    const download = b.addSystemCommand(&.{ "curl", "--fail", "--location", "--silent", "--show-error" });
-    download.addArgs(&.{ "https://github.com/coolbho3k/emibios/releases/download/0.2.1/gba_bios.bin", "--output" });
-    return download.addOutputFileArg("gba_bios.bin");
 }
 
 fn installNotices(b: *Build, parser: *Build.Dependency) *Build.Step {

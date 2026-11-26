@@ -22,6 +22,10 @@
             .url = "https://codeload.github.com/ziglibs/ini/tar.gz/d5b82337a2a61fd5c985e126ab5e8739660a0e94",
             .hash = "ini-0.1.0-YCQ9YiFsAAAQnrvMmRyoA9FM-7Ovo3TGzqbCPzzr3TjN",
         },
+        .emibios = .{
+            .url = "https://github.com/coolbho3k/emibios/releases/download/0.2.2/emibios-artifacts.tar.gz",
+            .hash = "emibios_artifacts-0.2.2-EqSm1HiAEADlX8mz2i64AqmLQQ64BIiUnXugljFF6zi5",
+        },
     },
     .minimum_zig_version = "0.16.0-dev.3142+5ccfeb926",
     .mach_zig_version = "2026.4.10-mach",

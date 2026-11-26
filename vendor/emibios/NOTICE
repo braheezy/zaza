@@ -1,15 +1,14 @@
-emibios 0.2.1 — GBA BIOS replacement
+emibios 0.2.2 — GBA BIOS replacement
 Copyright 2020–2021 DenSinH and fleroviux
 Copyright 2026 Emi Huang
 
 BIOS license: LGPL-3.0-or-later. See LICENSE for upstream license text.
-Release: https://github.com/coolbho3k/emibios/releases/tag/0.2.1
-Corresponding source: https://github.com/coolbho3k/emibios/tree/0.2.1
+Release: https://github.com/coolbho3k/emibios/releases/tag/0.2.2
+Corresponding source: https://github.com/coolbho3k/emibios/tree/0.2.2
 Binary: gba_bios.bin (unmodified standard release)
 SHA-256: 95e6c8a6c236ed8e2629bdb60bc75791434c4f08ca69ad2305e30ca3f3c29d1b
 
-build.zig downloads the binary into Zig's build cache. A successful download is
-reused on subsequent builds. Clearing the cache requires downloading it again.
+Zig fetches and verifies the pinned release archive on a package cache miss.
 The executable embeds the image and needs no runtime network access.
 Use --bios <path> to replace the bundled image with a 16 KiB BIOS.
 
