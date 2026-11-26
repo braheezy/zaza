@@ -1510,6 +1510,17 @@ test "Mode 0 composites sprites through window masks, alpha and affine sampling"
     try std.testing.expectEqual(video.decodeColor(0), frame[0][8]);
     try std.testing.expectEqual(video.decodeColor(0x001F), frame[0][16]);
 
+    // A wrapped WIN0 can include all, none, or only part of the visible scanline.
+    for ([_]u16{ 0xFFF0, 0xFF00, 0x0402 }) |limits| {
+        bus.writeData(u16, 0x0400_0040, limits);
+        try machine.snapshotBitmap(&frame);
+        const blue = video.decodeColor(0x7C00);
+        const blended = video.decodeColor(0x3C0F);
+        try std.testing.expectEqual(if (limits == 0xFF00) blended else blue, frame[0][0]);
+        try std.testing.expectEqual(if (limits == 0xFFF0) blue else blended, frame[0][2]);
+        try std.testing.expectEqual(if (limits == 0xFF00) blended else blue, frame[0][4]);
+    }
+
     bus.writeData(u16, Bus.dispcnt_address, 0x1100);
     // A semitransparent OBJ still blends with BG0 when all windows are disabled.
     var row: [video.width]video.Rgb = undefined;
@@ -1541,7 +1552,7 @@ test "offscreen sprite columns spend the scanline budget before a sprite wraps i
     for (row[1..]) |pixel| try @import("std").testing.expectEqual(video.decodeColor(0), pixel);
 }
 
-test "frontmost pixel composition matches a fully visible window in every mode" {
+test "full-width windows match per-pixel composition in every mode" {
     const std = @import("std");
     var machine: Machine = undefined;
     machine.initCartridge(&.{});
@@ -1549,9 +1560,12 @@ test "frontmost pixel composition matches a fully visible window in every mode" 
     var random = std.Random.DefaultPrng.init(73);
     random.random().bytes(&bus.vram);
     random.random().bytes(&bus.palette);
-    // Select every layer and effects outside WIN0. Its vertical range stays inactive.
-    bus.writeData(u16, 0x0400_004A, 0x003F);
-    bus.writeData(u16, 0x0400_0050, 0x003F);
+    // WIN0 covers the screen and disables effects even though BLDCNT requests fading.
+    bus.writeData(u16, 0x0400_0040, 0x00FF);
+    bus.writeData(u16, 0x0400_0048, 0x001F);
+    bus.writeData(u16, 0x0400_0050, 0x00BF);
+    bus.writeData(u16, 0x0400_0054, 8);
+    const all_backgrounds: [video.width]u8 = @splat(0x0F);
     // Overlap sprites with all four BG priorities, including across an eight-pixel boundary.
     for (0..4) |i| {
         const oam = Bus.oam_base + @as(u32, @intCast(i * 8));
@@ -1559,11 +1573,13 @@ test "frontmost pixel composition matches a fully visible window in every mode" 
         bus.writeData(u16, oam + 4, @intCast(i * 1024 + i));
     }
     for (0..6) |mode| {
-        bus.writeData(u16, Bus.dispcnt_address, @intCast(0x1F00 | mode));
+        bus.writeData(u16, Bus.dispcnt_address, @intCast(0x3F00 | mode));
         var plain = machine.currentDisplay();
         plain.green_swap = true;
+        plain.vertical_windows.active[0] = true;
         var windowed = plain;
-        windowed.control |= 1 << 13;
+        // Supplying the per-dot BG mask forces the general compositor.
+        windowed.bg_pixel_mask = &all_backgrounds;
         var plain_latch: u16 = 0;
         var windowed_latch: u16 = 0;
         for ([_]u16{ 1, 4, 7 }) |mosaic_width| {

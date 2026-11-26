@@ -69,9 +69,7 @@ pub const Display = struct {
         }
 
         const effect = Effects.init(self.registers);
-        // A semitransparent OBJ can still blend if BLDCNT enables a second target.
-        const front_only = self.control & 0xE000 == 0 and self.bg_pixel_mask == null and
-            effect.control & 0x3FC0 == 0;
+        const front_only = self.canComposeFrontOnly(effect);
         var pixels: [video.width]PalettePixel = undefined;
         const bitmap_row = mode == 4 and front_only and self.fetchMode4Row(affine[0], &pixels);
         if (!bitmap_row) {
@@ -433,6 +431,36 @@ pub const Display = struct {
             }
         }
         return true;
+    }
+
+    fn canComposeFrontOnly(self: Display, effect: Effects) bool {
+        if (self.bg_pixel_mask != null) return false;
+        const mask = self.uniformWindowMask() orelse return false;
+        const layers: u8 = @truncate((self.control >> 8) & 0x1F);
+        if (mask & layers != layers) return false;
+        // A semitransparent OBJ can blend even when BLDCNT selects no regular effect.
+        return mask & 0x20 == 0 or effect.control & 0x3FC0 == 0;
+    }
+
+    // The first covering window decides visibility for the entire row.
+    // A partial window needs per-pixel priority resolution.
+    fn uniformWindowMask(self: Display) ?u8 {
+        if (self.control & 0xE000 == 0) return 0x3F;
+        for (0..2) |i| {
+            if (!self.vertical_windows.active[i]) continue;
+            if (self.control & (@as(u16, 0x2000) << @intCast(i)) == 0) continue;
+            const limits = self.registers.stored(0x0400_0040 + @as(u32, @intCast(i * 2)));
+            const start = @min(limits >> 8, video.width);
+            const end = @min(limits & 255, video.width);
+            // Clip both limits, preserving whether the original interval wraps.
+            const wraps = (limits >> 8) > (limits & 255);
+            const inside = if (wraps) video.width - start + end else end - start;
+            if (inside == 0) continue;
+            if (inside < video.width) return null;
+            return @truncate(self.registers.stored(0x0400_0048) >> @intCast(i * 8));
+        }
+        if (self.control & 0x8000 != 0) return null;
+        return @truncate(self.registers.stored(0x0400_004A));
     }
 
     fn windowMask(self: Display, x: usize, object_window: bool) u8 {
